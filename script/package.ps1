@@ -7,6 +7,17 @@ Set-Location $root
 $version = (Select-String -Path plugin.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
 Write-Host "ApiMocktle $version"
 
+# Rust embeds `file!()` locations for panic messages and `strip` keeps them, so a
+# component built here would carry this machine's absolute paths
+# (`C:\Users\<name>\.cargo\registry\...`) into every install. Rewrite those
+# prefixes at compile time. The variable expands at run time, which keeps the
+# user name out of the repository.
+$remap = @(
+    "--remap-path-prefix=$env:USERPROFILE=~",
+    "--remap-path-prefix=$env:USERPROFILE\.cargo=/cargo"
+) -join ' '
+$env:RUSTFLAGS = if ($env:RUSTFLAGS) { "$env:RUSTFLAGS $remap" } else { $remap }
+
 cargo build --release --target wasm32-wasip2
 if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 
