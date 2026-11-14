@@ -15,3 +15,9 @@ dist/*.sources
 # and the workflow scaffolding are per-machine state, not shipped with the
 # plugin. `trellis update` keeps maintaining them on disk.
 /.trellis/
+
+# Trellis-generated agent skills and DSH instructions: regenerated locally by
+# `trellis update`, none of it is plugin source. AGENTS.md stays tracked — it is
+# the generic pointer every agent reads, not generated skill content.
+/.agents/
+/.dsh/
