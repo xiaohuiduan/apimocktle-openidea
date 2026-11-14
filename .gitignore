@@ -7,6 +7,10 @@
 dist/*.zip
 dist/*.sources
 
+# Signed install packages are distributed through GitHub releases; the registry
+# pins their SHA-256, so a committed copy would only go stale.
+*.oiplugin
+
 # Publisher signing key from `openidea-plugin keygen`. A leaked key hands the
 # whole `apimocktle.*` namespace to whoever has it, so it must never be staged.
 *.key

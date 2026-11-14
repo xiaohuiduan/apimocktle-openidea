@@ -4,6 +4,7 @@ version = "0.2.0"
 description = "从 Java/Kotlin 源码（Spring MVC、JAX-RS、Feign）提取 HTTP 接口，浏览它们，并导出到 ApiMocktle / YApi 兼容的服务器。"
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
+homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
 change-notes = "0.2.0 — 只保留两件事：浏览接口、导出到 ApiMocktle；分类 id 跨批持久化并在失效时自动重建。响应/请求体保留项目里定义的包装类型（Result 等）并代入泛型实参，接口参数结构不再为空。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
