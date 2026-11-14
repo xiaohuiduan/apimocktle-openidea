@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/plugin/schema-contract.md", "reason": "改写 type_schema 第 6 步、新增 substitute 前必读：判定顺序与 WRAPPERS 语义在此定义"}
+{"file": ".trellis/spec/plugin/scanner-contract.md", "reason": "在 spring::parse 增加类型参数提取、调整 DTO 传递闭包时必读：解析流水线与 load_class 策略"}
+{"file": ".trellis/spec/plugin/yapi-contract.md", "reason": "api_doc 的 res_body 字段与 JSON Schema 字符串契约，签名变更需同步"}

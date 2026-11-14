@@ -1,0 +1,8 @@
+/target
+/refs
+
+# Packaged artifacts: `dist/plugin.wasm` ships with the repo (plugin.toml points
+# at it), but the zip and the build stamp are recreated by script/package.ps1 on
+# every run, so tracking them would leave the tree permanently dirty.
+dist/*.zip
+dist/*.sources

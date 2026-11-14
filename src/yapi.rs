@@ -1,0 +1,330 @@
+//! The YApi-compatible client ApiMocktle speaks: project listing, categories,
+//! interface listing and interface save, plus the document a saved interface
+//! carries.
+
+use openidea_plugin::{Error, HttpRequest, host};
+use serde_json::{Value, json};
+
+use crate::model::{Endpoint, ParamSpec, ResolvedClass, body_schema};
+use crate::scan::DtoIndex;
+
+const LIST_PROJECTS: &str = "/api/project/list";
+const SAVE_API: &str = "/api/interface/save";
+const GET_CAT_MENU: &str = "/api/interface/getCatMenu";
+const ADD_CAT: &str = "/api/interface/add_cat";
+const LIST_CAT: &str = "/api/interface/list_cat";
+
+#[derive(Clone, Debug, Default)]
+pub struct ProjectInfo {
+    pub id: String,
+    pub name: String,
+    pub desc: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Category {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ApiBrief {
+    pub id: String,
+    pub path: String,
+    pub method: String,
+}
+
+pub struct Client {
+    pub base: String,
+    pub token: String,
+    pub project_id: String,
+}
+
+fn enc(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// YApi answers `{"errcode": 0}` on success and a non-zero code otherwise.
+fn check(payload: &Value) -> Result<(), Error> {
+    let code = payload.get("errcode").and_then(Value::as_i64).or_else(|| payload.get("code").and_then(Value::as_i64));
+    let message = payload
+        .get("errmsg")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("message").and_then(Value::as_str))
+        .unwrap_or("");
+    let ok = matches!(code, Some(0) | Some(200)) || matches!(message, "成功" | "成功！");
+    if ok { Ok(()) } else { Err(Error::Failed(format!("服务器返回错误：{}", if message.is_empty() { "未知错误" } else { message }))) }
+}
+
+impl Client {
+    fn trimmed(&self) -> String {
+        self.base.trim().trim_end_matches('/').to_owned()
+    }
+
+    fn call(&self, method: &str, path: &str, query: &str, body: Option<Value>) -> Result<Value, Error> {
+        let base = self.trimmed();
+        if base.is_empty() {
+            return Err(Error::Invalid("先在设置里填写 ApiMocktle 服务器地址".into()));
+        }
+        if self.token.trim().is_empty() {
+            return Err(Error::Invalid("先在设置里填写个人令牌".into()));
+        }
+        let url = if query.is_empty() { format!("{base}{path}") } else { format!("{base}{path}?{query}") };
+        let mut req = HttpRequest {
+            method: method.to_owned(),
+            url,
+            ..HttpRequest::default()
+        };
+        if let Some(payload) = body {
+            req.headers.push(("Content-Type".into(), "application/json".into()));
+            req.body = Some(payload.to_string().into_bytes());
+        }
+        // A slow server must fail the call, not blow the 5-second host budget.
+        req.timeout_ms = Some(3_000);
+        let response = host::fetch(&req)?;
+        let text = response.text();
+        if response.status == 401 || response.status == 403 {
+            return Err(Error::Denied("服务器拒绝了令牌，请在设置里更新个人令牌".into()));
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(Error::Failed(format!("HTTP {}：{}", response.status, text.chars().take(300).collect::<String>())));
+        }
+        let payload: Value = serde_json::from_str(&text)
+            .map_err(|_| Error::Failed(format!("响应不是 JSON：{}", text.chars().take(200).collect::<String>())))?;
+        check(&payload)?;
+        Ok(payload)
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<ProjectInfo>, Error> {
+        let payload = self.call("GET", LIST_PROJECTS, &format!("token={}", enc(&self.token)), None)?;
+        let items = payload.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                Some(ProjectInfo {
+                    id: item.get("_id").map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string()))?,
+                    name: item.get("name").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                    desc: item.get("desc").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                })
+            })
+            .collect())
+    }
+
+    pub fn list_categories(&self) -> Result<Vec<Category>, Error> {
+        let query = format!("project_id={}&token={}", enc(&self.project_id), enc(&self.token));
+        let payload = self.call("GET", GET_CAT_MENU, &query, None)?;
+        let items = payload.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                Some(Category {
+                    id: item.get("_id").map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string()))?,
+                    name: item.get("name").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                })
+            })
+            .collect())
+    }
+
+    pub fn create_category(&self, name: &str, desc: &str) -> Result<Category, Error> {
+        let body = json!({
+            "desc": desc,
+            "project_id": self.project_id,
+            "name": name,
+            "token": self.token,
+        });
+        let payload = self.call("POST", ADD_CAT, "", Some(body))?;
+        let data = payload.get("data").cloned().unwrap_or(Value::Null);
+        let id = data
+            .get("_id")
+            .map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string()))
+            .unwrap_or_default();
+        if id.is_empty() {
+            return Err(Error::Failed(format!("创建分类「{name}」后服务器没有返回 id")));
+        }
+        Ok(Category { id, name: data.get("name").and_then(Value::as_str).unwrap_or(name).to_owned() })
+    }
+
+    /// The id of `name`, creating the category when it does not exist yet.
+    pub fn find_or_create_category(&self, name: &str, desc: &str) -> Result<Category, Error> {
+        // A server that is briefly unreachable still gets a creation attempt.
+        if let Ok(categories) = self.list_categories()
+            && let Some(found) = categories.into_iter().find(|c| c.name == name && !c.id.is_empty())
+        {
+            return Ok(found);
+        }
+        self.create_category(name, desc)
+    }
+
+    pub fn list_apis(&self, cat_id: &str) -> Result<Vec<ApiBrief>, Error> {
+        let query = format!(
+            "token={}&project_id={}&catid={}&limit=5000",
+            enc(&self.token),
+            enc(&self.project_id),
+            enc(cat_id)
+        );
+        let payload = self.call("GET", LIST_CAT, &query, None)?;
+        let items = payload
+            .get("data")
+            .and_then(|d| d.get("list"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                Some(ApiBrief {
+                    id: item.get("_id").map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string()))?,
+                    path: item.get("path").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                    method: item.get("method").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                })
+            })
+            .collect())
+    }
+
+    pub fn save_api(&self, doc: &Value, cat_id: &str, existing_id: Option<&str>) -> Result<(), Error> {
+        let mut body = doc.clone();
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("token".into(), Value::String(self.token.clone()));
+            obj.insert("project_id".into(), Value::String(self.project_id.clone()));
+            obj.insert("catid".into(), Value::String(cat_id.to_owned()));
+            if let Some(id) = existing_id {
+                obj.insert("id".into(), Value::String(id.to_owned()));
+            }
+        }
+        self.call("POST", SAVE_API, "", Some(body)).map(|_| ())
+    }
+}
+
+fn kv(name: &str, value: &str, desc: &str, required: bool) -> Value {
+    json!({ "name": name, "value": value, "example": value, "desc": desc, "required": required })
+}
+
+fn header_kv(name: &str, desc: &str, required: bool) -> Value {
+    json!({ "name": name, "value": "", "example": "", "desc": desc, "required": required })
+}
+
+fn path_params(params: &[ParamSpec]) -> Value {
+    Value::Array(
+        params
+            .iter()
+            .map(|p| json!({ "name": p.name, "example": example_for(&p.ty), "desc": p.description }))
+            .collect(),
+    )
+}
+
+fn example_for(ty: &str) -> String {
+    let simple = crate::model::simple_name(ty);
+    match simple.as_str() {
+        "int" | "Integer" | "long" | "Long" | "short" | "Short" | "byte" | "Byte" => "1".into(),
+        "double" | "Double" | "float" | "Float" | "BigDecimal" => "1.0".into(),
+        "boolean" | "Boolean" => "true".into(),
+        _ => String::new(),
+    }
+}
+
+/// The YApi interface document for one endpoint.
+pub fn api_doc(endpoint: &Endpoint, dto: &DtoIndex, depth: u32) -> Value {
+    let resolve = |name: &str, _d: u32| {
+        let fields = dto.fields.get(name)?;
+        Some(ResolvedClass { params: dto.params.get(name).cloned().unwrap_or_default(), fields: fields.clone() })
+    };
+    let request_type = endpoint.body_type.clone();
+    let req_body_other = request_type
+        .as_ref()
+        .map(|ty| body_schema(ty, depth, &resolve))
+        .unwrap_or_else(|| json!({ "type": "object", "properties": {} }).to_string());
+    let res_body = if endpoint.return_type.trim().is_empty() {
+        json!({ "type": "object", "properties": {} }).to_string()
+    } else {
+        body_schema(&endpoint.return_type, depth, &resolve)
+    };
+
+    json!({
+        "title": endpoint.summary,
+        "path": endpoint.path,
+        "method": endpoint.yapi_method(),
+        "desc": endpoint.description,
+        "markdown": format!(
+            "## {}\n\n{}\n\n来源：`{}`（{} {}）",
+            endpoint.summary,
+            endpoint.description,
+            endpoint.handler(),
+            endpoint.framework,
+            endpoint.file
+        ),
+        "status": "done",
+        "req_body_is_json_schema": true,
+        "res_body_is_json_schema": true,
+        "req_headers": Value::Array(endpoint.header_params.iter().map(|p| header_kv(&p.name, &p.description, p.required)).collect()),
+        "req_query": Value::Array(endpoint.query_params.iter().map(|p| kv(&p.name, &example_for(&p.ty), &p.description, p.required)).collect()),
+        "req_params": path_params(&endpoint.path_params),
+        "req_body_form": Value::Array(Vec::new()),
+        "req_body_other": req_body_other,
+        "req_body_type": "json",
+        "res_body": res_body,
+        "res_body_type": "json",
+        "tags": [endpoint.class_name.clone()],
+        "tag": [endpoint.class_name.clone()],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Endpoint, FieldSpec, ParamSpec};
+
+    fn endpoint() -> Endpoint {
+        Endpoint {
+            method: Some("POST".into()),
+            path: "/api/users".into(),
+            class_name: "UserController".into(),
+            method_name: "create".into(),
+            summary: "创建用户".into(),
+            description: "创建一个用户".into(),
+            body_type: Some("CreateUser".into()),
+            return_type: "Result<UserDto>".into(),
+            query_params: vec![ParamSpec { name: "verbose".into(), ty: "boolean".into(), required: false, description: String::new() }],
+            path_params: vec![ParamSpec { name: "id".into(), ty: "long".into(), required: true, description: String::new() }],
+            ..Endpoint::default()
+        }
+    }
+
+    #[test]
+    fn document_carries_schemas_and_sources() {
+        let mut dto = DtoIndex::default();
+        dto.fields.insert(
+            "CreateUser".to_owned(),
+            vec![FieldSpec { name: "name".into(), ty: "String".into(), description: "名字".into(), children: vec![] }],
+        );
+        dto.fields.insert(
+            "UserDto".to_owned(),
+            vec![FieldSpec { name: "id".into(), ty: "long".into(), description: String::new(), children: vec![] }],
+        );
+        let doc = api_doc(&endpoint(), &dto, 2);
+        assert_eq!(doc["method"], "POST");
+        assert_eq!(doc["path"], "/api/users");
+        assert_eq!(doc["req_query"][0]["name"], "verbose");
+        assert_eq!(doc["req_query"][0]["example"], "true");
+        assert_eq!(doc["req_params"][0]["example"], "1");
+        let req: Value = serde_json::from_str(doc["req_body_other"].as_str().unwrap()).unwrap();
+        assert_eq!(req["properties"]["name"]["description"], "名字");
+        let res: Value = serde_json::from_str(doc["res_body"].as_str().unwrap()).unwrap();
+        assert_eq!(res["type"], "object");
+        assert_eq!(res["properties"]["id"]["type"], "number");
+        assert!(doc["markdown"].as_str().unwrap().contains("UserController#create"));
+    }
+
+    #[test]
+    fn urls_are_percent_encoded() {
+        assert_eq!(enc("a b/c"), "a%20b%2Fc");
+        assert_eq!(enc("中文"), "%E4%B8%AD%E6%96%87");
+    }
+}

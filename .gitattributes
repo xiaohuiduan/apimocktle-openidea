@@ -1,0 +1,17 @@
+# Keep LF in the repository and in every working copy. This project is built on
+# Windows but the sources, the packaged page and the specs are all LF; letting
+# core.autocrlf rewrite them would turn every checkout into a fake diff.
+* text=auto eol=lf
+
+# The component is a binary artifact; never attempt text normalisation on it.
+*.wasm binary
+
+# Trellis: append-only developer journals should merge cleanly across
+# parallel sessions/worktrees — each session only appends a new block, so
+# there is nothing to actually conflict on.
+#
+# Do NOT add a rule for workspace/*/index.md here — it is fully regenerated
+# every session, so a real conflict there is expected and safe to resolve by
+# picking either side (task state lives in task.json, not index.md). See
+# .trellis/spec/cli/backend/directory-structure.md for details.
+.trellis/workspace/*/journal-*.md merge=union

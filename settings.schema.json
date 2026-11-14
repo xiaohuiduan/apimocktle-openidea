@@ -1,0 +1,29 @@
+{
+  "properties": {
+    "serverUrl": {
+      "type": "string",
+      "title": "服务器地址",
+      "description": "ApiMocktle / YApi 服务器根地址，例如 http://localhost:4000",
+      "default": "http://localhost:4000"
+    },
+    "token": {
+      "type": "string",
+      "title": "个人令牌",
+      "description": "在 ApiMocktle 的「设置 › 令牌」里生成，保存在本机插件设置中",
+      "default": ""
+    },
+    "includeKotlin": {
+      "type": "boolean",
+      "title": "同时扫描 Kotlin 源码",
+      "default": true
+    },
+    "schemaDepth": {
+      "type": "number",
+      "title": "请求/响应体展开深度",
+      "description": "DTO 字段递归解析的最大层数（1-4）；超过类型链深度后不再变化，实测 3 层已覆盖常见结构",
+      "default": 3,
+      "minimum": 1,
+      "maximum": 4
+    }
+  }
+}

@@ -1,0 +1,67 @@
+id = "apimocktle.openidea"
+name = "ApiMocktle"
+version = "0.2.0"
+description = "从 Java/Kotlin 源码（Spring MVC、JAX-RS、Feign）提取 HTTP 接口，浏览它们，并导出到 ApiMocktle / YApi 兼容的服务器。"
+authors = ["ApiMocktle"]
+license = "Apache-2.0"
+change-notes = "0.2.0 — 只保留两件事：浏览接口、导出到 ApiMocktle；分类 id 跨批持久化并在失效时自动重建。响应/请求体保留项目里定义的包装类型（Result 等）并代入泛型实参，接口参数结构不再为空。"
+categories = ["frameworks", "tools"]
+icon = "icons/apimocktle.svg"
+engines.openidea = "^1.7"
+wasm = "dist/plugin.wasm"
+activation = ["on-command:*", "on-view:dashboard", "on-schedule:60"]
+
+[capabilities]
+required = ["project.read", "storage", "net:localhost", "net:127.0.0.1"]
+
+[[contributes.commands]]
+id = "export-project"
+title = "ApiMocktle: 导出项目接口"
+category = "ApiMocktle"
+
+[[contributes.commands]]
+id = "export-file"
+title = "ApiMocktle: 导出当前文件接口"
+category = "ApiMocktle"
+
+[[contributes.commands]]
+id = "export-continue"
+title = "ApiMocktle: 继续同步剩余接口"
+category = "ApiMocktle"
+
+[[contributes.commands]]
+id = "open-dashboard"
+title = "ApiMocktle: 打开 API 仪表盘"
+category = "ApiMocktle"
+
+[[contributes.commands]]
+id = "refresh"
+title = "ApiMocktle: 重新扫描接口"
+category = "ApiMocktle"
+
+[[contributes.keymaps]]
+command = "export-file"
+key = "Alt+Shift+E"
+mac = "Alt+Shift+E"
+
+[[contributes.menus]]
+menu = "editor.context"
+command = "export-file"
+when = "editorFocus"
+
+[[contributes.menus]]
+menu = "projectView.context"
+command = "export-file"
+
+[[contributes.views]]
+id = "dashboard"
+title = "ApiMocktle"
+icon = "icons/apimocktle.svg"
+location = "bottom"
+
+[contributes.settings]
+title = "ApiMocktle"
+schema = "settings.schema.json"
+
+[[contributes.endpoints]]
+files = ["**/*.java", "**/*.kt"]
