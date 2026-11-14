@@ -1,3 +1,0 @@
-{"file": ".trellis/spec/plugin/schema-contract.md", "reason": "检查替换逻辑是否破坏判定顺序、容器与包装的分工，以及是否补足降级用例"}
-{"file": ".trellis/spec/plugin/scanner-contract.md", "reason": "检查 spring.rs 改动是否影响现有解析规则（record/构造器/Kotlin）与位置坐标"}
-{"file": ".trellis/spec/plugin/quality-guidelines.md", "reason": "生产代码零 panic、测试命名与断言风格、文案一致性"}

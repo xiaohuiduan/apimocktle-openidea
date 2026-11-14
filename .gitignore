@@ -6,3 +6,12 @@
 # every run, so tracking them would leave the tree permanently dirty.
 dist/*.zip
 dist/*.sources
+
+# Publisher signing key from `openidea-plugin keygen`. A leaked key hands the
+# whole `apimocktle.*` namespace to whoever has it, so it must never be staged.
+*.key
+
+# Trellis working data stays local: specs, tasks, workspace journals, scripts
+# and the workflow scaffolding are per-machine state, not shipped with the
+# plugin. `trellis update` keeps maintaining them on disk.
+/.trellis/
