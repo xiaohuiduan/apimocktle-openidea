@@ -240,9 +240,18 @@ fn example_for(ty: &str) -> String {
 /// `YapiFormParam.type`: an upload part is `file`, everything else `text`.
 /// The parameter type decides this on its own; `consumes` is not parsed, since
 /// a second source of truth would fight the parameter classification.
+///
+/// A collection names its element, not the field: `List<MultipartFile>` looks
+/// like `List` from the outside, so the collection has to be unwrapped before
+/// deciding. Only collections are unwrapped — a `Map<String, MultipartFile>` is
+/// still one text field, not an upload.
 fn form_type(ty: &str) -> &'static str {
-    let simple = crate::model::simple_name(ty);
-    if simple == "MultipartFile" || simple.ends_with("Part") { "file" } else { "text" }
+    let (base, args) = crate::model::split_type(ty);
+    let base = base.rsplit('.').next().unwrap_or(&base);
+    if crate::model::is_array_like(base) {
+        return args.first().map_or("text", |element| form_type(element));
+    }
+    if base == "MultipartFile" || base.ends_with("Part") { "file" } else { "text" }
 }
 
 /// The `req_body_form` array, shaped like the upstream `YapiFormParam`.
@@ -391,6 +400,31 @@ mod tests {
         // The JSON-Schema slot keeps its old shape under `req_body_type = form`.
         let other: Value = serde_json::from_str(doc["req_body_other"].as_str().expect("a string")).unwrap();
         assert_eq!(other["type"], "object");
+    }
+
+    #[test]
+    fn a_file_collection_is_typed_by_its_element() {
+        // Spring binds a list of files as an upload; the outer name of a
+        // collection says nothing about what it carries.
+        assert_eq!(form_type("MultipartFile"), "file");
+        assert_eq!(form_type("org.springframework.web.multipart.MultipartFile"), "file");
+        assert_eq!(form_type("MultipartFile[]"), "file");
+        assert_eq!(form_type("jakarta.servlet.http.Part"), "file");
+
+        assert_eq!(form_type("List<MultipartFile>"), "file");
+        assert_eq!(form_type("Set<MultipartFile>"), "file");
+        assert_eq!(form_type("Collection<Part>"), "file");
+        assert_eq!(form_type("List<jakarta.servlet.http.Part>"), "file");
+
+        // Text parts keep their type, including collections of them.
+        assert_eq!(form_type("String"), "text");
+        assert_eq!(form_type("List<String>"), "text");
+        assert_eq!(form_type("int"), "text");
+
+        // Only collections are unwrapped: a Map is one text field, not an upload.
+        assert_eq!(form_type("Map<String, MultipartFile>"), "text");
+        // A bare collection carries no element type to inspect.
+        assert_eq!(form_type("List"), "text");
     }
 
     #[test]

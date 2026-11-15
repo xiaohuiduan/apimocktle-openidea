@@ -136,7 +136,7 @@ fn the_fixture_project_exports_end_to_end() {
 
     assert_eq!(scanned.files, 9, "every fixture source is read");
     let labels: Vec<String> = scanned.endpoints.iter().map(|e| e.key()).collect();
-    assert_eq!(scanned.endpoints.len(), 9, "{labels:?}");
+    assert_eq!(scanned.endpoints.len(), 10, "{labels:?}");
 
     let client =
         yapi::Client { base: "http://localhost:4000".into(), token: "secret-token".into(), project_id: "p1".into() };
@@ -147,9 +147,9 @@ fn the_fixture_project_exports_end_to_end() {
         client.save_api(&doc, &cat.id, None).expect("a save");
         docs.push((endpoint.key(), doc));
     }
-    assert_eq!(docs.len(), 9);
+    assert_eq!(docs.len(), 10);
     let saves = host.requests().iter().filter(|r| r.url.contains("/api/interface/save")).count();
-    assert_eq!(saves, 9, "one save per endpoint");
+    assert_eq!(saves, 10, "one save per endpoint");
 
     // Feign: `name` is a discovery name, so it must not reach the route.
     assert!(labels.iter().all(|key| !key.contains("passenger-service")), "{labels:?}");
@@ -199,6 +199,22 @@ fn the_fixture_project_exports_end_to_end() {
     let metadata = form.iter().find(|part| part["name"] == "metadata").expect("the metadata part");
     assert_eq!(metadata["type"], "text");
     assert_eq!(metadata["required"], 0);
+
+    // Collection-valued parts: the element type decides, not the wrapper name.
+    // `List<MultipartFile>` and `List<Part>` are uploads; `String` is not.
+    let many = doc(&docs, "POST /api/upload/files");
+    assert_eq!(many["req_body_type"], "form");
+    let parts = many["req_body_form"].as_array().expect("an array of parts");
+    assert_eq!(parts.len(), 3, "{parts:?}");
+    for name in ["files", "parts"] {
+        let part = parts
+            .iter()
+            .find(|part| part["name"] == name)
+            .unwrap_or_else(|| panic!("the {name} part: {parts:?}"));
+        assert_eq!(part["type"], "file", "{name} carries uploads");
+    }
+    let note = parts.iter().find(|part| part["name"] == "note").expect("the note part");
+    assert_eq!(note["type"], "text", "a text part stays text next to file parts");
 
     // A method without form parts keeps the JSON shape byte for byte.
     let json_save = doc(&docs, "POST /api/passenger/save");

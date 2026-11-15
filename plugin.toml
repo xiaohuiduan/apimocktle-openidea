@@ -1,11 +1,11 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.2.1"
+version = "0.2.2"
 description = "从 Java/Kotlin 源码（Spring MVC、JAX-RS、Feign）提取 HTTP 接口，浏览它们，并导出到 ApiMocktle / YApi 兼容的服务器。"
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.2.1 — 修三处缺陷：① 导出队列记住目标服务器与令牌指纹，设置改变后剩余批次暂停并提示两条出路，不再把接口发到另一个服务器；分类 id 缓存按服务器隔离。② multipart / form 参数（@RequestPart、@FormParam、@ModelAttribute）写入 req_body_form、req_body_type 为 form，请求体不再被描述成空 JSON 对象。③ Kotlin 类里的属性初始化器（如 private val client = Client()）不再吞掉其后的方法，此前整个类可能扫描出 0 个接口。"
+change-notes = "0.2.2 — 集合形态的上传参数（List<MultipartFile>、List<Part>、MultipartFile[]、Set<MultipartFile>）按元素类型判定，导出为 file；此前只看外层类型名（List），会被描述成文本字段，跟随该契约的客户端无法提交文件。Map<String, MultipartFile> 不穿透，仍按文本字段处理；单值参数与普通文本字段行为不变。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.7"

@@ -163,7 +163,7 @@ required = ["project.read", "storage", "net:api.example.com"]   # HTTPS
 ## 测试
 
 ```sh
-cargo test                      # 48 个用例：解析、Schema、YApi 编码、队列目标绑定，以及扫描→文档→保存整链路
+cargo test                      # 49 个用例：解析、Schema、YApi 编码、队列目标绑定，以及扫描→文档→保存整链路
 pwsh script/package.ps1         # 重建组件并打包（含 icons/）
 ```
 

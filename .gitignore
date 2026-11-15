@@ -15,6 +15,10 @@ dist/*.sources
 # whole `apimocktle.*` namespace to whoever has it, so it must never be staged.
 *.key
 
+# OpenIDEA's per-project IDE state (changelists, shelf). It appears as soon as
+# the fixture is opened as a project and is never part of the samples.
+.openidea/
+
 # Trellis working data stays local: specs, tasks, workspace journals, scripts
 # and the workflow scaffolding are per-machine state, not shipped with the
 # plugin. `trellis update` keeps maintaining them on disk.

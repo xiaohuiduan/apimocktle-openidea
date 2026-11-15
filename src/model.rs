@@ -141,7 +141,7 @@ const WRAPPERS: &[&str] = &[
     "IPage",
 ];
 
-fn is_array_like(base: &str) -> bool {
+pub(crate) fn is_array_like(base: &str) -> bool {
     matches!(
         base,
         "List" | "Set" | "Collection" | "Iterable" | "ArrayList" | "LinkedList" | "Queue" | "Deque" | "Stream"
