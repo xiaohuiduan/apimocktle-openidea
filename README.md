@@ -1,10 +1,17 @@
 # ApiMocktle for OpenIDEA
 
 把 IntelliJ 版 [ApiMocktle-java-plugin](https://github.com/xiaohuiduan/ApiMocktle-java-plugin) 的核心能力搬到
-[OpenIDEA](https://openidea.sh/zh/plugins) 的插件模型上：从 Java / Kotlin 源码提取 HTTP 接口，浏览、跳转、复制 curl，
-并同步到 ApiMocktle / YApi 兼容的 mock 服务器。
+[OpenIDEA](https://openidea.sh/zh/plugins) 的插件模型上：从 Java / Kotlin 源码提取 HTTP 接口，浏览、跳转，
+并同步到 ApiMocktle。
 
 插件是一个 WebAssembly 组件，通过 `plugin.toml` 声明贡献点，代码只经 `wit/` 暴露的宿主接口访问项目和网络。
+
+## ApiMocktle 是什么
+
+[ApiMocktle](https://github.com/xiaohuiduan/ApiMocktle) 是一个本地运行的 API 管理桌面应用
+（Tauri + React + Rust + SQLite）：接口文档、请求调试、自动化测试编排、OpenAPI / Swagger 导入导出与
+局域网分享都在本机完成。本插件负责其中「从代码生成接口文档」这一段：扫描项目源码，用个人令牌把接口
+写进 ApiMocktle 的项目目录。
 
 ## 和 IntelliJ 版的关系
 
@@ -96,7 +103,7 @@ cargo run --example scan_dir -- C:\path\to\project
 
 | 项 | 说明 |
 | - | - |
-| 服务器地址 | ApiMocktle / YApi 根地址，默认 `http://localhost:4000` |
+| 服务器地址 | ApiMocktle 服务器地址，默认 `http://localhost:4000` |
 | 个人令牌 | 在 ApiMocktle 里生成；保存在本机插件设置中 |
 | 同时扫描 Kotlin 源码 | 默认开 |
 | 请求/响应体展开深度 | DTO 递归层数，1–4，默认 3 |

@@ -1,11 +1,11 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.2.2"
-description = "从 Java/Kotlin 源码（Spring MVC、JAX-RS、Feign）提取 HTTP 接口，浏览它们，并导出到 ApiMocktle / YApi 兼容的服务器。"
+version = "0.2.3"
+description = "扫描 Java/Kotlin 源码里的 HTTP 接口（Spring MVC、JAX-RS、Feign），在底部仪表盘按控制器浏览、搜索、跳到源码声明，接口也会进入 Search Everywhere，并在 .http 文件里补全 URL。导出到 ApiMocktle：选定目标项目，自动创建分类、按 method + path 更新已有接口，请求/响应体按项目里的 DTO 生成 JSON Schema（Result<T> 这类包装保留字段并代入泛型实参，multipart 文件字段一并导出）。ApiMocktle（https://github.com/xiaohuiduan/ApiMocktle）是一个本地运行的 API 管理桌面应用，接口文档、请求调试、自动化测试和局域网分享都在本机完成。"
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.2.2 — 集合形态的上传参数（List<MultipartFile>、List<Part>、MultipartFile[]、Set<MultipartFile>）按元素类型判定，导出为 file；此前只看外层类型名（List），会被描述成文本字段，跟随该契约的客户端无法提交文件。Map<String, MultipartFile> 不穿透，仍按文本字段处理；单值参数与普通文本字段行为不变。"
+change-notes = "0.2.3 — 重写插件概览：说明扫描、浏览与导出流程，并介绍 ApiMocktle 是什么、附仓库地址；README 同步补充该介绍。功能与行为未变。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.7"
