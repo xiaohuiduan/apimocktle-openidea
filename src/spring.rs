@@ -373,6 +373,27 @@ fn parse_body(src: &str, lexed: &Lexed, from: usize, to: usize, class: &mut Clas
         if is(src, lexed, i, '@')
             && let Some((ann, next)) = read_ann(src, lexed, i)
         {
+            // Kotlin has no `;`, so an annotation always starts a new
+            // declaration. A statement still sitting in `seg`
+            // (`private val client = Client()`, or the `= "x"` tail of an
+            // expression-bodied function) must be settled here: its `=` would
+            // otherwise make every later `(` look like an initializer and the
+            // methods that follow are swallowed into the property. Java
+            // declarations end with `;`, so nothing is pending there and this
+            // stays out of Java's way — including a type annotation inside a
+            // generic or array type, which belongs to the field being built.
+            let kotlin_leftover = seg
+                .iter()
+                .copied()
+                .any(|t| ident(src, lexed, t).is_some_and(|w| matches!(w, "val" | "var" | "fun")));
+            let body_tail = seg.first().is_some_and(|&t| is(src, lexed, t, '='));
+            if !seg.is_empty() && (kotlin_leftover || body_tail) {
+                if let Some(field) = parse_field(src, lexed, &seg, &anns) {
+                    class.fields.push(field);
+                }
+                anns.clear();
+                seg.clear();
+            }
             anns.push(ann);
             i = next;
             continue;
@@ -430,11 +451,12 @@ fn parse_body(src: &str, lexed: &Lexed, from: usize, to: usize, class: &mut Clas
             i += 1;
             continue;
         }
-        // Kotlin declares properties without a trailing `;`, so a `val`/`var`
-        // ends the statement before it.
+        // Kotlin declarations have no trailing `;`, so `val`, `var` and `fun`
+        // end the statement before them. Without this a property initializer
+        // leaks its `=` into the declaration that follows and swallows it.
         if !seg.is_empty()
             && let Some(word) = ident(src, lexed, i)
-            && (word == "val" || word == "var")
+            && matches!(word, "val" | "var" | "fun")
         {
             if let Some(field) = parse_field(src, lexed, &seg, &anns) {
                 class.fields.push(field);
@@ -1119,6 +1141,151 @@ class OrderController {
         assert_eq!((eps[0].params[0].name.as_str(), eps[0].params[0].ty.as_str()), ("id", "Long"));
         assert_eq!((eps[0].params[1].name.as_str(), eps[0].params[1].ty.as_str()), ("q", "String"));
         assert_eq!(eps[1].body_type.as_deref(), Some("CreateOrder"));
+    }
+
+    #[test]
+    fn a_kotlin_property_initializer_does_not_swallow_the_methods_after_it() {
+        // Kotlin has no `;`: the `=` of `private val client = Client()` used to
+        // stay in the statement buffer, so every later `(` looked like a field
+        // initializer and the whole class produced no endpoints.
+        let src = r#"
+            @RestController
+            @RequestMapping("/k")
+            class KotlinClient(private val service: Service) {
+                private val client = Client()
+                private val hits = Counter()
+
+                @GetMapping("/a")
+                fun a(): String = "x"
+
+                @GetMapping("/b")
+                fun b(@RequestParam("q") q: String): String {
+                    return client.call(q)
+                }
+            }
+        "#;
+        let model = parse(src);
+        let eps = endpoints(&model, src);
+        assert_eq!(eps.len(), 2, "{eps:#?}");
+        assert_eq!(eps[0].path, "/k/a");
+        assert_eq!(eps[1].path, "/k/b");
+        assert_eq!(eps[1].return_type, "String");
+        assert_eq!(eps[1].params[0].name, "q");
+    }
+
+    #[test]
+    fn a_java_field_annotation_still_reaches_its_field() {
+        // The Kotlin guard must not touch Java: a declaration there ends with
+        // `;`, so nothing is pending when the annotation starts.
+        let src = r#"
+public class UserDto {
+    @JsonIgnore
+    private String secret;
+}
+"#;
+        let model = parse(src);
+        let fields = &model.classes[0].fields;
+        assert_eq!(fields.len(), 1, "{fields:?}");
+        assert_eq!(fields[0].name, "secret");
+        assert_eq!(fields[0].ty, "String");
+        assert_eq!(fields[0].anns[0].name, "JsonIgnore");
+    }
+
+    #[test]
+    fn an_annotation_after_an_opening_brace_belongs_to_the_first_member() {
+        let src = r#"
+public class UserDto {
+    @JsonProperty("user_name")
+    private String name;
+}
+"#;
+        let model = parse(src);
+        let fields = &model.classes[0].fields;
+        assert_eq!(fields.len(), 1, "{fields:?}");
+        assert_eq!(fields[0].name, "name");
+        assert_eq!(fields[0].ty, "String");
+        assert_eq!(fields[0].anns[0].strings("value"), vec!["user_name"]);
+    }
+
+    #[test]
+    fn stacked_annotations_land_on_one_declaration() {
+        let src = r#"
+public class UserDto {
+    @JsonIgnore
+    @JsonProperty("nick")
+    private String nickname;
+}
+"#;
+        let model = parse(src);
+        let fields = &model.classes[0].fields;
+        assert_eq!(fields.len(), 1, "{fields:?}");
+        assert_eq!(fields[0].name, "nickname");
+        let anns: Vec<&str> = fields[0].anns.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(anns, vec!["JsonIgnore", "JsonProperty"]);
+    }
+
+    #[test]
+    fn a_kotlin_property_keeps_its_annotation_without_a_semicolon() {
+        // Kotlin writes `@Ann val name: Type` with no `;`: the annotation is
+        // stored for the property that follows it, not for the one before.
+        let src = r#"
+class Wallet {
+    @JsonIgnore
+    val secret: String = ""
+
+    @JsonProperty("balance_value")
+    val balance: Long = 0
+}
+"#;
+        let model = parse(src);
+        let fields = &model.classes[0].fields;
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["secret", "balance"], "{fields:?}");
+        assert_eq!(fields[0].ty, "String");
+        assert_eq!(fields[0].anns[0].name, "JsonIgnore");
+        assert_eq!(fields[1].ty, "Long");
+        assert_eq!(fields[1].anns[0].strings("value"), vec!["balance_value"]);
+    }
+
+    #[test]
+    fn a_type_annotation_inside_generics_keeps_the_field_type() {
+        // `@NonNull` sits inside the type, so the statement does not end there:
+        // cutting the buffer would leave the field typed `String >`.
+        let src = r#"
+public class UserDto {
+    private List<@NonNull String> names;
+}
+"#;
+        let model = parse(src);
+        let fields = &model.classes[0].fields;
+        assert_eq!(fields.len(), 1, "{fields:?}");
+        assert_eq!(fields[0].name, "names");
+        assert_eq!(fields[0].ty, "List<@NonNull String>");
+    }
+
+    #[test]
+    fn an_unannotated_function_after_an_initializer_is_still_read() {
+        // The initializer's `=` must not turn the next `fun` into a field
+        // initializer, whether or not a mapping annotation precedes it.
+        let src = r#"
+@RestController
+@RequestMapping("/k")
+class Svc {
+    private val client = Client()
+
+    private fun helper(x: Int): Int = x
+
+    @GetMapping("/ping")
+    fun ping(): String = "pong"
+}
+"#;
+        let model = parse(src);
+        let methods: Vec<&str> = model.classes[0].methods.iter().map(|m| m.name.as_str()).collect();
+        assert!(methods.contains(&"helper"), "{methods:?}");
+        assert!(methods.contains(&"ping"), "{methods:?}");
+        let eps = endpoints(&model, src);
+        assert_eq!(eps.len(), 1, "{eps:#?}");
+        assert_eq!(eps[0].path, "/k/ping");
     }
 
     #[test]

@@ -52,6 +52,13 @@ fn enc(value: &str) -> String {
     out
 }
 
+/// The base URL as the plugin compares and stores it: no surrounding spaces,
+/// no trailing slash, so `http://x/` and `http://x` are the same target. The
+/// export queue records this form, which is why it is public.
+pub fn normalize_base(base: &str) -> String {
+    base.trim().trim_end_matches('/').to_owned()
+}
+
 /// YApi answers `{"errcode": 0}` on success and a non-zero code otherwise.
 fn check(payload: &Value) -> Result<(), Error> {
     let code = payload.get("errcode").and_then(Value::as_i64).or_else(|| payload.get("code").and_then(Value::as_i64));
@@ -66,7 +73,7 @@ fn check(payload: &Value) -> Result<(), Error> {
 
 impl Client {
     fn trimmed(&self) -> String {
-        self.base.trim().trim_end_matches('/').to_owned()
+        normalize_base(&self.base)
     }
 
     fn call(&self, method: &str, path: &str, query: &str, body: Option<Value>) -> Result<Value, Error> {
@@ -230,6 +237,33 @@ fn example_for(ty: &str) -> String {
     }
 }
 
+/// `YapiFormParam.type`: an upload part is `file`, everything else `text`.
+/// The parameter type decides this on its own; `consumes` is not parsed, since
+/// a second source of truth would fight the parameter classification.
+fn form_type(ty: &str) -> &'static str {
+    let simple = crate::model::simple_name(ty);
+    if simple == "MultipartFile" || simple.ends_with("Part") { "file" } else { "text" }
+}
+
+/// The `req_body_form` array, shaped like the upstream `YapiFormParam`.
+/// `required` is the integer 0 or 1 YApi expects, not a JSON boolean.
+fn form_params(params: &[ParamSpec]) -> Value {
+    Value::Array(
+        params
+            .iter()
+            .map(|p| {
+                json!({
+                    "name": p.name,
+                    "example": example_for(&p.ty),
+                    "type": form_type(&p.ty),
+                    "required": if p.required { 1 } else { 0 },
+                    "desc": p.description,
+                })
+            })
+            .collect(),
+    )
+}
+
 /// The YApi interface document for one endpoint.
 pub fn api_doc(endpoint: &Endpoint, dto: &DtoIndex, depth: u32) -> Value {
     let resolve = |name: &str, _d: u32| {
@@ -241,6 +275,10 @@ pub fn api_doc(endpoint: &Endpoint, dto: &DtoIndex, depth: u32) -> Value {
         .as_ref()
         .map(|ty| body_schema(ty, depth, &resolve))
         .unwrap_or_else(|| json!({ "type": "object", "properties": {} }).to_string());
+    // A form interface is described by `req_body_form`; YApi ignores
+    // `req_body_other` in that mode, so the empty object stays as it was.
+    let form = form_params(&endpoint.form_params);
+    let req_body_type = if endpoint.form_params.is_empty() { "json" } else { "form" };
     let res_body = if endpoint.return_type.trim().is_empty() {
         json!({ "type": "object", "properties": {} }).to_string()
     } else {
@@ -266,9 +304,9 @@ pub fn api_doc(endpoint: &Endpoint, dto: &DtoIndex, depth: u32) -> Value {
         "req_headers": Value::Array(endpoint.header_params.iter().map(|p| header_kv(&p.name, &p.description, p.required)).collect()),
         "req_query": Value::Array(endpoint.query_params.iter().map(|p| kv(&p.name, &example_for(&p.ty), &p.description, p.required)).collect()),
         "req_params": path_params(&endpoint.path_params),
-        "req_body_form": Value::Array(Vec::new()),
+        "req_body_form": form,
         "req_body_other": req_body_other,
-        "req_body_type": "json",
+        "req_body_type": req_body_type,
         "res_body": res_body,
         "res_body_type": "json",
         "tags": [endpoint.class_name.clone()],
@@ -326,5 +364,39 @@ mod tests {
     fn urls_are_percent_encoded() {
         assert_eq!(enc("a b/c"), "a%20b%2Fc");
         assert_eq!(enc("中文"), "%E4%B8%AD%E6%96%87");
+    }
+
+    #[test]
+    fn form_parts_become_req_body_form_entries() {
+        let mut endpoint = endpoint();
+        // A multipart method carries its payload in the parts, not in a JSON body.
+        endpoint.body_type = None;
+        endpoint.form_params = vec![
+            ParamSpec { name: "file".into(), ty: "MultipartFile".into(), required: true, description: "附件".into() },
+            ParamSpec { name: "metadata".into(), ty: "String".into(), required: false, description: String::new() },
+        ];
+        let doc = api_doc(&endpoint, &DtoIndex::default(), 2);
+
+        assert_eq!(doc["req_body_type"], "form");
+        let form = doc["req_body_form"].as_array().expect("an array of parts");
+        assert_eq!(form.len(), 2);
+        assert_eq!(form[0]["name"], "file");
+        assert_eq!(form[0]["type"], "file");
+        // YApi stores `required` as 0 or 1, never as a JSON boolean.
+        assert_eq!(form[0]["required"], 1);
+        assert_eq!(form[0]["desc"], "附件");
+        assert_eq!(form[1]["name"], "metadata");
+        assert_eq!(form[1]["type"], "text");
+        assert_eq!(form[1]["required"], 0);
+        // The JSON-Schema slot keeps its old shape under `req_body_type = form`.
+        let other: Value = serde_json::from_str(doc["req_body_other"].as_str().expect("a string")).unwrap();
+        assert_eq!(other["type"], "object");
+    }
+
+    #[test]
+    fn a_json_body_keeps_req_body_type_json() {
+        let doc = api_doc(&endpoint(), &DtoIndex::default(), 2);
+        assert_eq!(doc["req_body_type"], "json");
+        assert_eq!(doc["req_body_form"], json!([]));
     }
 }

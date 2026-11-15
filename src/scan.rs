@@ -134,6 +134,7 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
                 path_params: pick(&params, ParamKind::Path),
                 query_params: pick(&params, ParamKind::Query),
                 header_params: pick(&params, ParamKind::Header),
+                form_params: pick(&params, ParamKind::Form),
                 body_type: raw.body_type.clone(),
                 return_type: raw.return_type.clone(),
             });
@@ -158,6 +159,9 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
     })
 }
 
+/// The parameters of one kind, in declaration order. `ParamKind::Cookie` is
+/// deliberately never picked: neither YApi nor the upstream plugin exports
+/// cookie parameters, so they stop here.
 fn pick(params: &[(ParamSpec, ParamKind)], kind: ParamKind) -> Vec<ParamSpec> {
     params.iter().filter(|(_, k)| *k == kind).map(|(p, _)| p.clone()).collect()
 }

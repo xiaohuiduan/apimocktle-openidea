@@ -38,7 +38,8 @@ const BATCH: usize = 200;
 /// Stop starting new interfaces past this; the host kills a command at 5 s.
 const BUDGET: Duration = Duration::from_millis(4_200);
 const QUEUE_KEY: &str = "export:queue";
-/// Category ids per project, kept across batches.
+/// Category ids per server and project, kept across batches. The base URL is
+/// part of the key so a `catid` from one server is never used on another.
 const CATS_KEY: &str = "cats:";
 const CATEGORY_DESC: &str = "由 OpenIDEA ApiMocktle 插件维护";
 
@@ -84,17 +85,38 @@ fn post(message: Value) {
     let _ = host::post_view_message(VIEW, &message.to_string());
 }
 
-fn load_categories(project_id: &str) -> HashMap<String, String> {
-    host::storage::get(&format!("{CATS_KEY}{project_id}"))
+/// Deterministic, dependency-free fingerprint of the token, recorded in the
+/// export queue so a queue can tell "same authorization" from "another token".
+///
+/// FNV-1a 64 is spelled out on purpose: `DefaultHasher` promises nothing across
+/// processes or Rust versions, so the same token could fingerprint differently
+/// after an IDE restart and pause a perfectly healthy queue. `sha2` would add a
+/// dependency for a change detector. This is not a secret and not a security
+/// boundary — the token itself is never written to storage.
+fn fingerprint(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn cats_key(base: &str, project_id: &str) -> String {
+    format!("{CATS_KEY}{base}:{project_id}")
+}
+
+fn load_categories(base: &str, project_id: &str) -> HashMap<String, String> {
+    host::storage::get(&cats_key(base, project_id))
         .ok()
         .flatten()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default()
 }
 
-fn save_categories(project_id: &str, map: &HashMap<String, String>) {
+fn save_categories(base: &str, project_id: &str, map: &HashMap<String, String>) {
     if let Ok(raw) = serde_json::to_string(map) {
-        let _ = host::storage::set(&format!("{CATS_KEY}{project_id}"), &raw);
+        let _ = host::storage::set(&cats_key(base, project_id), &raw);
     }
 }
 
@@ -121,6 +143,34 @@ fn rebuild_category(client: &yapi::Client, name: &str, cache: &mut HashMap<Strin
     }
     cache.insert(name.to_owned(), created.id.clone());
     Some(created.id)
+}
+
+/// Stops a queue that was built for another server or another token: nothing is
+/// sent, the queue stays, and the status bar says why. The error names both ways
+/// out, because silently resending is the failure this replaces.
+fn pause_for_another_target(queued_base: &str, current_base: &str) -> Error {
+    let same_server = queued_base == current_base;
+    let text = if same_server {
+        "同步已暂停 · 队列用的是另一个令牌"
+    } else {
+        "同步已暂停 · 队列属于另一服务器"
+    };
+    let mismatch = if same_server {
+        "导出队列用的是另一个个人令牌".to_owned()
+    } else {
+        format!("导出队列属于 {queued_base}，当前服务器是 {current_base}")
+    };
+    host::set_status_item(
+        "sync",
+        &StatusItem {
+            text: text.into(),
+            tooltip: Some("改回原来的服务器地址和令牌即可继续；要发到当前服务器请重新导出".into()),
+            command: Some("open-dashboard".into()),
+        },
+    );
+    Error::Failed(format!(
+        "{mismatch}。改回原来的服务器地址和令牌即可继续；要发到当前服务器，请重新点「导出全部」重新导出。"
+    ))
 }
 
 /// `path` is `target` or inside it, whichever separator the host used.
@@ -229,8 +279,18 @@ impl ApiMocktle {
             })
             .collect();
         let total = items.len();
-        let queue = json!({ "project_id": project_id, "items": items });
+        // The queue records the destination it was built for. Later batches read
+        // it back, so a settings change cannot silently redirect what is left.
+        let queue = json!({
+            "base": yapi::normalize_base(&cfg.base),
+            "auth": fingerprint(&cfg.token),
+            "project_id": project_id,
+            "items": items,
+        });
         host::storage::set(QUEUE_KEY, &queue.to_string())?;
+        // A new queue retires whatever the status bar said about the old one,
+        // including a pause notice left by a queue bound to another server.
+        host::remove_status_item("sync");
         host::log(
             openidea_plugin::LogLevel::Info,
             &format!("ApiMocktle: 待导出 {total} 个接口，目标项目 {project_id}"),
@@ -246,18 +306,42 @@ impl ApiMocktle {
         };
         let mut queue: Value =
             serde_json::from_str(&raw).map_err(|e| Error::Failed(format!("导出队列已损坏：{e}")))?;
-        let project_id = queue.get("project_id").and_then(Value::as_str).unwrap_or_default().to_owned();
         let items = queue.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+        let queued_base = queue.get("base").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let queued_auth = queue.get("auth").and_then(Value::as_str).unwrap_or_default().to_owned();
+        // A queue that cannot name its target — one written by 0.2.0 — is
+        // dropped instead of being guessed at. The command shows
+        // `没有待导出的接口`; the log says what was thrown away, because the
+        // schedule path has no other way to report it.
         if items.is_empty() {
             host::storage::delete(QUEUE_KEY)?;
             return Ok("没有待导出的接口".into());
         }
+        if queued_base.is_empty() || queued_auth.is_empty() {
+            host::storage::delete(QUEUE_KEY)?;
+            host::log(
+                LogLevel::Warn,
+                &format!(
+                    "ApiMocktle: 旧格式的导出队列（{} 个接口）没有目标服务器信息，已丢弃，请重新导出",
+                    items.len()
+                ),
+            );
+            return Ok("没有待导出的接口".into());
+        }
+        let base = yapi::normalize_base(&cfg.base);
+        let auth = fingerprint(&cfg.token);
+        // Sending these items to another server would write them into whatever
+        // project happens to share the id, so the queue stops here instead.
+        if queued_base != base || queued_auth != auth {
+            return Err(pause_for_another_target(&queued_base, &base));
+        }
+        let project_id = queue.get("project_id").and_then(Value::as_str).unwrap_or_default().to_owned();
         let queued = items.len();
         let client = yapi::Client { base: cfg.base.clone(), token: cfg.token.clone(), project_id: project_id.clone() };
 
         // Category ids are kept between batches: every lookup is a round trip,
         // and a five-second command budget only fits so many.
-        let mut categories = load_categories(&project_id);
+        let mut categories = load_categories(&base, &project_id);
         let mut known: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut saved = 0usize;
         let mut failed: Vec<String> = Vec::new();
@@ -313,7 +397,7 @@ impl ApiMocktle {
                 }
             }
         }
-        save_categories(&project_id, &categories);
+        save_categories(&base, &project_id, &categories);
 
         let left = rest.len();
         if left == 0 {
@@ -331,7 +415,7 @@ impl ApiMocktle {
             let shown: Vec<String> = failed.iter().take(3).cloned().collect();
             format!("\n其中 {} 个失败：{}", failed.len(), shown.join("；"))
         };
-        let mut summary = if left == 0 {
+        let summary = if left == 0 {
             format!("全部 {queued} 个接口已同步到 ApiMocktle。{failed_note}")
         } else {
             format!(
@@ -814,6 +898,8 @@ public class UserController {
     fn the_schedule_advances_the_queue_without_a_click() {
         let host = host();
         let queue = json!({
+            "base": "http://localhost:4000",
+            "auth": fingerprint("secret-token"),
             "project_id": "p1",
             "items": [
                 { "cat": "UserController", "doc": { "method": "GET", "path": "/api/users/list" } },
@@ -828,6 +914,242 @@ public class UserController {
         assert!(host::storage::get(QUEUE_KEY).unwrap().is_none(), "the queue is drained");
         let saved = host.requests().iter().filter(|r| r.url.contains("/api/interface/save")).count();
         assert_eq!(saved, 2);
+    }
+
+    /// A queue belongs to the server and token it was built for. Once the
+    /// settings point elsewhere the queue stays put and no request goes out —
+    /// the ids it carries would otherwise write into an unrelated project.
+    #[test]
+    fn a_queue_for_another_server_is_paused_not_resent() {
+        let host = host();
+        let items: Vec<Value> = (0..201)
+            .map(|i| json!({ "cat": "UserController", "doc": { "method": "GET", "path": format!("/api/items/{i}") } }))
+            .collect();
+        let queue = json!({
+            "base": "http://localhost:4000",
+            "auth": fingerprint("secret-token"),
+            "project_id": "p1",
+            "items": items,
+        });
+        host::storage::set(QUEUE_KEY, &queue.to_string()).unwrap();
+
+        let mut plugin = ApiMocktle::default();
+        // The first wake-up posts the batch the queue was built for.
+        plugin.handle_events(&[Event::Scheduled], &host.invocation());
+        let left = {
+            let raw = host::storage::get(QUEUE_KEY).unwrap().expect("a batch leaves items behind");
+            let queued: Value = serde_json::from_str(&raw).unwrap();
+            queued["items"].as_array().map(Vec::len).unwrap_or(0)
+        };
+        assert!(left > 0 && left < 201, "the queue is partially sent: {left}");
+        let before = host.requests().len();
+        assert!(before > 0, "the first batch did go out");
+
+        // The setting moves to another server before the next wake-up.
+        host.set_setting("serverUrl", "\"http://localhost:5000\"");
+        host.set_setting("token", "\"other-token\"");
+        plugin.handle_events(&[Event::Scheduled], &host.invocation());
+
+        assert_eq!(host.requests().len(), before, "a paused queue makes no request at all");
+        assert!(
+            !host.requests().iter().any(|r| r.url.contains("localhost:5000")),
+            "nothing reaches the new server"
+        );
+        let kept = host::storage::get(QUEUE_KEY).unwrap().expect("the queue is kept for later");
+        let kept: Value = serde_json::from_str(&kept).unwrap();
+        assert_eq!(kept["items"].as_array().map(Vec::len), Some(left), "the rest is neither sent nor dropped");
+        let status = host.status_items();
+        let item = status.get("sync").expect("the pause shows in the status bar");
+        assert!(item.text.contains("暂停"), "{}", item.text);
+        assert!(
+            host.logs().iter().any(|(level, text)| *level == LogLevel::Warn && text.contains("自动续传失败")),
+            "{:?}",
+            host.logs()
+        );
+    }
+
+    /// The guard must not fire on a healthy export: the same queue with the
+    /// setting untouched keeps advancing.
+    #[test]
+    fn an_unchanged_target_keeps_the_queue_moving() {
+        let host = host();
+        let queue = json!({
+            "base": "http://localhost:4000",
+            "auth": fingerprint("secret-token"),
+            "project_id": "p1",
+            "items": [
+                { "cat": "UserController", "doc": { "method": "GET", "path": "/api/users/list" } },
+                { "cat": "UserController", "doc": { "method": "POST", "path": "/api/users/create" } },
+            ],
+        });
+        host::storage::set(QUEUE_KEY, &queue.to_string()).unwrap();
+
+        let mut plugin = ApiMocktle::default();
+        plugin.handle_events(&[Event::Scheduled], &host.invocation());
+
+        assert!(host::storage::get(QUEUE_KEY).unwrap().is_none(), "the queue drains");
+        let saved = host.requests().iter().filter(|r| r.url.contains("/api/interface/save")).count();
+        assert_eq!(saved, 2);
+        assert!(!host.status_items().contains_key("sync"), "a finished export leaves no status item");
+    }
+
+    /// A queue written before it recorded a target (0.2.0) cannot be routed:
+    /// it is dropped instead of guessed at, and nothing is sent.
+    #[test]
+    fn an_old_queue_without_a_target_is_dropped() {
+        let host = host();
+        let queue = json!({
+            "project_id": "p1",
+            "items": [{ "cat": "UserController", "doc": { "method": "GET", "path": "/api/users/list" } }],
+        });
+        host::storage::set(QUEUE_KEY, &queue.to_string()).unwrap();
+
+        let mut plugin = ApiMocktle::default();
+        let text = plugin.run_command("export-continue", &host.invocation(), None).unwrap().unwrap();
+
+        assert_eq!(text, "没有待导出的接口");
+        assert!(host::storage::get(QUEUE_KEY).unwrap().is_none(), "the old queue is dropped");
+        assert!(host.requests().is_empty(), "a queue of unknown origin sends nothing");
+        // Dropping is silent in the command's own text, so the log has to say it.
+        assert!(
+            host.logs().iter().any(|(level, text)| *level == LogLevel::Warn && text.contains("已丢弃")),
+            "{:?}",
+            host.logs()
+        );
+    }
+
+    /// A queue that needs several batches must survive its own write-back: the
+    /// target it records has to match the settings on the next wake-up, or a
+    /// healthy export would pause itself after the first batch.
+    #[test]
+    fn a_multi_batch_queue_keeps_moving_across_wake_ups() {
+        let host = host();
+        let items: Vec<Value> = (0..201)
+            .map(|i| json!({ "cat": "UserController", "doc": { "method": "GET", "path": format!("/api/items/{i}") } }))
+            .collect();
+        let queue = json!({
+            "base": "http://localhost:4000",
+            "auth": fingerprint("secret-token"),
+            "project_id": "p1",
+            "items": items,
+        });
+        host::storage::set(QUEUE_KEY, &queue.to_string()).unwrap();
+
+        let mut plugin = ApiMocktle::default();
+        plugin.handle_events(&[Event::Scheduled], &host.invocation());
+        let raw = host::storage::get(QUEUE_KEY).unwrap().expect("the first batch leaves the rest");
+        let queued: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(queued["items"].as_array().map(Vec::len), Some(1), "one item is left over");
+        assert_eq!(queued["base"], "http://localhost:4000", "the write-back keeps its target");
+        assert_eq!(queued["auth"], fingerprint("secret-token"));
+        assert!(host.status_items()["sync"].text.contains("同步中"), "{:?}", host.status_items());
+
+        plugin.handle_events(&[Event::Scheduled], &host.invocation());
+        assert!(host::storage::get(QUEUE_KEY).unwrap().is_none(), "the second wake-up drains it");
+        assert!(!host.status_items().contains_key("sync"), "no pause is reported");
+        let saved = host.requests().iter().filter(|r| r.url.contains("/api/interface/save")).count();
+        assert_eq!(saved, 201, "every queued interface went out exactly once");
+    }
+
+    /// Starting a new export retires the pause notice and the queue that caused
+    /// it: the notice must not outlive the queue it describes.
+    #[test]
+    fn a_new_export_clears_the_pause_notice() {
+        let host = host();
+        let queue = json!({
+            "base": "http://localhost:5000",
+            "auth": fingerprint("other-token"),
+            "project_id": "p1",
+            "items": [{ "cat": "UserController", "doc": { "method": "GET", "path": "/api/users/list" } }],
+        });
+        host::storage::set(QUEUE_KEY, &queue.to_string()).unwrap();
+
+        let mut plugin = ApiMocktle::default();
+        plugin.handle_events(&[Event::Scheduled], &host.invocation());
+        assert!(host.status_items()["sync"].text.contains("暂停"), "{:?}", host.status_items());
+
+        let text = plugin.run_command("export-project", &host.invocation(), None).unwrap().unwrap();
+        assert!(text.contains("已同步到 ApiMocktle"), "{text}");
+        assert!(!host.status_items().contains_key("sync"), "the pause notice is retired: {:?}", host.status_items());
+        let saved = host.requests().iter().filter(|r| r.url.contains("/api/interface/save")).count();
+        assert_eq!(saved, 2, "the new queue goes to the current server");
+    }
+
+    /// A cached category id belongs to one server; the same project id on
+    /// another server must not pick it up.
+    #[test]
+    fn a_category_cache_is_scoped_to_its_server() {
+        let _host = host();
+        let mut first = HashMap::new();
+        first.insert("UserController".to_owned(), "c1".to_owned());
+        save_categories("http://localhost:4000", "p1", &first);
+        let mut second = HashMap::new();
+        second.insert("UserController".to_owned(), "c2".to_owned());
+        save_categories("http://localhost:5000", "p1", &second);
+
+        assert_eq!(load_categories("http://localhost:4000", "p1")["UserController"], "c1");
+        assert_eq!(load_categories("http://localhost:5000", "p1")["UserController"], "c2");
+        assert!(load_categories("http://localhost:9000", "p1").is_empty(), "a third server starts empty");
+    }
+
+    /// Multipart parts reach the model and the document; cookie parameters
+    /// still stop at the parser, exactly as the upstream plugin leaves them out.
+    #[test]
+    fn multipart_parts_reach_the_model_and_cookies_do_not() {
+        let host = host();
+        host.add_file(
+            "/proj/src/UploadController.java",
+            r#"
+package com.acme;
+
+@RestController
+@RequestMapping("/api/files")
+public class UploadController {
+    @PostMapping("/upload")
+    public void upload(@RequestPart("file") MultipartFile file,
+                       @RequestPart(value = "meta", required = false) String meta,
+                       @CookieValue("session") String session) { }
+}
+"#,
+        );
+        let paths = ["/proj/src/UserController.java", "/proj/src/UploadController.java"];
+        host.on_search(move |_query, _limit| {
+            Ok(TextSearch {
+                matches: paths
+                    .iter()
+                    .map(|path| TextMatch {
+                        location: Location {
+                            path: (*path).to_owned(),
+                            range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+                        },
+                        line: String::new(),
+                    })
+                    .collect(),
+                limit_hit: false,
+            })
+        });
+
+        let project = host.invocation().project().expect("a project");
+        let scanned = scan::scan(&project, &scan::Options::default()).unwrap();
+        let upload = scanned
+            .endpoints
+            .iter()
+            .find(|e| e.path == "/api/files/upload")
+            .expect("the upload route");
+        let parts: Vec<&str> = upload.form_params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(parts, vec!["file", "meta"]);
+        assert_eq!(upload.form_params[0].ty, "MultipartFile");
+        assert!(upload.form_params[0].required);
+        assert!(!upload.form_params[1].required);
+        let query: Vec<&str> = upload.query_params.iter().map(|p| p.name.as_str()).collect();
+        assert!(query.is_empty(), "a cookie parameter is not a query parameter either: {query:?}");
+
+        let doc = yapi::api_doc(upload, &scanned.dto, 2);
+        assert_eq!(doc["req_body_type"], "form");
+        assert_eq!(doc["req_body_form"][0]["type"], "file");
+        assert_eq!(doc["req_body_form"][1]["type"], "text");
+        assert_eq!(doc["req_body_form"][0]["required"], 1);
+        assert_eq!(doc["req_body_form"][1]["required"], 0);
     }
 
     #[test]

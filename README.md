@@ -30,7 +30,8 @@ OpenIDEA 插件运行在 WASM 沙箱里，没有 Java PSI、没有 Swing、没�
 - **接口扫描**：Spring MVC（`@RestController`、`@RequestMapping`、`@GetMapping` 等）、JAX-RS（`@Path` + `@GET`）、
   Feign（`@FeignClient`）；Java 与 Kotlin（含 `data class`、`fun ... : T` 返回类型）。
 - **参数分类**：`@PathVariable` / `@RequestParam` / `@RequestHeader` / `@RequestBody` / `@CookieValue` / `@RequestPart`，
-  Java 与 Kotlin 两种参数写法都识别。
+  Java 与 Kotlin 两种参数写法都识别。Form 类参数（`@RequestPart` / `@FormParam` / `@ModelAttribute`）写入
+  `req_body_form` 且 `req_body_type` 为 `form`；Cookie 参数只识别、不导出（上游 IntelliJ 版同样不导出）。
 - **仪表盘**：底部工具窗口，按控制器分组、搜索、查看路径与参数、跳到源码。
 - **导出**：个人令牌 + 目标项目下拉选择，自动创建分类、按 `method + path` 识别已有接口并更新；
   请求/响应体以 JSON Schema 写入：项目源码里定义的包装类型（`Result<T>`、`ApiResponse<T>`…）保留自己的
@@ -117,6 +118,10 @@ cargo run --example scan_dir -- C:\path\to\project
 想立刻推下一批，仍可点通知里的 **立即继续** 或运行命令 *ApiMocktle: 继续同步剩余接口*。队列存在插件存储
 里，关窗口不丢，重启 IDE 后会接着走。
 
+队列记住自己是为哪个服务器、哪个令牌建的。导出进行中改了服务器地址或令牌，剩余批次**暂停**而不是改投到
+新服务器：状态栏显示「同步已暂停 · 队列属于另一服务器」，点通知或改回原设置都能继续；确实要发到新服务器，
+重新点「导出全部」即可。
+
 ## 权限与网络
 
 清单里声明的能力：
@@ -158,12 +163,16 @@ required = ["project.read", "storage", "net:api.example.com"]   # HTTPS
 ## 测试
 
 ```sh
-cargo test                      # 31 个用例：解析、Schema、YApi 编码，以及扫描→导出→定时续传的整链路
+cargo test                      # 48 个用例：解析、Schema、YApi 编码、队列目标绑定，以及扫描→文档→保存整链路
 pwsh script/package.ps1         # 重建组件并打包（含 icons/）
 ```
 
-端到端用例跑在 SDK 的 `MockHost` 上：注入一个 controller 与两个 DTO，断言解析出的路由、生成的
-`req_body_other`/`res_body` Schema、按 YApi 协议实际发出的请求体、视图消息往返、以及发请求拿响应。
+端到端用例跑在 SDK 的 `MockHost` 上：`tests/fixtures_export.rs` 把 `fixtures/spring-demo` 下的全部
+`.java`/`.kt` 注入成项目文件，走 `scan` → `api_doc` → `save_api` 全链路，断言 Feign 服务名不进路径、
+`Result<List<Order>>` 的 `data` 是数组、Kotlin 与 JAX-RS 资源都被识别、multipart 接口带两个 form part；
+`src/lib.rs` 的用例覆盖换服务器暂停、未换服务器继续、旧格式队列丢弃与分类缓存按服务器隔离。
+
+`fixtures/spring-demo` 只是扫描输入，不需要能编译或启动——插件读的是源码文本。
 
 SDK 版本固定在 `Cargo.toml` 的 tag（当前 `v0.1.44`，插件 API 1.7）；升级 IDE 时同步改 tag 与
 `engines.openidea`，两者必须匹配，否则组件与宿主的 WIT 接口对不上。`dist/plugin.wasm` 的导入表已确认是

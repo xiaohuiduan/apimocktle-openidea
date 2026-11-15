@@ -48,6 +48,9 @@ pub struct Endpoint {
     pub path_params: Vec<ParamSpec>,
     pub query_params: Vec<ParamSpec>,
     pub header_params: Vec<ParamSpec>,
+    /// Multipart / form parts (`@RequestPart`, `@FormParam`, `@ModelAttribute`).
+    /// YApi reads these from `req_body_form`, not from the body schema.
+    pub form_params: Vec<ParamSpec>,
     pub body_type: Option<String>,
     pub return_type: String,
 }

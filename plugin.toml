@@ -1,11 +1,11 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.2.0"
+version = "0.2.1"
 description = "从 Java/Kotlin 源码（Spring MVC、JAX-RS、Feign）提取 HTTP 接口，浏览它们，并导出到 ApiMocktle / YApi 兼容的服务器。"
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.2.0 — 只保留两件事：浏览接口、导出到 ApiMocktle；分类 id 跨批持久化并在失效时自动重建。响应/请求体保留项目里定义的包装类型（Result 等）并代入泛型实参，接口参数结构不再为空。"
+change-notes = "0.2.1 — 修三处缺陷：① 导出队列记住目标服务器与令牌指纹，设置改变后剩余批次暂停并提示两条出路，不再把接口发到另一个服务器；分类 id 缓存按服务器隔离。② multipart / form 参数（@RequestPart、@FormParam、@ModelAttribute）写入 req_body_form、req_body_type 为 form，请求体不再被描述成空 JSON 对象。③ Kotlin 类里的属性初始化器（如 private val client = Client()）不再吞掉其后的方法，此前整个类可能扫描出 0 个接口。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.7"
