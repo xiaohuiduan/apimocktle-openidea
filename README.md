@@ -37,7 +37,8 @@ OpenIDEA 插件运行在 WASM 沙箱里，没有 Java PSI、没有 Swing、没�
 - **接口扫描**：Spring MVC（`@RestController`、`@RequestMapping`、`@GetMapping` 等）、JAX-RS（`@Path` + `@GET`）、
   Feign（`@FeignClient`）；Java 与 Kotlin（含 `data class`、`fun ... : T` 返回类型）。
 - **路由常量**：`@PostMapping(RouteConstant.ITEM_QUERY)` 这种把路径写成 `static final` 常量的写法，会跨文件
-  解析常量值。限定名按**声明它的那个类**解析——两个类都有 `PATH` 时 `ARoutes.PATH` 与 `BRoutes.PATH` 各取各的；
+  解析常量值。常量按**声明它的类的全限定名**识别：`com.a.Routes.PATH` 与 `com.b.Routes.PATH` 是两回事，
+  即使两个类同名、甚至两个控制器各 import 一个同名 `Routes` 也各取各的；注解里写全限定名时包名参与识别。
   不带限定名时先看当前类，再看 `import static`，只有全项目唯一声明才按名字兜底，歧义时退回 `/` 而不是猜一个。
   支持类级 `@RequestMapping` 前缀；解析不到时退回 `/`，不影响同类的其他接口。
 - **接口标题**：优先 `@Operation(summary)`（Swagger），其次方法 Javadoc，最后方法名；方法没有自己的 Javadoc
@@ -214,8 +215,8 @@ required = ["project.read", "storage", "net:api.example.com"]   # HTTPS
 - **没有类型系统**：DTO 字段来自文本级解析，跨文件继承、复杂泛型推导、接口多态都不完整；`List<User>` 这类常见形状可靠，
   `Result<? extends Base<T>>` 这类会退化成 `object`。
 - **路由常量只认纯字面量**：`Constants.PREFIX + "/x"` 这种拼接、以及 `String.format(...)`、枚举常量都不解析，
-  这类接口的路径会退回 `/`。常量声明在别的类里时按类名解析；同名常量分属多个类又没写限定名时无法判断，
-  同样退回 `/`。
+  这类接口的路径会退回 `/`。常量的声明类按全限定名识别，但同名常量分属多个类、又既没写限定名也没 import 时
+  无法判断，同样退回 `/`。嵌套在别的类里的常量不支持（源码解析只读顶层类）。
 - **依赖 jar 解析的边界**：只走 Maven（读项目 `pom.xml` 的依赖与传递 POM，最多 200 个 POM），Gradle 项目
   目前读不到仓库依赖；jar 要能在本地仓库里找到（`~/.m2/repository` 或设置里的路径），单个 jar 超过 12 MiB
   就跳过，一次扫描最多读 120 个 jar、单个类最多 32 个（超了就当解析不到）；class 里的 `@JsonProperty` 等
@@ -246,7 +247,7 @@ required = ["project.read", "storage", "net:api.example.com"]   # HTTPS
 ## 测试
 
 ```sh
-cargo test                      # 74 个用例：解析、Schema、ZIP/class、POM、路由常量、YApi 编码、队列，以及端到端链路
+cargo test                      # 77 个用例：解析、Schema、ZIP/class、POM、路由常量、YApi 编码、队列，以及端到端链路
 pwsh script/package.ps1         # 重建组件并打包（含 icons/）
 ```
 
@@ -259,6 +260,7 @@ pwsh script/package.ps1         # 重建组件并打包（含 icons/）
 `ApiEnvelope` 连父类 `code`/`message` 和泛型实参一起导出、实现了接口的包装类（`JailedEnvelope`）仍然保留
 泛型载荷字段，并验证没授权时安静退回；
 `tests/route_constants.rs` 覆盖“路径写成常量”的扫描：限定名按声明类解析（两个类各有 `PATH` 也不串）、
+两个包各有一个同名 `Routes` 时按各自 `import` 解析、注解里写全限定名时包名参与识别、
 不带限定名时当前类优先、`import static` 可解析、同名歧义不猜。
 
 `fixtures/spring-demo` 只是扫描输入，不需要能编译或启动——插件读的是源码文本；`fixtures/deps` 里的

@@ -313,3 +313,131 @@ fn an_ambiguous_bare_name_is_not_guessed() {
         "an unresolvable bare name stays on `/`"
     );
 }
+
+/// Two packages may each declare a class with the same simple name — that is
+/// ordinary Java, and the class identity is the package plus the name. Caching
+/// by `Routes.PATH` loses which `Routes` was meant, so the second controller
+/// silently reuses the first one's path.
+const ROUTES_A: &str = r#"
+package com.a;
+
+public class Routes {
+    public static final String PATH = "/a";
+}
+"#;
+
+const ROUTES_B: &str = r#"
+package com.b;
+
+public class Routes {
+    public static final String PATH = "/b";
+}
+"#;
+
+const CONTROLLER_IMPORTING_A: &str = r#"
+package com.a.web;
+
+import com.a.Routes;
+
+@RestController
+public class AController {
+    @GetMapping(Routes.PATH)
+    public String a() { return null; }
+}
+"#;
+
+const CONTROLLER_IMPORTING_B: &str = r#"
+package com.b.web;
+
+import com.b.Routes;
+
+@RestController
+public class BController {
+    @GetMapping(Routes.PATH)
+    public String b() { return null; }
+}
+"#;
+
+#[test]
+fn same_simple_name_in_two_packages_resolves_per_import() {
+    let keys = scan_with(
+        &[
+            ("a/com/a/Routes.java", ROUTES_A),
+            ("b/com/b/Routes.java", ROUTES_B),
+            ("web/com/a/web/AController.java", CONTROLLER_IMPORTING_A),
+            ("web/com/b/web/BController.java", CONTROLLER_IMPORTING_B),
+        ],
+        &[
+            "web/com/a/web/AController.java",
+            "web/com/b/web/BController.java",
+        ],
+    );
+    assert_eq!(
+        keys,
+        vec!["GET /a".to_owned(), "GET /b".to_owned()],
+        "each controller resolves `Routes` through its own import"
+    );
+}
+
+const CONTROLLER_WITH_FQNS: &str = r#"
+package com.acme.item;
+
+@RestController
+public class FqnController {
+    @GetMapping(com.a.Routes.PATH)
+    public String a() { return null; }
+
+    @GetMapping(com.b.Routes.PATH)
+    public String b() { return null; }
+}
+"#;
+
+#[test]
+fn fully_qualified_constants_keep_their_package() {
+    // The annotation writes the whole qualified name, so the package is part of
+    // the identity and must not be dropped down to the simple class name.
+    let keys = scan_with(
+        &[
+            ("a/com/a/Routes.java", ROUTES_A),
+            ("b/com/b/Routes.java", ROUTES_B),
+            ("item/FqnController.java", CONTROLLER_WITH_FQNS),
+        ],
+        &["item/FqnController.java"],
+    );
+    assert_eq!(
+        keys,
+        vec!["GET /a".to_owned(), "GET /b".to_owned()],
+        "both fully qualified references resolve, and neither collapses onto the other"
+    );
+}
+
+const CONTROLLER_STATIC_IMPORTING_B: &str = r#"
+package com.b.web;
+
+import static com.b.Routes.PATH;
+
+@RestController
+public class BStaticController {
+    @GetMapping(PATH)
+    public String b() { return null; }
+}
+"#;
+
+#[test]
+fn a_static_import_of_a_shared_simple_name_keeps_its_package() {
+    // Both packages declare `Routes`; the static import names `com.b`'s, so the
+    // bare `PATH` must not resolve to `com.a`'s value.
+    let keys = scan_with(
+        &[
+            ("a/com/a/Routes.java", ROUTES_A),
+            ("b/com/b/Routes.java", ROUTES_B),
+            ("web/com/b/web/BStaticController.java", CONTROLLER_STATIC_IMPORTING_B),
+        ],
+        &["web/com/b/web/BStaticController.java"],
+    );
+    assert_eq!(
+        keys,
+        vec!["GET /b".to_owned()],
+        "the static import carries the package, so the right `Routes` answers"
+    );
+}

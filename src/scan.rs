@@ -202,36 +202,58 @@ fn pick(params: &[(ParamSpec, ParamKind)], kind: ParamKind) -> Vec<ParamSpec> {
 /// method of such a controller would be published on `/` and collapse into a
 /// single record in ApiMocktle.
 ///
-/// Keys are `Class.NAME`, never the bare name: two classes may both declare
-/// `PATH`, and a controller that maps `/a` with `ARoutes.PATH` and `/b` with
-/// `BRoutes.PATH` has to get both. A bare name is only used when it is
-/// unambiguous for the file — the enclosing class, a static import, or a name
-/// exactly one class declares.
+/// A constant is identified by its *fully qualified* declaring class plus the
+/// field name: `com.a.Routes.PATH` and `com.b.Routes.PATH` are different
+/// values, while the simple name `Routes` is only a shorthand the file's
+/// imports resolve. Keying by the simple name alone let two packages collide.
+/// A bare name is only used when it is unambiguous for the file — the
+/// enclosing class, a static import, or a name exactly one class declares.
 #[derive(Default)]
 struct Consts {
-    /// `Class.NAME` → the string it assigns.
+    /// `com.a.Routes.PATH` → the string it assigns.
     values: HashMap<String, String>,
-    /// A simple name only one class declares, and that class' key.
+    /// A simple field name only one class declares → its fully qualified key.
     unique: HashMap<String, String>,
-    /// Simple names declared by more than one class with different values.
+    /// Simple field names declared by more than one class with different
+    /// values, so a bare reference to them means nothing on its own.
     ambiguous: HashSet<String>,
-    /// Qualifiers whose declaring file has already been read.
+    /// Fully qualified classes whose source has already been read.
     loaded: HashSet<String>,
+    /// Simple class name → the packages declaring it. A qualifier such as
+    /// `Routes.PATH` is resolved through the file's imports; an import naming
+    /// exactly one of these settles it, two do not.
+    packages: HashMap<String, HashSet<String>>,
 }
 
 impl Consts {
     fn absorb(&mut self, model: &spring::FileModel) {
         for class in &model.classes {
+            let owner = if model.package.is_empty() {
+                class.name.clone()
+            } else {
+                format!("{}.{}", model.package, class.name)
+            };
+            self.packages
+                .entry(class.name.clone())
+                .or_default()
+                .insert(model.package.clone());
             for field in &class.fields {
                 let Some(value) = &field.value else { continue };
-                let key = format!("{}.{}", class.name, field.name);
-                if self.values.contains_key(&key) && self.values[&key] == *value {
+                let key = format!("{owner}.{}", field.name);
+                if let Some(known) = self.values.get(&key) {
+                    if known == value {
+                        continue;
+                    }
+                    // Same class declaring the same field twice: the last
+                    // initializer is not the one an annotation sees anyway.
+                    self.values.insert(key, value.clone());
                     continue;
                 }
-                self.values.insert(key.clone(), value.clone());
+                self.values.insert(key, value.clone());
                 match self.unique.get(&field.name) {
                     None => {
-                        self.unique.insert(field.name.clone(), key);
+                        self.unique
+                            .insert(field.name.clone(), format!("{owner}.{}", field.name));
                     }
                     // The same name with the same value is not a conflict: it
                     // still means one thing.
@@ -247,41 +269,50 @@ impl Consts {
     /// Substitutes constants in every mapping annotation of `model`.
     fn resolve_in(&mut self, project: &Project, options: &Options, model: &mut spring::FileModel) {
         let imports = model.imports.clone();
+        let package = model.package.clone();
         for class in &mut model.classes {
-            let class_name = class.name.clone();
-            resolve_anns(self, project, options, &imports, &mut class.anns, Some(&class_name));
+            // The controller's own class is the first place a bare name looks,
+            // and it is identified by its package too.
+            let owner = if package.is_empty() {
+                class.name.clone()
+            } else {
+                format!("{package}.{}", class.name)
+            };
+            resolve_anns(self, project, options, &imports, &mut class.anns, Some(&owner));
             for method in &mut class.methods {
-                resolve_anns(self, project, options, &imports, &mut method.anns, Some(&class_name));
+                resolve_anns(self, project, options, &imports, &mut method.anns, Some(&owner));
             }
         }
     }
 
-    /// `class` is the type the annotation is written in, if the reference is
-    /// unqualified: its own `static final` wins before any import.
+    /// `owner` is the fully qualified type the annotation is written in, if
+    /// the reference is unqualified: its own `static final` wins before any
+    /// import.
     fn lookup(
         &mut self,
         project: &Project,
         options: &Options,
         idents: &[String],
         imports: &[String],
-        class: Option<&str>,
+        owner: Option<&str>,
     ) -> Option<String> {
         let name = idents.last()?;
         if idents.len() > 1 {
-            // `RouteConstant.ITEM_QUERY`: the qualifier names the declaring
-            // class, so only that class' constant may answer.
+            // `RouteConstant.ITEM_QUERY` / `com.a.Routes.PATH`: the qualifier
+            // names the declaring class, so only that class' constant may
+            // answer.
             let qualifier = idents[..idents.len() - 1].join(".");
-            return self.qualified(project, options, &qualifier, name, imports);
+            return self.qualified_class(project, options, &qualifier, name, imports, owner);
         }
         // `ITEM_QUERY` on its own: the enclosing class first, then a static
         // import, then a name only one class declares.
-        if let Some(class) = class
-            && let Some(value) = self.values.get(&format!("{class}.{name}"))
+        if let Some(owner) = owner
+            && let Some(value) = self.values.get(&format!("{owner}.{name}"))
         {
             return Some(value.clone());
         }
         for owner in static_import_owners(imports, name) {
-            if let Some(value) = self.qualified(project, options, &owner, name, imports) {
+            if let Some(value) = self.qualified_class(project, options, &owner, name, imports, None) {
                 return Some(value);
             }
         }
@@ -291,67 +322,153 @@ impl Consts {
         self.unique.get(name).and_then(|key| self.values.get(key)).cloned()
     }
 
-    /// The value of `Class.NAME`, reading `Class`'s source on demand: the
-    /// annotation search only returns files that declare a mapping, so a
-    /// constants-only class is never among the scanned paths.
-    fn qualified(
+    /// Resolves a class name as it appears in an annotation (`Routes`,
+    /// `com.a.Routes`, `R.Constants`) to the value of `NAME` in that class.
+    fn qualified_class(
         &mut self,
         project: &Project,
         options: &Options,
         qualifier: &str,
         name: &str,
         imports: &[String],
+        owner: Option<&str>,
     ) -> Option<String> {
-        let key = format!("{qualifier}.{name}");
+        let mut tried: Vec<String> = Vec::new();
+        for class in self.class_candidates(qualifier, imports, owner) {
+            if tried.contains(&class) {
+                continue;
+            }
+            if let Some(value) = self.value_of(project, options, &class, name, imports) {
+                return Some(value);
+            }
+            tried.push(class);
+        }
+        None
+    }
+
+    /// The fully qualified classes a written qualifier may name, most likely
+    /// first. `Routes` becomes `com.a.Routes` when the file imports
+    /// `com.a.Routes`; an already qualified `com.b.Routes` names itself.
+    fn class_candidates(&self, qualifier: &str, imports: &[String], owner: Option<&str>) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |candidate: String| {
+            if !candidate.is_empty() && !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        };
+        let segments: Vec<&str> = qualifier.split('.').collect();
+        // A package segment is lower case, a class name is not: the qualifier
+        // already carries its package, and imports have nothing to add.
+        if segments[0].chars().next().is_some_and(|c| c.is_lowercase()) {
+            push(qualifier.to_owned());
+            return out;
+        }
+        // The part after the class name, prefixed with a dot — empty for a
+        // simple name, so nothing like `com.a.Routes.` is ever built.
+        let rest = if segments.len() > 1 {
+            format!(".{}", segments[1..].join("."))
+        } else {
+            String::new()
+        };
+        // A nested class of the enclosing type: `Outer.Inner` inside `Outer`.
+        // The source parser flattens class bodies, so this only ever answers
+        // for a top-level class; it keeps the shape right for a future parser
+        // that reads nested declarations.
+        if let Some(owner) = owner
+            && let Some(outer) = owner.rsplit('.').next()
+            && segments[0] == outer
+        {
+            push(format!("{owner}{rest}"));
+        }
+        // The file's imports decide what a simple name means.
+        for import in imports
+            .iter()
+            .filter(|import| !import.starts_with("static"))
+        {
+            if import.rsplit('.').next() == Some(segments[0]) {
+                push(format!("{import}{rest}"));
+            }
+        }
+        // A same-package class needs no import; `owner` is fully qualified, so
+        // its package is the controller's own.
+        match owner.and_then(|o| o.rsplit_once('.')) {
+            Some((package, _)) => push(format!("{package}.{}{rest}", segments[0])),
+            None => push(format!("{}{rest}", segments[0])),
+        }
+        // Wildcard imports, then any package the project is known to declare
+        // the class in: a simple name that only exists once still resolves.
+        for import in imports {
+            if let Some(base) = import.strip_suffix(".*") {
+                push(format!("{base}.{}", segments.join(".")));
+            }
+        }
+        if let Some(declaring) = self.packages.get(segments[0]) {
+            let mut packages: Vec<&String> = declaring.iter().collect();
+            packages.sort();
+            for package in packages {
+                push(format!("{package}.{}", segments.join(".")));
+            }
+        }
+        out
+    }
+
+    /// The value of `Class.NAME`, reading `Class`'s source on demand: the
+    /// annotation search only returns files that declare a mapping, so a
+    /// constants-only class is never among the scanned paths.
+    fn value_of(
+        &mut self,
+        project: &Project,
+        options: &Options,
+        class: &str,
+        name: &str,
+        imports: &[String],
+    ) -> Option<String> {
+        let key = format!("{class}.{name}");
         if let Some(value) = self.values.get(&key) {
             return Some(value.clone());
         }
-        // `Constants.Sub.PATH` may name a nested class; the file is named after
-        // the outer one, so a miss on the full prefix tries its last segment.
-        let candidates: Vec<&str> = if qualifier.contains('.') {
-            qualifier.rsplit('.').take(2).collect()
-        } else {
-            vec![qualifier]
-        };
-        for candidate in candidates {
-            let key = format!("{candidate}.{name}");
+        if !self.loaded.insert(class.to_owned()) {
+            return None;
+        }
+        // The file is named after the outermost class; a nested one lives
+        // inside it (`com.a.Outer.Inner` → file `Outer`).
+        let simple = class.rsplit('.').next().unwrap_or(class);
+        let outer = class.rsplit('.').nth(1).unwrap_or(simple);
+        for candidate in [simple, outer] {
+            // `com.a.Routes` must not be read out of `com/b/Routes.java`: the
+            // package decides which file is meant.
+            let Some(model) = load_source_for(project, options, candidate, class, imports) else { continue };
+            self.absorb(&model);
             if let Some(value) = self.values.get(&key) {
                 return Some(value.clone());
             }
-            if self.loaded.insert(candidate.to_owned())
-                && let Some(model) = load_source(project, options, candidate, imports)
-            {
-                self.absorb(&model);
-                if let Some(value) = self.values.get(&key) {
-                    return Some(value.clone());
-                }
-            }
         }
-        self.values.get(&format!("{qualifier}.{name}")).cloned()
+        None
     }
 }
 
 /// The classes a static import may take `name` from: `import static a.b.C.NAME`
-/// and `import static a.b.C.*`. The parser glues `static` onto the package
-/// name, so the last segment before the constant is the class either way.
+/// and `import static a.b.C.*`. The source parser glues `static` onto the
+/// package name without a separator (`staticcom.acme.b.BRoutes.PATH`), so that
+/// prefix is stripped here. The full qualified name is returned — `a.b.C`, not
+/// `C` — or two packages' `C` would collide here exactly as in the cache.
 fn static_import_owners(imports: &[String], name: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |owner: &str| {
-        if owner.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && !out.iter().any(|o| o == owner) {
+        let owner = owner.strip_prefix("static").unwrap_or(owner);
+        let owner = owner.trim_start_matches('.');
+        if !owner.is_empty() && !out.iter().any(|o| o == owner) {
             out.push(owner.to_owned());
         }
     };
     for import in imports {
         let Some(rest) = import.strip_suffix(name) else { continue };
         let Some(rest) = rest.strip_suffix('.') else { continue };
-        push(rest.rsplit('.').next().unwrap_or(rest));
+        push(rest);
     }
     for import in imports {
-        if let Some(rest) = import.strip_suffix(".*")
-            && let Some(owner) = rest.rsplit('.').next()
-            && import.starts_with("static")
-        {
-            push(owner);
+        if let Some(rest) = import.strip_suffix(".*") {
+            push(rest);
         }
     }
     out
@@ -379,23 +496,55 @@ fn resolve_anns(
     }
 }
 
-/// The parsed source of the class `name`, preferring the file its import names.
-fn load_source(project: &Project, options: &Options, name: &str, imports: &[String]) -> Option<spring::FileModel> {
+/// The source declaring the class `class` (`com.a.Routes`, `Outer.Inner`),
+/// whose file is named after `name`. The package has to match the file's, or
+/// two packages' `Routes` would answer for each other.
+fn load_source_for(
+    project: &Project,
+    options: &Options,
+    name: &str,
+    class: &str,
+    imports: &[String],
+) -> Option<spring::FileModel> {
     let mut candidates: Vec<String> = project.find_files(&format!("**/{name}.java"), 3).unwrap_or_default();
     if options.include_kotlin {
         candidates.extend(project.find_files(&format!("**/{name}.kt"), 3).unwrap_or_default());
     }
-    let imported = imports.iter().find(|import| import.rsplit('.').next() == Some(name));
-    if let Some(import) = imported {
-        let tail = format!("/{}.java", import.replace('.', "/"));
-        candidates.sort_by_key(|path| !path.replace('\\', "/").ends_with(&tail));
-    }
+    // The class' directory is the part before the simple name:
+    // `com.a.Routes` → `com/a`, `Outer.Inner` → nothing to match on.
+    let segments: Vec<&str> = class.split('.').collect();
+    let package: &[&str] = if segments.len() > 1 { &segments[..segments.len() - 1] } else { &[] };
+    let wanted = if package.is_empty() { None } else { Some(package.join("/")) };
+    // The import that names this class decides, then the package directory.
+    let imported_tail = imports
+        .iter()
+        .find(|import| import.rsplit('.').next() == Some(name))
+        .map(|import| format!("/{}.java", import.replace('.', "/")));
+    let rank = |path: &str| {
+        let normalized = path.replace('\\', "/");
+        let by_import = imported_tail.as_ref().is_none_or(|tail| normalized.ends_with(tail));
+        let by_package = wanted
+            .as_ref()
+            .is_none_or(|dir| normalized.contains(&format!("/{dir}/{name}.")));
+        // 0 = both say yes, 1 = one does, 2 = neither: try the best first
+        // rather than dropping the rest.
+        (u8::from(!by_import) + u8::from(!by_package), 0u8)
+    };
+    candidates.sort_by_key(|path| rank(path));
     for path in candidates {
         let Ok(src) = project.read_file(&path) else { continue };
         let model = spring::parse(&src);
-        if model.classes.iter().any(|class| class.name == name) {
-            return Some(model);
+        // The file has to declare the class under the package the qualifier
+        // named; a same-named class in another package is a different type.
+        if !model.classes.iter().any(|declared| declared.name == name) {
+            continue;
         }
+        if let Some(wanted) = &wanted
+            && model.package.replace('.', "/") != *wanted
+        {
+            continue;
+        }
+        return Some(model);
     }
     None
 }
