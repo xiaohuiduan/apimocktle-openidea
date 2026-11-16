@@ -1,5 +1,7 @@
 # Builds the plugin component and packs the installable archive.
 #   pwsh script/package.ps1
+#   pwsh script/package.ps1 -Toolchain 1.96.0-x86_64-pc-windows-gnu
+param([string]$Toolchain = '')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $root
@@ -18,14 +20,24 @@ $remap = @(
 ) -join ' '
 $env:RUSTFLAGS = if ($env:RUSTFLAGS) { "$env:RUSTFLAGS $remap" } else { $remap }
 
-cargo build --release --target wasm32-wasip2
+# A machine without the MSVC linker (PATH `link.exe` is coreutils') uses the GNU
+# toolchain instead, e.g. `-Toolchain 1.96.0-x86_64-pc-windows-gnu`.
+$cargo = @()
+if ($Toolchain) { $cargo += "+$Toolchain" }
+& cargo @cargo build --release --target wasm32-wasip2
 if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 
+$targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'target' }
 New-Item -ItemType Directory -Force -Path dist | Out-Null
-Copy-Item target/wasm32-wasip2/release/openidea_apimocktle.wasm dist/plugin.wasm -Force
+Copy-Item "$targetDir/wasm32-wasip2/release/openidea_apimocktle.wasm" dist/plugin.wasm -Force
 
 $stamp = Get-Date -Format 'HH:mm:ss'
-Set-Content -Path dist/plugin.wasm.sources -Value "built $stamp from $(git rev-parse --short HEAD 2>$null)" -NoNewline
+$rev = git rev-parse --short HEAD 2>$null
+if ($rev) {
+    Set-Content -Path dist/plugin.wasm.sources -Value "built $stamp from $rev" -NoNewline
+} else {
+    Remove-Item dist/plugin.wasm.sources -ErrorAction SilentlyContinue
+}
 
 $out = Join-Path 'dist' "apimocktle-openidea-$version.zip"
 if (Test-Path $out) { Remove-Item $out }

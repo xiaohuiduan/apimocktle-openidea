@@ -6,11 +6,14 @@
 //! the `endpoints` contribution, a dashboard view, and an ApiMocktle / YApi
 //! server through `host::fetch`.
 
+pub mod classfile;
+pub mod deps;
 pub mod java;
 pub mod model;
 pub mod scan;
 pub mod spring;
 pub mod yapi;
+pub mod zip;
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -72,6 +75,10 @@ fn scan_options() -> scan::Options {
     scan::Options {
         include_kotlin: host::setting_bool("includeKotlin").unwrap_or(true),
         depth: host::setting_number("schemaDepth").map(|n| n as u32).unwrap_or(3).clamp(1, 4),
+        deps: crate::deps::Config {
+            enabled: host::setting_bool("resolveDependencyJars").unwrap_or(true),
+            repo: crate::deps::repository(),
+        },
         ..scan::Options::default()
     }
 }
@@ -771,6 +778,9 @@ public class UserController {
         host.set_setting("token", "\"secret-token\"");
         host.set_setting("includeKotlin", "true");
         host.set_setting("schemaDepth", "2");
+        // These tests run without the fs.read grant and must not poke at the
+        // developer's real Maven repository.
+        host.set_setting("resolveDependencyJars", "false");
         // Only the controller matches the annotation search.
         host.on_search(|query, _limit| {
             if query.pattern.starts_with('@') {
@@ -1075,8 +1085,19 @@ public class UserController {
         assert_eq!(saved, 2, "the new queue goes to the current server");
     }
 
-    /// A cached category id belongs to one server; the same project id on
-    /// another server must not pick it up.
+    /// A hand-typed repository is normalised, and an empty field means Maven's
+    /// default. There is no folder chooser: the settings window cannot open a
+    /// dialog, and a grant only comes from the manifest anyway.
+    #[test]
+    fn the_typed_repository_is_normalised() {
+        let host = host();
+        assert_eq!(deps::repository(), deps::DEFAULT_REPO, "nothing set yet");
+        host.set_setting("mavenRepository", "\"D:\\\\maven\\\\repo\\\\\"");
+        assert_eq!(deps::repository(), "D:/maven/repo");
+        host.set_setting("mavenRepository", "\"  \"");
+        assert_eq!(deps::repository(), deps::DEFAULT_REPO, "a blank field falls back");
+    }
+
     #[test]
     fn a_category_cache_is_scoped_to_its_server() {
         let _host = host();

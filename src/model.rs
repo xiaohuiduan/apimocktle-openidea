@@ -152,6 +152,19 @@ fn is_object_like(base: &str) -> bool {
     matches!(base, "Map" | "HashMap" | "LinkedHashMap" | "TreeMap" | "JSONObject" | "JsonObject")
 }
 
+/// The sample property a `Map<K, V>` is described under. ApiMocktle only reads
+/// `properties` from a schema, the same way YApi does, so a map written as
+/// `additionalProperties` renders as an empty object; a concrete key named
+/// after K keeps the value schema visible. The upstream IntelliJ plugin does
+/// the same in its `JsonSchemaBuilder.buildMapSchema`.
+fn map_key_name(key_ty: &str) -> String {
+    match simple_name(key_ty).as_str() {
+        "String" | "CharSequence" | "char" | "Character" | "UUID" | "Object" => "string".to_owned(),
+        "int" | "Integer" | "long" | "Long" | "short" | "Short" | "byte" | "Byte" => "0".to_owned(),
+        _ => "key".to_owned(),
+    }
+}
+
 fn scalar_schema(base: &str) -> Option<Value> {
     let ty = match base {
         "String" | "CharSequence" | "StringBuilder" | "char" | "Character" | "UUID" | "LocalDate"
@@ -166,7 +179,9 @@ fn scalar_schema(base: &str) -> Option<Value> {
 }
 
 /// Resolves a class name to its declared parameters and fields. Returning
-/// `None` means "unknown type", which is described as a plain object.
+/// `None` means the class has no source in the project: a single-argument
+/// generic is then unwrapped to its argument (a dependency jar's wrapper), and
+/// anything else is described as a plain object.
 pub type Resolver<'a> = dyn Fn(&str, u32) -> Option<ResolvedClass> + 'a;
 
 /// The JSON Schema for one type, as YApi stores it.
@@ -183,7 +198,10 @@ pub fn type_schema(ty: &str, depth: u32, resolve: &Resolver<'_>) -> Value {
     let base = base.rsplit('.').next().unwrap_or(&base).to_owned();
     if is_object_like(&base) {
         let value = args.get(1).map(|v| type_schema(v, depth, resolve)).unwrap_or_else(|| json!({ "type": "string" }));
-        return json!({ "type": "object", "additionalProperties": value });
+        let key = args.first().map(|k| map_key_name(k)).unwrap_or_else(|| "string".to_owned());
+        let mut properties = Map::new();
+        properties.insert(key, value);
+        return json!({ "type": "object", "description": "Map", "properties": properties });
     }
     if is_array_like(&base) {
         let item = args.first().map(|v| type_schema(v, depth, resolve)).unwrap_or_else(|| json!({ "type": "string" }));
@@ -221,6 +239,12 @@ pub fn type_schema(ty: &str, depth: u32, resolve: &Resolver<'_>) -> Value {
             let mapped = substitute(&resolved.fields, &resolved.params, &args);
             object_schema(&mapped, depth, resolve)
         }
+        // A wrapper declared in a dependency jar (`ApiEnvelope<T>`,
+        // `PageResult<T>`, …) has no source here, so its own fields cannot be
+        // read. The only thing left to describe is the type argument: unwrap
+        // it exactly like `ResponseEntity`, instead of degrading the whole
+        // body to a bare `{"type": "object"}` with no fields at all.
+        _ if args.len() == 1 => type_schema(&args[0], depth, resolve),
         _ => json!({ "type": "object" }),
     }
 }
@@ -241,7 +265,7 @@ fn substitute(fields: &[FieldSpec], params: &[String], args: &[String]) -> Vec<F
 
 /// Substitutes whole identifiers only, so `T` is replaced while `Test`, `Time`
 /// and `TaskDto` are left alone. A missing argument leaves the parameter as is.
-fn substitute_type(ty: &str, params: &[String], args: &[String]) -> String {
+pub(crate) fn substitute_type(ty: &str, params: &[String], args: &[String]) -> String {
     let mut out = String::with_capacity(ty.len());
     let mut word = String::new();
     for c in ty.chars() {
@@ -261,8 +285,7 @@ fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
-fn mapped_word<'a>(word: &'a str, params: &[String], args: &'a [String]) -> &'a str {
-    if word.is_empty() {
+fn mapped_word<'a>(word: &'a str, params: &[String], args: &'a [String]) -> &'a str {    if word.is_empty() {
         return word;
     }
     params
@@ -411,6 +434,35 @@ mod tests {
     }
 
     #[test]
+    fn a_wrapper_from_a_jar_is_unwrapped_to_its_argument() {
+        // `ApiEnvelope` is not in WRAPPERS and has no source in the project:
+        // a dependency jar cannot be read, so the envelope's own fields are out
+        // of reach and its single type argument is what still can be described.
+        let resolve: &Resolver = &only_dtos;
+        let schema: Value =
+            serde_json::from_str(&body_schema("ApiEnvelope<Map<String, List<UserDto>>>", 2, resolve)).unwrap();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["description"], "Map");
+        assert_eq!(schema["properties"]["string"]["type"], "array");
+        assert_eq!(schema["properties"]["string"]["items"]["properties"]["name"]["type"], "string");
+
+        // Two arguments stay opaque: `Pair<A, B>` has no single payload to
+        // stand in for the unknown class.
+        let pair: Value = serde_json::from_str(&body_schema("Pair<UserDto, String>", 2, resolve)).unwrap();
+        assert_eq!(pair["type"], "object");
+        assert!(pair["properties"].is_null(), "{pair}");
+
+        // A wrapper the project declares itself keeps its own shape, as before.
+        let known: &Resolver = &|name: &str, _depth: u32| match name {
+            "ApiEnvelope" => Some(wrapper()),
+            "UserDto" => Some(user_dto()),
+            _ => None,
+        };
+        let kept: Value = serde_json::from_str(&body_schema("ApiEnvelope<UserDto>", 2, known)).unwrap();
+        assert_eq!(kept["properties"]["data"]["properties"]["name"]["type"], "string");
+    }
+
+    #[test]
     fn a_spent_depth_budget_unwraps_the_wrapper() {
         // At depth 0 the wrapper is unwrapped byte for byte as it was before
         // wrappers were kept; the guard is also what stops a self-referential
@@ -495,9 +547,18 @@ mod tests {
     #[test]
     fn schema_handles_maps_and_arrays() {
         let resolve: &Resolver = &|_: &str, _depth: u32| None;
+        // ApiMocktle only renders `properties` (a map written as
+        // `additionalProperties` shows as `{}`), so a Map is described under
+        // one sample key named after K.
         let map: Value = serde_json::from_str(&body_schema("Map<String, Long>", 2, resolve)).unwrap();
         assert_eq!(map["type"], "object");
-        assert_eq!(map["additionalProperties"]["type"], "number");
+        assert_eq!(map["description"], "Map");
+        assert_eq!(map["properties"]["string"]["type"], "number");
+        assert!(map.get("additionalProperties").is_none());
+
+        let numeric: Value = serde_json::from_str(&body_schema("Map<Long, List<UserDto>>", 2, resolve)).unwrap();
+        assert_eq!(numeric["properties"]["0"]["type"], "array");
+
         let arr: Value = serde_json::from_str(&body_schema("String[]", 2, resolve)).unwrap();
         assert_eq!(arr["items"]["type"], "string");
     }

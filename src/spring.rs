@@ -111,6 +111,10 @@ pub struct Field {
     pub ty: String,
     pub anns: Vec<Ann>,
     pub doc: String,
+    /// The string a `static final String` initializer assigns. Annotations
+    /// such as `@PostMapping(RouteConstant.ITEM_QUERY)` name a constant
+    /// instead of writing the route, so the value has to travel with the field.
+    pub value: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -223,7 +227,7 @@ pub fn parse(src: &str) -> FileModel {
                         let close = matching(src, &lexed, k, '(', ')').unwrap_or(n - 1);
                         ctor_fields = parse_params(src, &lexed, k + 1, close)
                             .into_iter()
-                            .map(|p| Field { name: p.name, ty: p.ty, anns: p.anns, doc: p.doc })
+                            .map(|p| Field { name: p.name, ty: p.ty, anns: p.anns, doc: p.doc, value: None })
                             .collect();
                         k = close + 1;
                         while k < n
@@ -366,6 +370,15 @@ fn param_name<'a>(src: &'a str, lexed: &Lexed, from: usize, to: usize) -> Option
 }
 
 fn parse_body(src: &str, lexed: &Lexed, from: usize, to: usize, class: &mut Class) {
+    // Javadoc search stops here: a member without its own doc must not inherit
+    // the class comment (that is how every route of a controller ended up
+    // summarised as the class title). `from` follows the class's `{`, so the
+    // floor is that brace's end — not the first token's start, which the doc
+    // written just inside the body comes before.
+    let floor = from
+        .checked_sub(1)
+        .and_then(|open| lexed.toks.get(open))
+        .map_or(0, |open| open.end);
     let mut anns: Vec<Ann> = Vec::new();
     let mut seg: Vec<usize> = Vec::new();
     let mut i = from;
@@ -388,7 +401,7 @@ fn parse_body(src: &str, lexed: &Lexed, from: usize, to: usize, class: &mut Clas
                 .any(|t| ident(src, lexed, t).is_some_and(|w| matches!(w, "val" | "var" | "fun")));
             let body_tail = seg.first().is_some_and(|&t| is(src, lexed, t, '='));
             if !seg.is_empty() && (kotlin_leftover || body_tail) {
-                if let Some(field) = parse_field(src, lexed, &seg, &anns) {
+                if let Some(field) = parse_field(src, lexed, &seg, &anns, floor) {
                     class.fields.push(field);
                 }
                 anns.clear();
@@ -413,7 +426,12 @@ fn parse_body(src: &str, lexed: &Lexed, from: usize, to: usize, class: &mut Clas
                 } else {
                     (type_before(src, lexed, &seg, name_tok), close + 1)
                 };
-                let doc = doc_before(src, lexed, lexed.toks[anns.first().map_or(name_tok, |a| a.at)].start);
+                let doc = doc_from(
+                    src,
+                    lexed,
+                    floor,
+                    lexed.toks[anns.first().map_or(name_tok, |a| a.at)].start,
+                );
                 class.methods.push(Method {
                     name: name.to_owned(),
                     anns: std::mem::take(&mut anns),
@@ -443,7 +461,7 @@ fn parse_body(src: &str, lexed: &Lexed, from: usize, to: usize, class: &mut Clas
             break;
         }
         if is(src, lexed, i, ';') {
-            if let Some(field) = parse_field(src, lexed, &seg, &anns) {
+            if let Some(field) = parse_field(src, lexed, &seg, &anns, floor) {
                 class.fields.push(field);
             }
             anns.clear();
@@ -458,7 +476,7 @@ fn parse_body(src: &str, lexed: &Lexed, from: usize, to: usize, class: &mut Clas
             && let Some(word) = ident(src, lexed, i)
             && matches!(word, "val" | "var" | "fun")
         {
-            if let Some(field) = parse_field(src, lexed, &seg, &anns) {
+            if let Some(field) = parse_field(src, lexed, &seg, &anns, floor) {
                 class.fields.push(field);
             }
             anns.clear();
@@ -467,18 +485,24 @@ fn parse_body(src: &str, lexed: &Lexed, from: usize, to: usize, class: &mut Clas
         seg.push(i);
         i += 1;
     }
-    if let Some(field) = parse_field(src, lexed, &seg, &anns) {
+    if let Some(field) = parse_field(src, lexed, &seg, &anns, floor) {
         class.fields.push(field);
     }
 }
 
-fn parse_field(src: &str, lexed: &Lexed, seg: &[usize], anns: &[Ann]) -> Option<Field> {
+fn parse_field(src: &str, lexed: &Lexed, seg: &[usize], anns: &[Ann], floor: usize) -> Option<Field> {
     let cut = seg.iter().position(|&t| is(src, lexed, t, '=')).unwrap_or(seg.len());
     let head = &seg[..cut];
     if head.is_empty() {
         return None;
     }
-    let doc_at = |token: usize| doc_before(src, lexed, lexed.toks[anns.first().map_or(token, |a| a.at)].start);
+    // `private static final String PATH = "/api/x";` — the initializer is what
+    // an annotation may reference by name.
+    let value = seg
+        .get(cut + 1)
+        .filter(|&&t| lexed.toks[t].kind == Kind::Str)
+        .map(|&t| lexed.toks[t].text(src).to_owned());
+    let doc_at = |token: usize| doc_from(src, lexed, floor, lexed.toks[anns.first().map_or(token, |a| a.at)].start);
     // Kotlin writes `val name: Type`.
     if let Some(colon) = head.iter().position(|&t| is(src, lexed, t, ':')) {
         let name_tok = head[..colon]
@@ -499,7 +523,7 @@ fn parse_field(src: &str, lexed: &Lexed, seg: &[usize], anns: &[Ann]) -> Option<
         if ty.is_empty() {
             return None;
         }
-        return Some(Field { name, ty, anns: anns.to_vec(), doc: doc_at(name_tok) });
+        return Some(Field { name, ty, anns: anns.to_vec(), doc: doc_at(name_tok), value });
     }
     let name_tok = head.iter().rev().copied().find(|&t| ident(src, lexed, t).is_some())?;
     let name = ident(src, lexed, name_tok)?.to_owned();
@@ -510,7 +534,7 @@ fn parse_field(src: &str, lexed: &Lexed, seg: &[usize], anns: &[Ann]) -> Option<
     if ty.is_empty() {
         return None;
     }
-    Some(Field { name, ty, anns: anns.to_vec(), doc: doc_at(name_tok) })
+    Some(Field { name, ty, anns: anns.to_vec(), doc: doc_at(name_tok), value })
 }
 
 /// A Kotlin `fun` return type, written after the parameter list as `: Type`.
@@ -718,11 +742,17 @@ fn unescape(s: &str) -> String {
 
 /// The Javadoc written just above `byte`, if any.
 fn doc_before(src: &str, lexed: &Lexed, byte: usize) -> String {
+    doc_from(src, lexed, 0, byte)
+}
+
+/// The last Javadoc that ends at or before `byte` and starts at or after
+/// `floor`.
+fn doc_from(src: &str, lexed: &Lexed, floor: usize, byte: usize) -> String {
     let found = lexed
         .docs
         .iter()
         .rev()
-        .find(|(_, end)| *end <= byte)
+        .find(|(start, end)| *end <= byte && *start >= floor)
         .copied();
     match found {
         Some((start, end)) => doc_text(&src[start..end]),
@@ -752,6 +782,15 @@ fn first_line(text: &str) -> String {
         .find(|l| !l.is_empty() && !l.starts_with('@'))
         .unwrap_or("")
         .to_owned()
+}
+
+/// A string attribute of a named annotation: `@Operation(summary = "…")`.
+fn annotation_text(anns: &[Ann], name: &str, key: &str) -> Option<String> {
+    anns.iter()
+        .filter(|ann| ann.name == name)
+        .flat_map(|ann| ann.strings(key))
+        .find(|text| !text.is_empty())
+        .map(str::to_owned)
 }
 
 /// The one-line summary of a Javadoc block, for field descriptions.
@@ -949,18 +988,21 @@ pub fn endpoints(model: &FileModel, src: &str) -> Vec<RawEndpoint> {
                 }
                 subs = next;
             }
-            let mut summary = first_line(&method.doc);
+            // A Swagger annotation is the author's own title for the route; the
+            // Javadoc and then the method name are the fallbacks.
+            let mut summary = annotation_text(&method.anns, "Operation", "summary").unwrap_or_else(|| first_line(&method.doc));
             if summary.is_empty() {
                 summary = method.name.clone();
             }
-            let description = if method.doc.is_empty() {
+            let described = annotation_text(&method.anns, "Operation", "description").unwrap_or_else(|| method.doc.clone());
+            let description = if described.is_empty() {
                 if class_summary.is_empty() {
                     format!("{}#{}", class.name, method.name)
                 } else {
                     format!("{class_summary}\n\n{}#{}", class.name, method.name)
                 }
             } else {
-                method.doc.clone()
+                described
             };
             let mut params = Vec::new();
             let mut body_type: Option<String> = None;
@@ -1040,6 +1082,36 @@ public class UserController {
     }
 }
 "#;
+
+    #[test]
+    fn a_swagger_operation_names_the_route() {
+        // A controller-level Javadoc must not become every route's title, and
+        // `@Operation(summary)` is the author's own name for the endpoint.
+        let src = r#"
+package com.acme;
+
+/** h5端调用接口 */
+@RestController
+@RequiredArgsConstructor
+public class ItemController {
+    @Operation(summary = "查询用户条目信息", description = "查询用户条目信息")
+    @PostMapping("/qry")
+    public String qry() { return null; }
+
+    @PostMapping("/plain")
+    public String plain() { return null; }
+}
+"#;
+        let model = parse(src);
+        let eps = endpoints(&model, src);
+        assert_eq!(eps.len(), 2);
+        let named = eps.iter().find(|e| e.path == "/qry").expect("the named route");
+        assert_eq!(named.summary, "查询用户条目信息");
+        assert_eq!(named.description, "查询用户条目信息");
+        let plain = eps.iter().find(|e| e.path == "/plain").expect("the plain route");
+        assert_eq!(plain.summary, "plain", "no doc: the method name, not the class title");
+        assert!(plain.description.contains("ItemController#plain"), "{}", plain.description);
+    }
 
     #[test]
     fn reads_spring_routes() {

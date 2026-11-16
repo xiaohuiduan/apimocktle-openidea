@@ -6,6 +6,10 @@
 # The component is a binary artifact; never attempt text normalisation on it.
 *.wasm binary
 
+# A jar is a zip: let git sniff it as binary instead of relying on content
+# detection, so no line-ending rule can ever touch it.
+*.jar binary
+
 # Trellis: append-only developer journals should merge cleanly across
 # parallel sessions/worktrees — each session only appends a new block, so
 # there is nothing to actually conflict on.

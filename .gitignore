@@ -29,3 +29,7 @@ dist/*.sources
 # the generic pointer every agent reads, not generated skill content.
 /.agents/
 /.dsh/
+
+# Another agent environment's memory database and session traces. It has no
+# business in the repository and is not source of any kind.
+/.dsh-meow/

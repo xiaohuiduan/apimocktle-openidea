@@ -29,11 +29,19 @@ pub struct Options {
     pub resolve_dto: bool,
     /// Candidate controller files to parse.
     pub file_limit: u32,
+    /// Read dependency jars for types the project does not contain.
+    pub deps: crate::deps::Config,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { include_kotlin: true, depth: 2, resolve_dto: true, file_limit: FILE_LIMIT }
+        Options {
+            include_kotlin: true,
+            depth: 2,
+            resolve_dto: true,
+            file_limit: FILE_LIMIT,
+            deps: crate::deps::Config::default(),
+        }
     }
 }
 
@@ -85,7 +93,14 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
     let mut endpoints: Vec<Endpoint> = Vec::new();
     let mut classes: HashMap<String, (Vec<String>, Vec<spring::Field>)> = HashMap::new();
     let mut sources: HashMap<String, String> = HashMap::new();
+    // Simple class name → the package it was imported from. Dependency jars
+    // are ranked with it, so the jar that holds `ApiEnvelope` is read first.
+    let mut hints: HashMap<String, String> = HashMap::new();
     let mut files = 0usize;
+    // Parsed files are kept so route constants can be resolved across them
+    // before any endpoint is built (a second pass over the sources).
+    let mut parsed: Vec<(String, String, spring::FileModel)> = Vec::new();
+    let mut constants = Consts::default();
 
     for path in &paths {
         let src = match project.read_file(path) {
@@ -94,11 +109,27 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
         };
         files += 1;
         let model = spring::parse(&src);
+        for import in &model.imports {
+            let Some((package, simple)) = import.rsplit_once('.') else { continue };
+            if simple.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                hints.entry(simple.to_owned()).or_insert_with(|| package.to_owned());
+            }
+        }
+        constants.absorb(&model);
         for class in &model.classes {
             classes
                 .entry(class.name.clone())
                 .or_insert_with(|| (class.type_params.clone(), class.fields.clone()));
         }
+        sources.insert(path.clone(), src.clone());
+        parsed.push((path.clone(), src, model));
+    }
+
+    for (path, src, mut model) in parsed {
+        // `@PostMapping(RouteConstant.ITEM_QUERY)` names the route instead of
+        // writing it, so the constant is substituted before the routes are
+        // built; otherwise every method of the controller shares path `/`.
+        constants.resolve_in(project, options, &mut model);
         let lexed = lex(&src);
         let mut index = LineIndex::new(&src);
         for raw in spring::endpoints(&model, &src) {
@@ -139,14 +170,14 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
                 return_type: raw.return_type.clone(),
             });
         }
-        sources.insert(path.clone(), src);
     }
 
     endpoints.sort_by(|a, b| a.path.cmp(&b.path).then(a.method.cmp(&b.method)));
     endpoints.dedup_by(|a, b| a.key() == b.key() && a.class_name == b.class_name);
 
     let dto = if options.resolve_dto {
-        resolve_dtos(project, options, &endpoints, &classes, &sources)
+        let mut deps = crate::deps::Deps::new(options.deps.clone());
+        resolve_dtos(project, options, &endpoints, &classes, &sources, &mut deps, &hints)
     } else {
         DtoIndex::default()
     };
@@ -166,6 +197,100 @@ fn pick(params: &[(ParamSpec, ParamKind)], kind: ParamKind) -> Vec<ParamSpec> {
     params.iter().filter(|(_, k)| *k == kind).map(|(p, _)| p.clone()).collect()
 }
 
+/// Static string constants that route annotations can name instead of writing
+/// the path: `@PostMapping(RouteConstant.ITEM_QUERY)`. Without them every
+/// method of such a controller would be published on `/` and collapse into a
+/// single record in ApiMocktle.
+#[derive(Default)]
+struct Consts {
+    /// Both `ITEM_QUERY` and `RouteConstant.ITEM_QUERY`.
+    values: HashMap<String, String>,
+    /// Qualifiers whose declaring file has already been read.
+    loaded: HashSet<String>,
+}
+
+impl Consts {
+    fn absorb(&mut self, model: &spring::FileModel) {
+        for class in &model.classes {
+            for field in &class.fields {
+                let Some(value) = &field.value else { continue };
+                self.values.entry(field.name.clone()).or_insert_with(|| value.clone());
+                self.values.entry(format!("{}.{}", class.name, field.name)).or_insert_with(|| value.clone());
+            }
+        }
+    }
+
+    /// Substitutes constants in every mapping annotation of `model`.
+    fn resolve_in(&mut self, project: &Project, options: &Options, model: &mut spring::FileModel) {
+        let imports = model.imports.clone();
+        for class in &mut model.classes {
+            resolve_anns(self, project, options, &imports, &mut class.anns);
+            for method in &mut class.methods {
+                resolve_anns(self, project, options, &imports, &mut method.anns);
+            }
+        }
+    }
+
+    fn lookup(&mut self, project: &Project, options: &Options, idents: &[String], imports: &[String]) -> Option<String> {
+        let name = idents.last()?;
+        if let Some(value) = self.values.get(name) {
+            return Some(value.clone());
+        }
+        // `RouteConstant.ITEM_QUERY`: the qualifier is the declaring class,
+        // which usually lives in another module, so it is read on demand.
+        let qualifier = idents.iter().rev().nth(1)?;
+        let key = format!("{qualifier}.{name}");
+        if self.loaded.insert(qualifier.clone())
+            && let Some(model) = load_source(project, options, qualifier, imports)
+        {
+            self.absorb(&model);
+        }
+        self.values.get(&key).cloned()
+    }
+}
+
+fn resolve_anns(
+    consts: &mut Consts,
+    project: &Project,
+    options: &Options,
+    imports: &[String],
+    anns: &mut [spring::Ann],
+) {
+    for ann in anns {
+        for arg in &mut ann.args {
+            // A literal is already the route; only an identifier reference needs
+            // substituting (`"a" + CONST` is left alone rather than guessed).
+            if !arg.strings.is_empty() || arg.idents.is_empty() {
+                continue;
+            }
+            if let Some(value) = consts.lookup(project, options, &arg.idents, imports) {
+                arg.strings.push(value);
+            }
+        }
+    }
+}
+
+/// The parsed source of the class `name`, preferring the file its import names.
+fn load_source(project: &Project, options: &Options, name: &str, imports: &[String]) -> Option<spring::FileModel> {
+    let mut candidates: Vec<String> = project.find_files(&format!("**/{name}.java"), 3).unwrap_or_default();
+    if options.include_kotlin {
+        candidates.extend(project.find_files(&format!("**/{name}.kt"), 3).unwrap_or_default());
+    }
+    let imported = imports.iter().find(|import| import.rsplit('.').next() == Some(name));
+    if let Some(import) = imported {
+        let tail = format!("/{}.java", import.replace('.', "/"));
+        candidates.sort_by_key(|path| !path.replace('\\', "/").ends_with(&tail));
+    }
+    for path in candidates {
+        let Ok(src) = project.read_file(&path) else { continue };
+        let model = spring::parse(&src);
+        if model.classes.iter().any(|class| class.name == name) {
+            return Some(model);
+        }
+    }
+    None
+}
+
 /// Loads every type the endpoints mention, then every type those mention.
 fn resolve_dtos(
     project: &Project,
@@ -173,6 +298,8 @@ fn resolve_dtos(
     endpoints: &[Endpoint],
     classes: &HashMap<String, (Vec<String>, Vec<spring::Field>)>,
     sources: &HashMap<String, String>,
+    deps: &mut crate::deps::Deps,
+    hints: &HashMap<String, String>,
 ) -> DtoIndex {
     let mut queue: Vec<String> = Vec::new();
     for endpoint in endpoints {
@@ -195,7 +322,8 @@ fn resolve_dtos(
         budget -= 1;
         let found = match classes.get(&name) {
             Some(hit) => Some(hit.clone()),
-            None => load_class(project, options, &name, sources),
+            None => load_class(project, options, &name, sources)
+                .or_else(|| deps.fields(project, &name, hints.get(&name).map(String::as_str))),
         };
         let Some((params, fields)) = found else { continue };
         for field in &fields {

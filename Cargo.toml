@@ -1,13 +1,13 @@
 [package]
 name = "openidea-apimocktle"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 publish = false
 
 # Builds on its own for wasm32-wasip2, outside any Cargo workspace.
 [workspace]
-# The reference checkouts under refs/ are separate projects (the SDK is its
-# own workspace root), so keep them out of this one.
+# A local clone of the SDK (`refs/`, gitignored) is its own workspace root, so
+# keep it out of this one. Harmless while the directory is absent.
 exclude = ["refs"]
 
 [lib]
@@ -17,6 +17,7 @@ crate-type = ["cdylib", "rlib"]
 # The SDK version pins the plugin API the component is built against; keep the
 # tag in step with `engines.openidea` in plugin.toml.
 openidea-plugin = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.44" }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 serde_json = "1"
 
 [profile.release]

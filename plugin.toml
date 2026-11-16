@@ -1,11 +1,11 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.2.3"
-description = "扫描 Java/Kotlin 源码里的 HTTP 接口（Spring MVC、JAX-RS、Feign），在底部仪表盘按控制器浏览、搜索、跳到源码声明，接口也会进入 Search Everywhere，并在 .http 文件里补全 URL。导出到 ApiMocktle：选定目标项目，自动创建分类、按 method + path 更新已有接口，请求/响应体按项目里的 DTO 生成 JSON Schema（Result<T> 这类包装保留字段并代入泛型实参，multipart 文件字段一并导出）。ApiMocktle（https://github.com/xiaohuiduan/ApiMocktle）是一个本地运行的 API 管理桌面应用，接口文档、请求调试、自动化测试和局域网分享都在本机完成。"
+version = "0.2.4"
+description = "扫描 Java/Kotlin 源码里的 HTTP 接口（Spring MVC、JAX-RS、Feign），在底部仪表盘按控制器浏览、搜索、跳到源码声明，接口也会进入 Search Everywhere，并在 .http 文件里补全 URL。导出到 ApiMocktle：选定目标项目，自动创建分类、按 method + path 更新已有接口，请求/响应体按项目里的 DTO 生成 JSON Schema（Result<T> 这类包装保留字段并代入泛型实参，multipart 文件字段一并导出；源码里没有的 DTO 会从 Maven 依赖 jar 的 class 文件里解析）。ApiMocktle（https://github.com/xiaohuiduan/ApiMocktle）是一个本地运行的 API 管理桌面应用，接口文档、请求调试、自动化测试和局域网分享都在本机完成。"
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.2.3 — 重写插件概览：说明扫描、浏览与导出流程，并介绍 ApiMocktle 是什么、附仓库地址；README 同步补充该介绍。功能与行为未变。"
+change-notes = "0.2.4 — ① 源码里没有的 DTO / 包装类（如公共 jar 里的 ApiEnvelope<T>）会按 POM 依赖树找到 Maven 本地仓库的 jar，读 .class 补全字段、泛型实参与父类字段；新增可选能力 fs.read:~/.m2/repository，不授权时退回旧行为。② 路由写成 static final 常量（@PostMapping(RouteConstant.ITEM_QUERY)）时跨文件解析常量值，不再让整个控制器塌到 /。③ 接口标题改为 @Operation(summary) → 方法 Javadoc → 方法名，方法没有自己的注释时不再拿类注释顶替。④ Map<K,V> 导出为 properties 下的示例键，ApiMocktle 字段表不再显示空对象。⑤ 新增设置：解析依赖 jar 里的类型、Maven 本地仓库。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.7"
@@ -14,6 +14,9 @@ activation = ["on-command:*", "on-view:dashboard", "on-schedule:60"]
 
 [capabilities]
 required = ["project.read", "storage", "net:localhost", "net:127.0.0.1"]
+# 依赖 jar 在项目之外：读取 ~/.m2/repository 需要这条授权。用户不勾选时
+# 插件照常工作，只是源码里没有的类型退化成 object。
+optional = ["fs.read:~/.m2/repository"]
 
 [[contributes.commands]]
 id = "export-project"
@@ -60,6 +63,9 @@ title = "ApiMocktle"
 icon = "icons/apimocktle.svg"
 location = "bottom"
 
+# A single page, so the settings tree stays one level (`插件 › ApiMocktle`).
+# The folder chooser lives on the dashboard toolbar and in the command palette:
+# this form has no `actions`, and `pages` would add a second tree level.
 [contributes.settings]
 title = "ApiMocktle"
 schema = "settings.schema.json"
