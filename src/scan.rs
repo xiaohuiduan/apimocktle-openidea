@@ -201,10 +201,20 @@ fn pick(params: &[(ParamSpec, ParamKind)], kind: ParamKind) -> Vec<ParamSpec> {
 /// the path: `@PostMapping(RouteConstant.ITEM_QUERY)`. Without them every
 /// method of such a controller would be published on `/` and collapse into a
 /// single record in ApiMocktle.
+///
+/// Keys are `Class.NAME`, never the bare name: two classes may both declare
+/// `PATH`, and a controller that maps `/a` with `ARoutes.PATH` and `/b` with
+/// `BRoutes.PATH` has to get both. A bare name is only used when it is
+/// unambiguous for the file — the enclosing class, a static import, or a name
+/// exactly one class declares.
 #[derive(Default)]
 struct Consts {
-    /// Both `ITEM_QUERY` and `RouteConstant.ITEM_QUERY`.
+    /// `Class.NAME` → the string it assigns.
     values: HashMap<String, String>,
+    /// A simple name only one class declares, and that class' key.
+    unique: HashMap<String, String>,
+    /// Simple names declared by more than one class with different values.
+    ambiguous: HashSet<String>,
     /// Qualifiers whose declaring file has already been read.
     loaded: HashSet<String>,
 }
@@ -214,8 +224,22 @@ impl Consts {
         for class in &model.classes {
             for field in &class.fields {
                 let Some(value) = &field.value else { continue };
-                self.values.entry(field.name.clone()).or_insert_with(|| value.clone());
-                self.values.entry(format!("{}.{}", class.name, field.name)).or_insert_with(|| value.clone());
+                let key = format!("{}.{}", class.name, field.name);
+                if self.values.contains_key(&key) && self.values[&key] == *value {
+                    continue;
+                }
+                self.values.insert(key.clone(), value.clone());
+                match self.unique.get(&field.name) {
+                    None => {
+                        self.unique.insert(field.name.clone(), key);
+                    }
+                    // The same name with the same value is not a conflict: it
+                    // still means one thing.
+                    Some(existing) if self.values.get(existing) == Some(value) => {}
+                    Some(_) => {
+                        self.ambiguous.insert(field.name.clone());
+                    }
+                }
             }
         }
     }
@@ -224,29 +248,113 @@ impl Consts {
     fn resolve_in(&mut self, project: &Project, options: &Options, model: &mut spring::FileModel) {
         let imports = model.imports.clone();
         for class in &mut model.classes {
-            resolve_anns(self, project, options, &imports, &mut class.anns);
+            let class_name = class.name.clone();
+            resolve_anns(self, project, options, &imports, &mut class.anns, Some(&class_name));
             for method in &mut class.methods {
-                resolve_anns(self, project, options, &imports, &mut method.anns);
+                resolve_anns(self, project, options, &imports, &mut method.anns, Some(&class_name));
             }
         }
     }
 
-    fn lookup(&mut self, project: &Project, options: &Options, idents: &[String], imports: &[String]) -> Option<String> {
+    /// `class` is the type the annotation is written in, if the reference is
+    /// unqualified: its own `static final` wins before any import.
+    fn lookup(
+        &mut self,
+        project: &Project,
+        options: &Options,
+        idents: &[String],
+        imports: &[String],
+        class: Option<&str>,
+    ) -> Option<String> {
         let name = idents.last()?;
-        if let Some(value) = self.values.get(name) {
+        if idents.len() > 1 {
+            // `RouteConstant.ITEM_QUERY`: the qualifier names the declaring
+            // class, so only that class' constant may answer.
+            let qualifier = idents[..idents.len() - 1].join(".");
+            return self.qualified(project, options, &qualifier, name, imports);
+        }
+        // `ITEM_QUERY` on its own: the enclosing class first, then a static
+        // import, then a name only one class declares.
+        if let Some(class) = class
+            && let Some(value) = self.values.get(&format!("{class}.{name}"))
+        {
             return Some(value.clone());
         }
-        // `RouteConstant.ITEM_QUERY`: the qualifier is the declaring class,
-        // which usually lives in another module, so it is read on demand.
-        let qualifier = idents.iter().rev().nth(1)?;
-        let key = format!("{qualifier}.{name}");
-        if self.loaded.insert(qualifier.clone())
-            && let Some(model) = load_source(project, options, qualifier, imports)
-        {
-            self.absorb(&model);
+        for owner in static_import_owners(imports, name) {
+            if let Some(value) = self.qualified(project, options, &owner, name, imports) {
+                return Some(value);
+            }
         }
-        self.values.get(&key).cloned()
+        if self.ambiguous.contains(name) {
+            return None;
+        }
+        self.unique.get(name).and_then(|key| self.values.get(key)).cloned()
     }
+
+    /// The value of `Class.NAME`, reading `Class`'s source on demand: the
+    /// annotation search only returns files that declare a mapping, so a
+    /// constants-only class is never among the scanned paths.
+    fn qualified(
+        &mut self,
+        project: &Project,
+        options: &Options,
+        qualifier: &str,
+        name: &str,
+        imports: &[String],
+    ) -> Option<String> {
+        let key = format!("{qualifier}.{name}");
+        if let Some(value) = self.values.get(&key) {
+            return Some(value.clone());
+        }
+        // `Constants.Sub.PATH` may name a nested class; the file is named after
+        // the outer one, so a miss on the full prefix tries its last segment.
+        let candidates: Vec<&str> = if qualifier.contains('.') {
+            qualifier.rsplit('.').take(2).collect()
+        } else {
+            vec![qualifier]
+        };
+        for candidate in candidates {
+            let key = format!("{candidate}.{name}");
+            if let Some(value) = self.values.get(&key) {
+                return Some(value.clone());
+            }
+            if self.loaded.insert(candidate.to_owned())
+                && let Some(model) = load_source(project, options, candidate, imports)
+            {
+                self.absorb(&model);
+                if let Some(value) = self.values.get(&key) {
+                    return Some(value.clone());
+                }
+            }
+        }
+        self.values.get(&format!("{qualifier}.{name}")).cloned()
+    }
+}
+
+/// The classes a static import may take `name` from: `import static a.b.C.NAME`
+/// and `import static a.b.C.*`. The parser glues `static` onto the package
+/// name, so the last segment before the constant is the class either way.
+fn static_import_owners(imports: &[String], name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |owner: &str| {
+        if owner.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && !out.iter().any(|o| o == owner) {
+            out.push(owner.to_owned());
+        }
+    };
+    for import in imports {
+        let Some(rest) = import.strip_suffix(name) else { continue };
+        let Some(rest) = rest.strip_suffix('.') else { continue };
+        push(rest.rsplit('.').next().unwrap_or(rest));
+    }
+    for import in imports {
+        if let Some(rest) = import.strip_suffix(".*")
+            && let Some(owner) = rest.rsplit('.').next()
+            && import.starts_with("static")
+        {
+            push(owner);
+        }
+    }
+    out
 }
 
 fn resolve_anns(
@@ -255,6 +363,7 @@ fn resolve_anns(
     options: &Options,
     imports: &[String],
     anns: &mut [spring::Ann],
+    class: Option<&str>,
 ) {
     for ann in anns {
         for arg in &mut ann.args {
@@ -263,7 +372,7 @@ fn resolve_anns(
             if !arg.strings.is_empty() || arg.idents.is_empty() {
                 continue;
             }
-            if let Some(value) = consts.lookup(project, options, &arg.idents, imports) {
+            if let Some(value) = consts.lookup(project, options, &arg.idents, imports, class) {
                 arg.strings.push(value);
             }
         }

@@ -157,6 +157,13 @@ fn descriptor_type(descriptor: &str) -> Option<String> {
 }
 
 /// The declared type parameters and the superclass of a class signature.
+///
+/// A class signature is `[type-params] superclass-ty {interface-ty}`: javac
+/// writes every implemented interface after the superclass, so requiring
+/// end-of-input at the superclass threw away the whole signature — including
+/// the type parameters — for any class that implements one. Serializable alone
+/// was enough. The interfaces carry nothing this reader needs, but they have to
+/// be parsed past.
 fn class_signature(sig: &str) -> Option<(Vec<String>, Ty)> {
     let bytes = sig.as_bytes();
     let mut at = 0;
@@ -181,7 +188,12 @@ fn class_signature(sig: &str) -> Option<(Vec<String>, Ty)> {
         at += 1; // '>'
     }
     let super_ty = parse_ty(bytes, &mut at)?;
-    (at == bytes.len()).then_some((params, super_ty))
+    // Interface signatures follow the superclass and are not used here, but a
+    // signature that does not parse to the end is still a malformed one.
+    while at < bytes.len() {
+        parse_ty(bytes, &mut at)?;
+    }
+    Some((params, super_ty))
 }
 
 #[derive(Clone, Debug)]
@@ -408,6 +420,63 @@ mod tests {
             class_signature("<T::Ljava/lang/Comparable<TT;>;>Ljava/lang/Object;").expect("bounds");
         assert_eq!(params, vec!["T".to_owned()]);
         assert_eq!(super_ty.render(), "Object");
+    }
+
+    #[test]
+    fn an_interface_after_the_superclass_keeps_the_signature() {
+        // `class ApiEnvelope<T> extends BaseReply implements Serializable`:
+        // javac appends the interface type after the superclass. Stopping at
+        // the superclass dropped the type parameters, so `T` was never
+        // substituted and the payload fields disappeared from the schema.
+        let (params, super_ty) = class_signature(
+            "<T:Ljava/lang/Object;>Lcom/acme/BaseReply;Ljava/io/Serializable;",
+        )
+        .expect("a signature with one interface");
+        assert_eq!(params, vec!["T".to_owned()], "the type parameters survive");
+        assert_eq!(super_ty.render(), "BaseReply");
+
+        // Generic superclass arguments plus two interfaces, and a generic
+        // interface of its own.
+        let (params, super_ty) = class_signature(
+            "<T:Ljava/lang/Object;>Lcom/acme/GenericBase<Ljava/util/List<TT;>;>;\
+             Ljava/io/Serializable;Ljava/lang/Cloneable;Lcom/acme/Aware<Lcom/acme/Ctx;>;",
+        )
+        .expect("a signature with interfaces");
+        assert_eq!(params, vec!["T".to_owned()]);
+        assert_eq!(super_ty.render(), "GenericBase<List<T>>");
+    }
+
+    #[test]
+    fn reads_a_class_that_implements_an_interface() {
+        // The same case end to end through the fixture jar: the interface in
+        // the signature must not cost the class its parameters or fields.
+        let jar = include_bytes!("../fixtures/deps/api-envelope.jar");
+        let zip = Zip::open(jar).expect("the fixture is a jar");
+        let entry = zip.find("/JailedEnvelope.class").expect("the class entry");
+        let bytes = zip.read(entry, 1 << 20).expect("the class bytes");
+        let class = parse(&bytes).expect("a class file");
+        assert_eq!(class.name, "JailedEnvelope");
+        assert_eq!(class.params, vec!["T".to_owned()]);
+        assert_eq!(class.super_class.as_deref(), Some("BaseReply"));
+        assert_eq!(
+            class.fields,
+            vec![JarField { name: "payload".into(), ty: "T".into() }],
+            "the generic field keeps T so the caller can substitute it: {class:?}"
+        );
+    }
+
+    #[test]
+    fn reads_a_generic_superclass_with_interfaces() {
+        let jar = include_bytes!("../fixtures/deps/api-envelope.jar");
+        let zip = Zip::open(jar).expect("the fixture is a jar");
+        let entry = zip.find("/PagedEnvelope.class").expect("the class entry");
+        let bytes = zip.read(entry, 1 << 20).expect("the class bytes");
+        let class = parse(&bytes).expect("a class file");
+        assert_eq!(class.name, "PagedEnvelope");
+        assert_eq!(class.params, vec!["T".to_owned()]);
+        assert_eq!(class.super_class.as_deref(), Some("GenericBase"));
+        assert_eq!(class.super_args, vec!["List<T>".to_owned()], "the superclass argument");
+        assert_eq!(class.fields, vec![JarField { name: "items".into(), ty: "T".into() }]);
     }
 
     #[test]

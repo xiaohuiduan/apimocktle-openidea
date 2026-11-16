@@ -37,7 +37,9 @@ OpenIDEA 插件运行在 WASM 沙箱里，没有 Java PSI、没有 Swing、没�
 - **接口扫描**：Spring MVC（`@RestController`、`@RequestMapping`、`@GetMapping` 等）、JAX-RS（`@Path` + `@GET`）、
   Feign（`@FeignClient`）；Java 与 Kotlin（含 `data class`、`fun ... : T` 返回类型）。
 - **路由常量**：`@PostMapping(RouteConstant.ITEM_QUERY)` 这种把路径写成 `static final` 常量的写法，会跨文件
-  解析常量值（支持 `Class.CONST`、类级 `@RequestMapping` 前缀）；解析不到时退回 `/`，不影响同类的其他接口。
+  解析常量值。限定名按**声明它的那个类**解析——两个类都有 `PATH` 时 `ARoutes.PATH` 与 `BRoutes.PATH` 各取各的；
+  不带限定名时先看当前类，再看 `import static`，只有全项目唯一声明才按名字兜底，歧义时退回 `/` 而不是猜一个。
+  支持类级 `@RequestMapping` 前缀；解析不到时退回 `/`，不影响同类的其他接口。
 - **接口标题**：优先 `@Operation(summary)`（Swagger），其次方法 Javadoc，最后方法名；方法没有自己的 Javadoc
   时**不会**拿类注释顶上。
 - **参数分类**：`@PathVariable` / `@RequestParam` / `@RequestHeader` / `@RequestBody` / `@CookieValue` / `@RequestPart`，
@@ -212,7 +214,8 @@ required = ["project.read", "storage", "net:api.example.com"]   # HTTPS
 - **没有类型系统**：DTO 字段来自文本级解析，跨文件继承、复杂泛型推导、接口多态都不完整；`List<User>` 这类常见形状可靠，
   `Result<? extends Base<T>>` 这类会退化成 `object`。
 - **路由常量只认纯字面量**：`Constants.PREFIX + "/x"` 这种拼接、以及 `String.format(...)`、枚举常量都不解析，
-  这类接口的路径会退回 `/`。
+  这类接口的路径会退回 `/`。常量声明在别的类里时按类名解析；同名常量分属多个类又没写限定名时无法判断，
+  同样退回 `/`。
 - **依赖 jar 解析的边界**：只走 Maven（读项目 `pom.xml` 的依赖与传递 POM，最多 200 个 POM），Gradle 项目
   目前读不到仓库依赖；jar 要能在本地仓库里找到（`~/.m2/repository` 或设置里的路径），单个 jar 超过 12 MiB
   就跳过，一次扫描最多读 120 个 jar、单个类最多 32 个（超了就当解析不到）；class 里的 `@JsonProperty` 等
@@ -243,7 +246,7 @@ required = ["project.read", "storage", "net:api.example.com"]   # HTTPS
 ## 测试
 
 ```sh
-cargo test                      # 66 个用例：解析、Schema、ZIP/class、POM、路由常量、YApi 编码、队列，以及端到端链路
+cargo test                      # 74 个用例：解析、Schema、ZIP/class、POM、路由常量、YApi 编码、队列，以及端到端链路
 pwsh script/package.ps1         # 重建组件并打包（含 icons/）
 ```
 
@@ -253,14 +256,16 @@ pwsh script/package.ps1         # 重建组件并打包（含 icons/）
 `tests/unknown_wrapper.rs` 只放 Controller 和 DTO，让 `ApiEnvelope` 像依赖 jar 一样解析不到，断言
 `ApiEnvelope<Map<String, List<ItemInfoDTO>>>` 的响应仍是可读的 `Map` + DTO 字段；
 `tests/jar_deps.rs` 在内存里搭一个 Maven 仓库（POM 链 + `fixtures/deps/api-envelope.jar`），断言传递依赖里的
-`ApiEnvelope` 连父类 `code`/`message` 和泛型实参一起导出，并验证没授权时安静退回；
-`tests/route_constants.rs` 覆盖“路径写成常量”的扫描；
-`src/lib.rs` 的用例覆盖换服务器暂停、未换服务器继续、旧格式队列丢弃、分类缓存按服务器隔离，以及
-Maven 仓库路径的规范化（反斜杠归一、空值回退默认）。
+`ApiEnvelope` 连父类 `code`/`message` 和泛型实参一起导出、实现了接口的包装类（`JailedEnvelope`）仍然保留
+泛型载荷字段，并验证没授权时安静退回；
+`tests/route_constants.rs` 覆盖“路径写成常量”的扫描：限定名按声明类解析（两个类各有 `PATH` 也不串）、
+不带限定名时当前类优先、`import static` 可解析、同名歧义不猜。
 
 `fixtures/spring-demo` 只是扫描输入，不需要能编译或启动——插件读的是源码文本；`fixtures/deps` 里的
-`api-envelope.jar` 是 `BaseReply.java` / `ApiEnvelope.java` / `PageRequest.java` 用 `javac -source 8`
-编译出的测试输入。测试与文档里一律用 `com.acme` / `com.example` 这类示例命名，真实工程的类名不写进仓库。
+`api-envelope.jar` 是 `BaseReply.java` / `ApiEnvelope.java` / `PageRequest.java` / `GenericBase.java` /
+`JailedEnvelope.java` / `PagedEnvelope.java` 用 `javac --release 8` 编译出的测试输入（后两个专门带接口与
+泛型父类，用来盯住 class Signature 的解析）。测试与文档里一律用 `com.acme` / `com.example` 这类示例命名，
+真实工程的类名不写进仓库。
 
 SDK 版本固定在 `Cargo.toml` 的 tag（当前 `v0.1.44`，插件 API 1.7）；升级 IDE 时同步改 tag 与
 `engines.openidea`，两者必须匹配，否则组件与宿主的 WIT 接口对不上。`dist/plugin.wasm` 的导入表已确认是

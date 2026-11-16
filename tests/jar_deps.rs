@@ -187,7 +187,88 @@ fn without_the_fs_grant_the_jar_is_skipped_quietly() {
     let res: Value = serde_json::from_str(doc["res_body"].as_str().expect("a schema string")).expect("json");
 
     // Without the grant the jar is invisible, so the wrapper stays unknown and
-    // the 0.2.4 fallback unwraps the single type argument instead.
+    // the fallback unwraps the single type argument instead.
     assert_eq!(res["description"], "Map", "{res}");
     assert!(res["properties"]["errorNo"].is_null(), "{res}");
+}
+
+/// The same end-to-end path for a wrapper whose class also implements an
+/// interface: javac then writes the interface into the class Signature after
+/// the superclass, which used to cost the whole signature — the type parameters
+/// and the fields typed by them.
+const IFACE_CONTROLLER: &str = r#"
+package com.acme.item;
+
+@RestController
+@RequestMapping("/api/items")
+public class ItemController {
+    @GetMapping("/jailed")
+    public JailedEnvelope<ItemInfoDTO> jailed() {
+        return null;
+    }
+}
+"#;
+
+fn interface_document() -> Value {
+    let host = MockHost::install().with_capabilities(&[
+        "project.read",
+        "storage",
+        "fs.read:/repo",
+        "fs.write:/repo",
+    ]);
+    host.add_project(ROOT);
+    host.set_project_root(Some(ROOT));
+    host.add_file(&format!("{ROOT}/pom.xml"), PROJECT_POM);
+    host.add_file(&format!("{ROOT}/src/main/java/com/acme/item/ItemController.java"), IFACE_CONTROLLER);
+    host.add_file(&format!("{ROOT}/src/main/java/com/acme/item/dto/ItemInfoDTO.java"), ITEM_DTO);
+    host.add_external_file(&format!("{REPO}/com/example/api/1.0/api-1.0.pom"), API_POM);
+    host.add_external_file(&format!("{REPO}/com/example/common/1.0/common-1.0.pom"), COMMON_POM);
+    host::fs::write_bytes(&format!("{REPO}/com/example/common/1.0/common-1.0.jar"), &jar()).expect("seed the jar");
+
+    let paths = [
+        format!("{ROOT}/src/main/java/com/acme/item/ItemController.java"),
+        format!("{ROOT}/src/main/java/com/acme/item/dto/ItemInfoDTO.java"),
+    ];
+    host.on_search(move |_query, _limit| {
+        Ok(TextSearch {
+            matches: paths
+                .iter()
+                .map(|path| TextMatch {
+                    location: Location {
+                        path: path.clone(),
+                        range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+                    },
+                    line: String::new(),
+                })
+                .collect(),
+            limit_hit: false,
+        })
+    });
+
+    let project = host.invocation().project().expect("a project");
+    let scanned = scan::scan(&project, &options()).expect("a scan");
+    let endpoint = scanned
+        .endpoints
+        .iter()
+        .find(|e| e.method_name == "jailed")
+        .expect("the endpoint");
+    yapi::api_doc(endpoint, &scanned.dto, 3)
+}
+
+#[test]
+fn a_wrapper_that_implements_an_interface_keeps_its_payload() {
+    let doc = interface_document();
+    let res: Value = serde_json::from_str(doc["res_body"].as_str().expect("a schema string")).expect("json");
+    let properties = res["properties"].as_object().expect("wrapper properties");
+
+    // Inherited from BaseReply, which still has to be read.
+    assert_eq!(properties["code"]["type"], "number", "the generic superclass is kept: {res}");
+    assert_eq!(properties["message"]["type"], "string", "{res}");
+    // `T` substituted with the endpoint's argument: the payload fields are the
+    // whole point of having the signature at all.
+    assert_eq!(
+        properties["payload"]["properties"]["itemId"]["type"], "number",
+        "the payload keeps its fields: {res}"
+    );
+    assert_eq!(properties["payload"]["properties"]["itemName"]["type"], "string", "{res}");
 }
