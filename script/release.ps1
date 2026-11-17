@@ -96,10 +96,29 @@ if ($expected -ne 1) { throw "plugin.toml must have exactly one change-notes (fo
 if ($notes.Length -lt 10 -or $notes.Length -gt 2000) { throw "change-notes looks wrong: $($notes.Length) characters" }
 if ($notes -match "`u{FFFD}") { throw 'change-notes contains U+FFFD already; fix plugin.toml before releasing' }
 Write-Host "notes   : $($notes.Length) chars, starts: $($notes.Substring(0, [Math]::Min(30, $notes.Length)))..."
+
+# Send the JSON as UTF-8 bytes, never as a .NET string. `Invoke-RestMethod -Body
+# <string>` encodes with ISO-8859-1, which turns every Chinese character into
+# '?', and the damage is permanent once stored. Passing bytes removes the guess.
+function ConvertTo-Utf8JsonBody($object) {
+    $json = $object | ConvertTo-Json -Compress
+    return [System.Text.Encoding]::UTF8.GetBytes($json)
+}
+
 $release = $null
 try {
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$tag" @common
-    Write-Host "release $tag already exists; replacing its package asset"
+    Write-Host "release $tag already exists; refreshing its notes and package asset"
+    # The notes belong to the tag being released. If they were edited since the
+    # release was created (or created wrong), refresh them instead of leaving
+    # whatever was stored first.
+    $patch = ConvertTo-Utf8JsonBody @{ body = $notes; name = $tag }
+    $patched = @{} + $common
+    $patched.Method = 'Patch'
+    $patched.Body = $patch
+    $patched.ContentType = 'application/json; charset=utf-8'
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/$($release.id)" @patched
+    Write-Host "notes refreshed ($($release.body.Length) chars)"
     foreach ($asset in $release.assets) {
         if ($asset.name -eq (Split-Path $pkg -Leaf)) {
             Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/assets/$($asset.id)" -Method Delete @common
@@ -107,9 +126,18 @@ try {
     }
 } catch {
     if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
-    $body = @{ tag_name = $tag; name = $tag; body = $notes; draft = $false; prerelease = $false } | ConvertTo-Json -Compress
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases" -Method Post -Body $body -ContentType 'application/json' @common
-    Write-Host "release $tag created"
+    $body = ConvertTo-Utf8JsonBody @{ tag_name = $tag; name = $tag; body = $notes; draft = $false; prerelease = $false }
+    $create = @{} + $common
+    $create.Method = 'Post'
+    $create.Body = $body
+    $create.ContentType = 'application/json; charset=utf-8'
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases" @create
+    Write-Host "release $tag created ($($release.body.Length) chars)"
+}
+
+# Prove the stored notes survived the round trip before reporting success.
+if ($release.body -ne $notes) {
+    throw "the release notes did not survive the upload: stored $($release.body.Length) chars, expected $($notes.Length)"
 }
 
 $upload = @{ Headers = $headers; TimeoutSec = 300; Method = 'Post'; InFile = $pkg; ContentType = 'application/octet-stream' }
