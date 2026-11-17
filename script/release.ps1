@@ -100,9 +100,13 @@ Write-Host "notes   : $($notes.Length) chars, starts: $($notes.Substring(0, [Mat
 # Send the JSON as UTF-8 bytes, never as a .NET string. `Invoke-RestMethod -Body
 # <string>` encodes with ISO-8859-1, which turns every Chinese character into
 # '?', and the damage is permanent once stored. Passing bytes removes the guess.
+#
+# `Write-Output -NoEnumerate` matters: `return $bytes` from a function unrolls the
+# array into Object[], and -Body then serialises an object array instead of
+# writing the bytes, so the PATCH silently stores nothing.
 function ConvertTo-Utf8JsonBody($object) {
     $json = $object | ConvertTo-Json -Compress
-    return [System.Text.Encoding]::UTF8.GetBytes($json)
+    Write-Output -NoEnumerate ([System.Text.Encoding]::UTF8.GetBytes($json))
 }
 
 $release = $null
