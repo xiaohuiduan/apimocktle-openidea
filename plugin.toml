@@ -1,11 +1,11 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.2.6"
+version = "0.2.7"
 description = "扫描 Java/Kotlin 源码里的 HTTP 接口（Spring MVC、JAX-RS、Feign），在底部仪表盘按控制器浏览、搜索、跳到源码声明，接口也会进入 Search Everywhere，并在 .http 文件里补全 URL。导出到 ApiMocktle：选定目标项目，自动创建分类、按 method + path 更新已有接口，请求/响应体按项目里的 DTO 生成 JSON Schema（Result<T> 这类包装保留字段并代入泛型实参，multipart 文件字段一并导出；源码里没有的 DTO 会从 Maven 依赖 jar 的 class 文件里解析）。ApiMocktle（https://github.com/xiaohuiduan/ApiMocktle）是一个本地运行的 API 管理桌面应用，接口文档、请求调试、自动化测试和局域网分享都在本机完成。"
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.2.6 — 路由常量改为按「全限定类名 + 字段名」识别，此前只按简单类名缓存，两个包各有一个同名 `Routes` 时必然串：两个控制器分别 import 会得到同一个值，注解里写全限定名时第二个接口还会因路径重复被去重而整条消失。现在常量键是 `com.a.Routes.PATH` 与 `com.b.Routes.PATH`，注解里的限定名先经文件 import 解析成声明类再查，读文件时也核对包名；`import static` 同样带上包名。0.2.5 的两处修复（常量按声明类解析、class 签名保留泛型参数）一并沿用。功能与设置未变。"
+change-notes = "0.2.7 — 构建改回手册流程：组件由 openidea-plugin build 直接产出，不再对编译产物做额外处理，安装的字节就是该命令从这里源码生成的字节。插件行为与设置未变（0.2.6 的路由常量按「全限定类名 + 字段名」识别等修复一并沿用）。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.7"

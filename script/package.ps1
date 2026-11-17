@@ -1,6 +1,15 @@
-# Builds the plugin component and packs the installable archive.
-#   pwsh script/package.ps1
-#   pwsh script/package.ps1 -Toolchain 1.96.0-x86_64-pc-windows-gnu
+# Builds the component and packs the installable archive.
+#
+# Build and pack are the two commands the registry manual documents; this script
+# only wraps them so the local zip has the layout "Install Plugin from Package
+# File" reads. Publishing is the manual's flow, nothing extra:
+#
+#   openidea-plugin build .
+#   openidea-plugin pack . --key <key> --publisher apimocktle
+#
+# `openidea-plugin build` writes dist/plugin.wasm itself, so nothing here
+# post-processes the component: the bytes a user installs are exactly what that
+# command produces from this source.
 param([string]$Toolchain = '')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -8,17 +17,6 @@ Set-Location $root
 
 $version = (Select-String -Path plugin.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
 Write-Host "ApiMocktle $version"
-
-# Rust embeds `file!()` locations for panic messages and `strip` keeps them, so a
-# component built here would carry this machine's absolute paths
-# (`C:\Users\<name>\.cargo\registry\...`) into every install. Rewrite those
-# prefixes at compile time. The variable expands at run time, which keeps the
-# user name out of the repository.
-$remap = @(
-    "--remap-path-prefix=$env:USERPROFILE=~",
-    "--remap-path-prefix=$env:USERPROFILE\.cargo=/cargo"
-) -join ' '
-$env:RUSTFLAGS = if ($env:RUSTFLAGS) { "$env:RUSTFLAGS $remap" } else { $remap }
 
 # A machine without the MSVC linker (PATH `link.exe` is coreutils') uses the GNU
 # toolchain instead, e.g. `-Toolchain 1.96.0-x86_64-pc-windows-gnu`.
@@ -30,14 +28,6 @@ if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'target' }
 New-Item -ItemType Directory -Force -Path dist | Out-Null
 Copy-Item "$targetDir/wasm32-wasip2/release/openidea_apimocktle.wasm" dist/plugin.wasm -Force
-
-$stamp = Get-Date -Format 'HH:mm:ss'
-$rev = git rev-parse --short HEAD 2>$null
-if ($rev) {
-    Set-Content -Path dist/plugin.wasm.sources -Value "built $stamp from $rev" -NoNewline
-} else {
-    Remove-Item dist/plugin.wasm.sources -ErrorAction SilentlyContinue
-}
 
 $out = Join-Path 'dist' "apimocktle-openidea-$version.zip"
 if (Test-Path $out) { Remove-Item $out }
