@@ -81,7 +81,21 @@ if ($proxy) { $common.Proxy = $proxy }
 $repo = (git remote get-url origin) -replace '^https://github.com/', '' -replace '\.git$', ''
 Write-Host "repo    : $repo"
 
-$notes = python -c "import tomllib;print(tomllib.load(open('plugin.toml','rb'))['change-notes'])"
+# Read the notes straight from plugin.toml as UTF-8. Do NOT shell out to Python
+# and capture stdout: PowerShell decodes a child process' output with the console
+# code page, which on a Chinese Windows is GBK. The UTF-8 Chinese text then turns
+# into replacement characters and, once posted, cannot be recovered — that is
+# exactly how the v0.2.7 release body ended up full of U+FFFD.
+$toml = [System.IO.File]::ReadAllText((Join-Path $root 'plugin.toml'), [System.Text.Encoding]::UTF8)
+$notesMatch = [regex]::Match($toml, '(?m)^change-notes = "(.*)"\s*$')
+if (-not $notesMatch.Success) { throw 'plugin.toml has no change-notes' }
+$notes = $notesMatch.Groups[1].Value
+# `(?m)` only: `(?s)` would let `.` cross newlines and swallow the rest of the file.
+$expected = (Select-String -Path 'plugin.toml' -Pattern '^change-notes = "' | Measure-Object).Count
+if ($expected -ne 1) { throw "plugin.toml must have exactly one change-notes (found $expected)" }
+if ($notes.Length -lt 10 -or $notes.Length -gt 2000) { throw "change-notes looks wrong: $($notes.Length) characters" }
+if ($notes -match "`u{FFFD}") { throw 'change-notes contains U+FFFD already; fix plugin.toml before releasing' }
+Write-Host "notes   : $($notes.Length) chars, starts: $($notes.Substring(0, [Math]::Min(30, $notes.Length)))..."
 $release = $null
 try {
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$tag" @common
