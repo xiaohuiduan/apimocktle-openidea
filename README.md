@@ -272,3 +272,23 @@ pwsh script/package.ps1         # 重建组件并打包（含 icons/）
 SDK 版本固定在 `Cargo.toml` 的 tag（当前 `v0.1.44`，插件 API 1.7）；升级 IDE 时同步改 tag 与
 `engines.openidea`，两者必须匹配，否则组件与宿主的 WIT 接口对不上。`dist/plugin.wasm` 的导入表已确认是
 `openidea:plugin/*@1.7.0`，并导出 `commands`、`lifecycle`、`view-provider`、`endpoints-provider`。
+
+## 发布
+
+流程就是 registry 手册的两条命令，没有额外的构建步骤：
+
+```sh
+openidea-plugin build .                                    # 产出 dist/plugin.wasm
+openidea-plugin pack . --key ~/.openidea-keys/apimocktle.key --publisher apimocktle
+```
+
+`script/release.ps1` 把「打包 → 建 release → 上传附件」串成一条命令，并打印要写进
+[l0ng-ai/openidea-plugins](https://github.com/l0ng-ai/openidea-plugins) 的 `version` / `package` / `sha256`：
+
+```sh
+git tag v0.2.7 && git push origin v0.2.7
+pwsh script/release.ps1            # -DryRun 只构建签名，不碰 release
+```
+
+签名密钥只在**本机**：它不入库（`.gitignore` 里的 `*.key`），也不放进 CI secrets。任何人读到它就能以
+`apimocktle.*` 的名义发布，所以这一步留在本机，交给一条可重复的命令，而不是交给流水线。
