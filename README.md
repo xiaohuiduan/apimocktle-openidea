@@ -311,7 +311,7 @@ Rebuild and re-grant afterwards. This is the host's capability model, not a choi
 ## Tests
 
 ```sh
-cargo test                      # 89 tests: parsing, schema, ZIP/class, POM, route constants, YApi encoding, queue, i18n, and the end-to-end path
+cargo test                      # 90 tests: parsing, schema, ZIP/class, POM, route constants, YApi encoding, queue, i18n, and the end-to-end path
 node script/check-pages.mjs     # the dashboard's real rendering in both languages (cargo test cannot run JS)
 pwsh script/package.ps1         # rebuild the component and pack it (including icons/ and locales/)
 ```

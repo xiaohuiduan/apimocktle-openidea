@@ -1453,4 +1453,63 @@ public class UploadController {
             .collect();
         assert_eq!(bodies.iter().filter(|b| b.contains("\"catid\":\"fresh\"")).count(), 2);
     }
+
+    /// A non-2xx reply is not the only place a body can quote the request URL: a
+    /// proxy error page or an HTML notice can arrive with `200` and echo the
+    /// address it was asked for — token included. Both the dashboard's status line
+    /// and a notification show whatever these paths return, so the token must not
+    /// survive into either.
+    #[test]
+    fn an_html_error_page_with_a_200_never_leaks_the_token() {
+        let host = host();
+        // Exactly the reported shape: status 200, body not JSON, body quotes the
+        // request URL, and that URL carries `?token=…`.
+        const TOKEN: &str = "abcdef0123456789abcdef0123456789";
+        host.set_setting("token", &format!("\"{TOKEN}\""));
+        host.on_fetch(move |request| {
+            // A real HTML page is raw bytes, not a JSON string: `reply` would
+            // serialize it *with* quotes, which parses as valid JSON and takes a
+            // different branch entirely.
+            let page = format!("<p>Request failed: {}</p>", request.url);
+            Ok(HttpResponse { status: 200, headers: Vec::new(), body: page.into_bytes() })
+        });
+
+        let mut plugin = ApiMocktle::default();
+        // Path 1: the projects list, whose error reaches `projects.error` and the
+        // status line.
+        plugin.render(VIEW, None, &host.invocation()).unwrap();
+        plugin
+            .handle(VIEW, ViewEvent::Message(json!({ "op": "projects" }).to_string()), &host.invocation())
+            .unwrap();
+        let messages = host.view_messages();
+        assert!(!messages.is_empty(), "the page is told the list failed");
+        for (_, payload) in &messages {
+            assert!(!payload.contains(TOKEN), "the dashboard must not show the token: {payload}");
+        }
+
+        // Path 2: the export the dashboard triggers (`export-all` → `report`),
+        // whose error reaches both a toast and a notification.
+        let before = host.notifications().len();
+        plugin
+            .handle(VIEW, ViewEvent::Message(json!({ "op": "export-all" }).to_string()), &host.invocation())
+            .unwrap();
+        let fresh: Vec<_> = host.notifications().into_iter().skip(before).collect();
+        assert!(!fresh.is_empty(), "the user is told the export failed");
+        for n in &fresh {
+            assert!(!n.body.contains(TOKEN), "a notification must not show the token: {}", n.body);
+        }
+        for (_, payload) in host.view_messages() {
+            assert!(!payload.contains(TOKEN), "the toast must not show the token: {payload}");
+        }
+
+        // The message stays useful: the body is still shown, only the secret is
+        // gone. `list_projects` reaches `not_json` directly.
+        let shown = yapi::Client { base: "http://localhost:4000".into(), token: TOKEN.into(), project_id: String::new() }
+            .list_projects()
+            .unwrap_err()
+            .to_string();
+        assert!(!shown.contains(TOKEN), "{shown}");
+        assert!(shown.contains("Request failed"), "the response body is still shown: {shown}");
+        assert!(shown.contains("token=…"), "the parameter is still named: {shown}");
+    }
 }

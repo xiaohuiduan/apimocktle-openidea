@@ -114,8 +114,12 @@ impl Client {
             return Err(Error::Failed(i18n::http_status(response.status, &i18n::redact_token(&shown))));
         }
         let payload: Value = serde_json::from_str(&text).map_err(|_| {
+            // Same URL-in-the-body problem as the branches above: an HTML error
+            // page or a proxy notice often quotes the request address, token
+            // included. Redact before the text can reach the dashboard or a
+            // notification.
             let shown: String = text.chars().take(200).collect();
-            Error::Failed(i18n::not_json(&shown))
+            Error::Failed(i18n::not_json(&i18n::redact_token(&shown)))
         })?;
         check(&payload)?;
         Ok(payload)
