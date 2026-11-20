@@ -316,14 +316,18 @@ impl Deps {
         // The manifest is the only place a grant can come from, so the advice
         // has to name the exact line to add, not "grant permission".
         let repo = &self.cfg.repo;
-        let advice = format!(
-            "读取依赖 jar 需要插件清单里的 fs.read 授权（正在读 {path}）。在插件包里把 plugin.toml 的 \
-             `optional` 改成 `fs.read:{repo}`（连同已有的 fs.read:~/.m2/repository 一起），重新安装并在 \
-             设置 › 插件 › ApiMocktle › 权限 里勾选；两个目录都用就两条都留。"
-        );
+        // The notification follows the IDE language; the log keeps Chinese, like
+        // every other `host::log` line in this plugin (logs are for diagnosing,
+        // not part of the UI).
+        let advice = crate::i18n::dep_jar_advice(crate::i18n::Lang::Zh, path, repo);
         host::log(LogLevel::Warn, &format!("ApiMocktle: {advice}"));
         if !WARNED.swap(true, Ordering::Relaxed) {
-            host::notify(NotificationLevel::Warning, "ApiMocktle 读不到依赖 jar", &advice);
+            let lang = crate::i18n::lang();
+            host::notify(
+                NotificationLevel::Warning,
+                crate::i18n::DEP_JAR_TITLE.get(lang),
+                &crate::i18n::dep_jar_advice(lang, path, repo),
+            );
         }
     }
 

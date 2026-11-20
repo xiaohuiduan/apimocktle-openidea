@@ -141,7 +141,7 @@ fn document() -> Value {
         .iter()
         .find(|e| e.method_name == "queryItem")
         .expect("the endpoint");
-    yapi::api_doc(endpoint, &scanned.dto, 3)
+    yapi::api_doc(endpoint, &scanned.dto, 3, openidea_apimocktle::i18n::Lang::En)
 }
 
 #[test]
@@ -183,7 +183,7 @@ fn without_the_fs_grant_the_jar_is_skipped_quietly() {
         .iter()
         .find(|e| e.method_name == "queryItem")
         .expect("the endpoint");
-    let doc = yapi::api_doc(endpoint, &scanned.dto, 3);
+    let doc = yapi::api_doc(endpoint, &scanned.dto, 3, openidea_apimocktle::i18n::Lang::En);
     let res: Value = serde_json::from_str(doc["res_body"].as_str().expect("a schema string")).expect("json");
 
     // Without the grant the jar is invisible, so the wrapper stays unknown and
@@ -252,7 +252,7 @@ fn interface_document() -> Value {
         .iter()
         .find(|e| e.method_name == "jailed")
         .expect("the endpoint");
-    yapi::api_doc(endpoint, &scanned.dto, 3)
+    yapi::api_doc(endpoint, &scanned.dto, 3, openidea_apimocktle::i18n::Lang::En)
 }
 
 #[test]

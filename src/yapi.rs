@@ -5,6 +5,7 @@
 use openidea_plugin::{Error, HttpRequest, host};
 use serde_json::{Value, json};
 
+use crate::i18n;
 use crate::model::{Endpoint, ParamSpec, ResolvedClass, body_schema};
 use crate::scan::DtoIndex;
 
@@ -68,7 +69,7 @@ fn check(payload: &Value) -> Result<(), Error> {
         .or_else(|| payload.get("message").and_then(Value::as_str))
         .unwrap_or("");
     let ok = matches!(code, Some(0) | Some(200)) || matches!(message, "成功" | "成功！");
-    if ok { Ok(()) } else { Err(Error::Failed(format!("服务器返回错误：{}", if message.is_empty() { "未知错误" } else { message }))) }
+    if ok { Ok(()) } else { Err(Error::Failed(i18n::server_error(&i18n::redact_token(message)))) }
 }
 
 impl Client {
@@ -79,10 +80,10 @@ impl Client {
     fn call(&self, method: &str, path: &str, query: &str, body: Option<Value>) -> Result<Value, Error> {
         let base = self.trimmed();
         if base.is_empty() {
-            return Err(Error::Invalid("先在设置里填写 ApiMocktle 服务器地址".into()));
+            return Err(Error::Invalid(i18n::YAPI_SET_SERVER.get(i18n::lang()).into()));
         }
         if self.token.trim().is_empty() {
-            return Err(Error::Invalid("先在设置里填写个人令牌".into()));
+            return Err(Error::Invalid(i18n::YAPI_SET_TOKEN.get(i18n::lang()).into()));
         }
         let url = if query.is_empty() { format!("{base}{path}") } else { format!("{base}{path}?{query}") };
         let mut req = HttpRequest {
@@ -96,16 +97,26 @@ impl Client {
         }
         // A slow server must fail the call, not blow the 5-second host budget.
         req.timeout_ms = Some(3_000);
-        let response = host::fetch(&req)?;
+        // The token rides in the query string, and a transport error quotes the
+        // whole URL: redact before the message can reach the UI (`?` alone would
+        // surface it in the dashboard's status line and in a notification).
+        let response = host::fetch(&req).map_err(|e| match e {
+            // These two carry no URL; keep their meaning (and their wording).
+            e @ (Error::Denied(_) | Error::Cancelled) => e,
+            other => Error::Failed(i18n::redact_token(&other.to_string())),
+        })?;
         let text = response.text();
         if response.status == 401 || response.status == 403 {
-            return Err(Error::Denied("服务器拒绝了令牌，请在设置里更新个人令牌".into()));
+            return Err(Error::Denied(i18n::YAPI_TOKEN_REJECTED.get(i18n::lang()).into()));
         }
         if !(200..300).contains(&response.status) {
-            return Err(Error::Failed(format!("HTTP {}：{}", response.status, text.chars().take(300).collect::<String>())));
+            let shown: String = text.chars().take(300).collect();
+            return Err(Error::Failed(i18n::http_status(response.status, &i18n::redact_token(&shown))));
         }
-        let payload: Value = serde_json::from_str(&text)
-            .map_err(|_| Error::Failed(format!("响应不是 JSON：{}", text.chars().take(200).collect::<String>())))?;
+        let payload: Value = serde_json::from_str(&text).map_err(|_| {
+            let shown: String = text.chars().take(200).collect();
+            Error::Failed(i18n::not_json(&shown))
+        })?;
         check(&payload)?;
         Ok(payload)
     }
@@ -154,7 +165,7 @@ impl Client {
             .map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string()))
             .unwrap_or_default();
         if id.is_empty() {
-            return Err(Error::Failed(format!("创建分类「{name}」后服务器没有返回 id")));
+            return Err(Error::Failed(i18n::category_without_id(name)));
         }
         Ok(Category { id, name: data.get("name").and_then(Value::as_str).unwrap_or(name).to_owned() })
     }
@@ -274,7 +285,12 @@ fn form_params(params: &[ParamSpec]) -> Value {
 }
 
 /// The YApi interface document for one endpoint.
-pub fn api_doc(endpoint: &Endpoint, dto: &DtoIndex, depth: u32) -> Value {
+///
+/// `lang` picks the language of the `markdown` field, the only prose in the
+/// document. It is a parameter rather than a `host::locale()` call so building a
+/// document does not depend on a mounted host — the document is also built by
+/// tests and by the endpoint export path with no view attached.
+pub fn api_doc(endpoint: &Endpoint, dto: &DtoIndex, depth: u32, lang: i18n::Lang) -> Value {
     let resolve = |name: &str, _d: u32| {
         let fields = dto.fields.get(name)?;
         Some(ResolvedClass { params: dto.params.get(name).cloned().unwrap_or_default(), fields: fields.clone() })
@@ -299,13 +315,13 @@ pub fn api_doc(endpoint: &Endpoint, dto: &DtoIndex, depth: u32) -> Value {
         "path": endpoint.path,
         "method": endpoint.yapi_method(),
         "desc": endpoint.description,
-        "markdown": format!(
-            "## {}\n\n{}\n\n来源：`{}`（{} {}）",
-            endpoint.summary,
-            endpoint.description,
-            endpoint.handler(),
-            endpoint.framework,
-            endpoint.file
+        "markdown": i18n::api_markdown(
+            lang,
+            &endpoint.summary,
+            &endpoint.description,
+            &endpoint.handler(),
+            &endpoint.framework,
+            &endpoint.file
         ),
         "status": "done",
         "req_body_is_json_schema": true,
@@ -355,7 +371,7 @@ mod tests {
             "UserDto".to_owned(),
             vec![FieldSpec { name: "id".into(), ty: "long".into(), description: String::new(), children: vec![] }],
         );
-        let doc = api_doc(&endpoint(), &dto, 2);
+        let doc = api_doc(&endpoint(), &dto, 2, i18n::Lang::Zh);
         assert_eq!(doc["method"], "POST");
         assert_eq!(doc["path"], "/api/users");
         assert_eq!(doc["req_query"][0]["name"], "verbose");
@@ -384,7 +400,7 @@ mod tests {
             ParamSpec { name: "file".into(), ty: "MultipartFile".into(), required: true, description: "附件".into() },
             ParamSpec { name: "metadata".into(), ty: "String".into(), required: false, description: String::new() },
         ];
-        let doc = api_doc(&endpoint, &DtoIndex::default(), 2);
+        let doc = api_doc(&endpoint, &DtoIndex::default(), 2, i18n::Lang::Zh);
 
         assert_eq!(doc["req_body_type"], "form");
         let form = doc["req_body_form"].as_array().expect("an array of parts");
@@ -429,7 +445,7 @@ mod tests {
 
     #[test]
     fn a_json_body_keeps_req_body_type_json() {
-        let doc = api_doc(&endpoint(), &DtoIndex::default(), 2);
+        let doc = api_doc(&endpoint(), &DtoIndex::default(), 2, i18n::Lang::Zh);
         assert_eq!(doc["req_body_type"], "json");
         assert_eq!(doc["req_body_form"], json!([]));
     }

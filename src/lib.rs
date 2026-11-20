@@ -8,6 +8,7 @@
 
 pub mod classfile;
 pub mod deps;
+pub mod i18n;
 pub mod java;
 pub mod model;
 pub mod scan;
@@ -44,7 +45,11 @@ const QUEUE_KEY: &str = "export:queue";
 /// Category ids per server and project, kept across batches. The base URL is
 /// part of the key so a `catid` from one server is never used on another.
 const CATS_KEY: &str = "cats:";
-const CATEGORY_DESC: &str = "由 OpenIDEA ApiMocktle 插件维护";
+
+/// The description every category this plugin creates carries.
+fn category_desc() -> &'static str {
+    i18n::CATEGORY_DESC.get(i18n::lang())
+}
 
 #[derive(Default)]
 pub struct ApiMocktle {
@@ -62,11 +67,12 @@ struct Config {
 fn config() -> Result<Config, Error> {
     let base = host::setting_string("serverUrl").unwrap_or_default().trim().to_owned();
     let token = host::setting_string("token").unwrap_or_default().trim().to_owned();
+    let lang = i18n::lang();
     if base.is_empty() {
-        return Err(Error::Invalid("先在设置 › ApiMocktle 里填写服务器地址".into()));
+        return Err(Error::Invalid(i18n::SET_SERVER_ADDRESS.get(lang).into()));
     }
     if token.is_empty() {
-        return Err(Error::Invalid("先在设置 › ApiMocktle 里填写个人令牌".into()));
+        return Err(Error::Invalid(i18n::SET_PERSONAL_TOKEN.get(lang).into()));
     }
     Ok(Config { base, token })
 }
@@ -132,7 +138,7 @@ fn resolve_category(client: &yapi::Client, name: &str, cache: &mut HashMap<Strin
     if let Some(id) = cache.get(name).filter(|id| !id.is_empty()) {
         return Some(id.clone());
     }
-    let found = client.find_or_create_category(name, CATEGORY_DESC).ok()?;
+    let found = client.find_or_create_category(name, category_desc()).ok()?;
     if found.id.is_empty() {
         return None;
     }
@@ -144,7 +150,7 @@ fn resolve_category(client: &yapi::Client, name: &str, cache: &mut HashMap<Strin
 /// the old one does not exist (it was deleted, or belongs to another project).
 fn rebuild_category(client: &yapi::Client, name: &str, cache: &mut HashMap<String, String>) -> Option<String> {
     cache.remove(name);
-    let created = client.create_category(name, CATEGORY_DESC).ok()?;
+    let created = client.create_category(name, category_desc()).ok()?;
     if created.id.is_empty() {
         return None;
     }
@@ -156,28 +162,27 @@ fn rebuild_category(client: &yapi::Client, name: &str, cache: &mut HashMap<Strin
 /// sent, the queue stays, and the status bar says why. The error names both ways
 /// out, because silently resending is the failure this replaces.
 fn pause_for_another_target(queued_base: &str, current_base: &str) -> Error {
+    let lang = i18n::lang();
     let same_server = queued_base == current_base;
     let text = if same_server {
-        "同步已暂停 · 队列用的是另一个令牌"
+        i18n::PAUSE_OTHER_TOKEN.get(lang)
     } else {
-        "同步已暂停 · 队列属于另一服务器"
+        i18n::PAUSE_OTHER_SERVER.get(lang)
     };
     let mismatch = if same_server {
-        "导出队列用的是另一个个人令牌".to_owned()
+        i18n::queue_other_token()
     } else {
-        format!("导出队列属于 {queued_base}，当前服务器是 {current_base}")
+        i18n::queue_other_server(queued_base, current_base)
     };
     host::set_status_item(
         "sync",
         &StatusItem {
             text: text.into(),
-            tooltip: Some("改回原来的服务器地址和令牌即可继续；要发到当前服务器请重新导出".into()),
+            tooltip: Some(i18n::PAUSE_TOOLTIP.get(lang).into()),
             command: Some("open-dashboard".into()),
         },
     );
-    Error::Failed(format!(
-        "{mismatch}。改回原来的服务器地址和令牌即可继续；要发到当前服务器，请重新点「导出全部」重新导出。"
-    ))
+    Error::Failed(i18n::paused_for_target(&mismatch))
 }
 
 /// `path` is `target` or inside it, whichever separator the host used.
@@ -238,7 +243,10 @@ impl ApiMocktle {
         only_path: Option<String>,
         target: Option<String>,
     ) -> Result<String, Error> {
-        let project = ctx.project().ok_or("先打开一个项目")?;
+        // `Failed` rather than `Invalid`: these strings are shown to the user as
+        // written (`Display`), while `Invalid` would prefix them with "invalid: ".
+        let project =
+            ctx.project().ok_or_else(|| Error::Failed(i18n::OPEN_A_PROJECT.get(i18n::lang()).into()))?;
         let cfg = config()?;
         let scanned = self.scan(&project)?;
         let picked: Vec<&Endpoint> = scanned
@@ -247,13 +255,13 @@ impl ApiMocktle {
             .filter(|e| only_path.as_ref().is_none_or(|path| under(&e.file, path)))
             .collect();
         if picked.is_empty() {
-            return Err(Error::Invalid("没有找到可导出的接口".into()));
+            return Err(Error::Invalid(i18n::NO_ENDPOINTS_FOUND.get(i18n::lang()).into()));
         }
 
         let probe = yapi::Client { base: cfg.base.clone(), token: cfg.token.clone(), project_id: String::new() };
         let projects = probe.list_projects()?;
         if projects.is_empty() {
-            return Err(Error::Failed("服务器上还没有项目，请先在 ApiMocktle 里创建一个".into()));
+            return Err(Error::Failed(i18n::NO_PROJECTS_ON_SERVER.get(i18n::lang()).into()));
         }
         let project_id = match target.filter(|id| !id.trim().is_empty()) {
             Some(id) => id,
@@ -270,7 +278,7 @@ impl ApiMocktle {
                         PickItem::new(&p.id, &label)
                     })
                     .collect();
-                host::pick("导出到哪个项目", &choices)?.ok_or(Error::Cancelled)?
+                host::pick(i18n::PICK_PROJECT.get(i18n::lang()), &choices)?.ok_or(Error::Cancelled)?
             }
         };
 
@@ -281,7 +289,7 @@ impl ApiMocktle {
             .map(|endpoint| {
                 json!({
                     "cat": endpoint.class_name.clone(),
-                    "doc": yapi::api_doc(endpoint, &scanned.dto, depth),
+                    "doc": yapi::api_doc(endpoint, &scanned.dto, depth, i18n::lang()),
                 })
             })
             .collect();
@@ -309,10 +317,11 @@ impl ApiMocktle {
     /// interface quiet when the host's schedule drives the batch.
     fn flush_export(&mut self, cfg: &Config, notify: bool) -> Result<String, Error> {
         let Some(raw) = host::storage::get(QUEUE_KEY)? else {
-            return Ok("没有待导出的接口".into());
+            return Ok(i18n::NOTHING_TO_EXPORT.get(i18n::lang()).into());
         };
+        let lang = i18n::lang();
         let mut queue: Value =
-            serde_json::from_str(&raw).map_err(|e| Error::Failed(format!("导出队列已损坏：{e}")))?;
+            serde_json::from_str(&raw).map_err(|e| Error::Failed(i18n::queue_corrupt(&e.to_string())))?;
         let items = queue.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
         let queued_base = queue.get("base").and_then(Value::as_str).unwrap_or_default().to_owned();
         let queued_auth = queue.get("auth").and_then(Value::as_str).unwrap_or_default().to_owned();
@@ -322,7 +331,7 @@ impl ApiMocktle {
         // schedule path has no other way to report it.
         if items.is_empty() {
             host::storage::delete(QUEUE_KEY)?;
-            return Ok("没有待导出的接口".into());
+            return Ok(i18n::NOTHING_TO_EXPORT.get(lang).into());
         }
         if queued_base.is_empty() || queued_auth.is_empty() {
             host::storage::delete(QUEUE_KEY)?;
@@ -333,7 +342,7 @@ impl ApiMocktle {
                     items.len()
                 ),
             );
-            return Ok("没有待导出的接口".into());
+            return Ok(i18n::NOTHING_TO_EXPORT.get(lang).into());
         }
         let base = yapi::normalize_base(&cfg.base);
         let auth = fingerprint(&cfg.token);
@@ -364,10 +373,14 @@ impl ApiMocktle {
                 continue;
             }
             sent += 1;
-            let category = item.get("cat").and_then(Value::as_str).unwrap_or("默认分类").to_owned();
+            let category = item
+                .get("cat")
+                .and_then(Value::as_str)
+                .unwrap_or(i18n::DEFAULT_CATEGORY.get(lang))
+                .to_owned();
             let doc = item.get("doc").cloned().unwrap_or(Value::Null);
             let Some(cat_id) = resolve_category(&client, &category, &mut categories) else {
-                failed.push(format!("分类「{category}」不可用"));
+                failed.push(i18n::category_unavailable(&category));
                 continue;
             };
             let existing = match known.get(&cat_id) {
@@ -397,9 +410,9 @@ impl ApiMocktle {
                     match rebuild_category(&client, &category, &mut categories) {
                         Some(fresh) if fresh != cat_id => match client.save_api(&doc, &fresh, None) {
                             Ok(()) => saved += 1,
-                            Err(second) => failed.push(format!("{key}：{second}")),
+                            Err(second) => failed.push(i18n::failed_endpoint(&key, &second.to_string())),
                         },
-                        _ => failed.push(format!("{key}：{first}")),
+                        _ => failed.push(i18n::failed_endpoint(&key, &first.to_string())),
                     }
                 }
             }
@@ -420,16 +433,12 @@ impl ApiMocktle {
             String::new()
         } else {
             let shown: Vec<String> = failed.iter().take(3).cloned().collect();
-            format!("\n其中 {} 个失败：{}", failed.len(), shown.join("；"))
+            i18n::failed_note(failed.len(), &shown)
         };
         let summary = if left == 0 {
-            format!("全部 {queued} 个接口已同步到 ApiMocktle。{failed_note}")
+            i18n::export_done(queued, &failed_note)
         } else {
-            format!(
-                "已同步 {saved} 个，还剩 {left} 个没发完。{failed_note}\n\
-                 OpenIDEA 对单次插件调用限时约 5 秒，剩下的接口每分钟会自动续传，不用管也会走完；\
-                 想马上推下一批就点「立即继续」。"
-            )
+            i18n::export_partial(saved, left, &failed_note)
         };
         host::log(
             LogLevel::Info,
@@ -446,7 +455,7 @@ impl ApiMocktle {
                     NotificationLevel::Info,
                     "ApiMocktle",
                     &summary,
-                    &[NotificationAction::new("立即继续", "export-continue")],
+                    &[NotificationAction::new(i18n::CONTINUE_NOW.get(lang), "export-continue")],
                 )?;
             } else {
                 host::notify(NotificationLevel::Info, "ApiMocktle", &summary);
@@ -455,8 +464,8 @@ impl ApiMocktle {
             host::set_status_item(
                 "sync",
                 &StatusItem {
-                    text: format!("同步中 · 剩 {left}"),
-                    tooltip: Some("OpenIDEA 限时单次调用 5 秒，剩余接口每分钟自动续传，完成后会提示".into()),
+                    text: i18n::syncing_left(left),
+                    tooltip: Some(i18n::SYNC_LEFT_TOOLTIP.get(lang).into()),
                     command: Some("open-dashboard".into()),
                 },
             );
@@ -477,7 +486,11 @@ impl ApiMocktle {
         }
         if host::storage::get(QUEUE_KEY)?.is_none() {
             host::remove_status_item("sync");
-            host::notify(NotificationLevel::Info, "ApiMocktle", "后台续传完成，接口已全部同步。");
+            host::notify(
+                NotificationLevel::Info,
+                "ApiMocktle",
+                i18n::BACKGROUND_DONE.get(i18n::lang()),
+            );
         }
         Ok(())
     }
@@ -486,9 +499,16 @@ impl ApiMocktle {
 impl Plugin for ApiMocktle {
     fn activate(&mut self, _ctx: &Context) -> Result<(), Error> {
         let base = host::setting_string("serverUrl").unwrap_or_default();
+        // The UI language is only visible to the plugin through `locale()`, and a
+        // wrong dashboard language is otherwise indistinguishable from a wrong
+        // catalog; logging it once makes the difference diagnosable.
         host::log(
             LogLevel::Info,
-            &format!("ApiMocktle {} 已激活（serverUrl={base}，API 1.7）", env!("CARGO_PKG_VERSION")),
+            &format!(
+                "ApiMocktle {} 已激活（serverUrl={base}，API 1.7，host::locale()={}）",
+                env!("CARGO_PKG_VERSION"),
+                host::locale()
+            ),
         );
         Ok(())
     }
@@ -498,7 +518,7 @@ impl Plugin for ApiMocktle {
             "export-project" => self.start_export(ctx, None, None).map(Some),
             "export-file" => {
                 let path = target_path(ctx, arg).ok_or_else(|| {
-                    Error::Invalid("先在项目树里选中文件/目录，或打开一个控制器文件".into())
+                    Error::Invalid(i18n::SELECT_FILE_OR_FOLDER.get(i18n::lang()).into())
                 })?;
                 self.start_export(ctx, Some(path), None).map(Some)
             }
@@ -514,7 +534,11 @@ impl Plugin for ApiMocktle {
                 self.cache.clear();
                 self.routes.clear();
                 host::refresh_view(VIEW);
-                host::notify(NotificationLevel::Info, "ApiMocktle", "缓存已清除，下次打开仪表盘时重新扫描。");
+                host::notify(
+                    NotificationLevel::Info,
+                    "ApiMocktle",
+                    i18n::CACHE_CLEARED.get(i18n::lang()),
+                );
                 Ok(None)
             }
             other => Err(Error::NotFound(format!("command {other}"))),
@@ -566,17 +590,27 @@ impl Views for ApiMocktle {
             return Err(Error::NotFound(view.into()));
         }
         // The page keeps its own state and asks for data over messages, so the
-        // frame is never re-rendered underneath the user.
+        // frame is never re-rendered underneath the user. `locale` travels with
+        // the start data because the host does not translate an `html` body:
+        // the page picks its own text from it.
+        // The raw `host::locale()` tag is baked in, because the page gets it
+        // verbatim and applies its own fallback (`page.html`). It can be stale —
+        // the host may render a view before telling the plugin the current
+        // language — so the page also asks for it again after loading.
+        let locale = host::locale();
         let start = json!({
             "configured": config().is_ok(),
             "base": host::setting_string("serverUrl").unwrap_or_default(),
+            "locale": locale,
         })
         .to_string()
         .replace('<', "\\u003c");
         let page = PAGE.replacen(r#""__START__""#, &start, 1);
+        // These two labels are translated by the host from `locales/<tag>.json`,
+        // so they are written in the catalog's source language (English).
         Ok(View::new(Body::Html(page))
-            .button(Button::new("refresh", "重新扫描").icon("refresh"))
-            .button(Button::new("export", "导出全部").icon("run")))
+            .button(Button::new("refresh", "Rescan").icon("refresh"))
+            .button(Button::new("export", "Export All").icon("run")))
     }
 
     fn handle(&mut self, view: &str, event: ViewEvent, ctx: &Invocation) -> Result<(), Error> {
@@ -599,6 +633,14 @@ impl Views for ApiMocktle {
             ViewEvent::Message(text) => {
                 let Ok(value) = serde_json::from_str::<Value>(&text) else { return Ok(()) };
                 match value.get("op").and_then(Value::as_str) {
+                    Some("locale") => {
+                        // The page asks rather than waiting for a push: the host
+                        // may render a view before it has told the plugin the
+                        // current language, so the value baked in at render time
+                        // can be stale. Answering here lets the page correct
+                        // itself on load and keep following the IDE afterwards.
+                        post(json!({ "op": "locale", "locale": host::locale() }));
+                    }
                     Some("scan") => {
                         let payload = self.dashboard_payload(ctx);
                         post(payload);
@@ -661,7 +703,8 @@ impl Views for ApiMocktle {
 impl ApiMocktle {
     fn dashboard_payload(&mut self, ctx: &Invocation) -> Value {
         let Some(project) = ctx.project() else {
-            return json!({ "op": "items", "error": "先打开一个项目", "items": [], "count": 0 });
+            let error = i18n::OPEN_A_PROJECT.get(i18n::lang());
+            return json!({ "op": "items", "error": error, "items": [], "count": 0 });
         };
         match self.scan(&project) {
             Ok(scanned) => {
@@ -676,13 +719,15 @@ impl ApiMocktle {
     }
 
     fn export_one(&mut self, ctx: &Invocation, index: usize, target: Option<String>) -> Result<String, Error> {
-        let project = ctx.project().ok_or("先打开一个项目")?;
+        let project = ctx
+            .project()
+            .ok_or_else(|| Error::Failed(i18n::OPEN_A_PROJECT.get(i18n::lang()).into()))?;
         let scanned = self.scan(&project)?;
         let endpoint = scanned
             .endpoints
             .get(index)
             .cloned()
-            .ok_or_else(|| Error::Invalid("接口不存在，请重新扫描".into()))?;
+            .ok_or_else(|| Error::Invalid(i18n::ENDPOINT_GONE.get(i18n::lang()).into()))?;
         self.export_single(ctx, &endpoint, &scanned, target)
     }
 
@@ -701,20 +746,20 @@ impl ApiMocktle {
             None if projects.len() == 1 => projects[0].id.clone(),
             None => {
                 let choices: Vec<PickItem> = projects.iter().map(|p| PickItem::new(&p.id, &p.name)).collect();
-                host::pick("导出到哪个项目", &choices)?.ok_or(Error::Cancelled)?
+                host::pick(i18n::PICK_PROJECT.get(i18n::lang()), &choices)?.ok_or(Error::Cancelled)?
             }
         };
         let client = yapi::Client { base: cfg.base, token: cfg.token, project_id };
-        let cat = client.find_or_create_category(&endpoint.class_name, CATEGORY_DESC)?;
+        let cat = client.find_or_create_category(&endpoint.class_name, category_desc())?;
         let existing = client
             .list_apis(&cat.id)
             .unwrap_or_default()
             .into_iter()
             .find(|a| a.path == endpoint.path && a.method.eq_ignore_ascii_case(&endpoint.yapi_method()))
             .map(|a| a.id);
-        let doc = yapi::api_doc(endpoint, &scanned.dto, scan_options().depth);
+        let doc = yapi::api_doc(endpoint, &scanned.dto, scan_options().depth, i18n::lang());
         client.save_api(&doc, &cat.id, existing.as_deref())?;
-        Ok(format!("已同步 {}", endpoint.label()))
+        Ok(i18n::synced(&endpoint.label()))
     }
 
     fn report(&mut self, result: Result<String, Error>) {
@@ -757,8 +802,17 @@ public class UserController {
         Ok(HttpResponse { status, headers: Vec::new(), body: body.to_string().into_bytes() })
     }
 
+    /// A CJK ideograph: the character range every Chinese string here uses.
+    fn is_cjk(c: char) -> bool {
+        ('\u{4e00}'..='\u{9fff}').contains(&c)
+    }
+
     /// A project with one controller and two DTOs, and a YApi server that
     /// answers like ApiMocktle does.
+    ///
+    /// The host's UI language is `zh-CN` here, so the assertions below can pin
+    /// the Chinese text they were written against; `the_same_export_reads_
+    /// english_on_an_english_ide` covers the other side.
     fn host() -> MockHost {
         let host = MockHost::install().with_capabilities(&[
             "project.read",
@@ -767,6 +821,7 @@ public class UserController {
             "net:127.0.0.1",
             "clipboard",
         ]);
+        host.set_locale("zh-CN");
         host.add_project("/proj");
         host.set_project_root(Some("/proj"));
         host.add_file("/proj/src/UserController.java", CONTROLLER);
@@ -892,8 +947,33 @@ public class UserController {
         let view = plugin.render(VIEW, None, &host.invocation()).unwrap();
         let Body::Html(page) = view.body else { panic!("an html body") };
         assert!(page.contains("ApiMocktle"));
-        assert!(page.contains("导出全部"));
+        // The page carries both sides of its own text table; which one is shown
+        // depends on the `locale` in the start data (see below).
+        assert!(page.contains("导出全部") && page.contains("Export All"), "the page has both labels");
         assert!(!page.contains("发送请求"), "the dashboard only browses and exports");
+
+        // The host does not translate an `html` body, so the start data tells the
+        // page which language to use.
+        // The start data carries the raw `host::locale()` tag; the page decides
+        // what to show from it plus its own `navigator.language`.
+        assert!(page.contains(r#""locale":"zh-CN""#), "the start data carries the raw language tag");
+        // The injected value is a JSON *object literal*: the page must read it as
+        // a value. `JSON.parse` on it throws, which used to leave the page in
+        // English on a Chinese IDE (caught at the page level by check-pages.mjs).
+        assert!(
+            page.contains(r#"typeof START === "object""#),
+            "the page reads the start data as a value, not through JSON.parse"
+        );
+        // `render` replaces the first quoted placeholder only; a second one
+        // would be left in the page as literal text.
+        assert!(!page.contains(r#""__START__""#), "the placeholder is gone once rendered");
+        let view_buttons: Vec<(&str, &str)> =
+            view.toolbar.iter().map(|b| (b.id.as_str(), b.label.as_str())).collect();
+        assert_eq!(
+            view_buttons,
+            vec![("refresh", "Rescan"), ("export", "Export All")],
+            "the host translates these from locales/<tag>.json, so they are written in its source language"
+        );
 
         let message = json!({ "op": "scan" }).to_string();
         plugin.handle(VIEW, ViewEvent::Message(message), &host.invocation()).unwrap();
@@ -902,6 +982,151 @@ public class UserController {
         let payload: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(payload["op"], "items");
         assert_eq!(payload["count"], 2);
+    }
+
+    /// Both "no project" messages were `ok_or("…")` — that is `Error::Failed`,
+    /// whose `Display` is the text itself. They are localized now, so they must
+    /// stay `Failed`: `Error::Invalid` would prefix them with "invalid: ".
+    ///
+    /// (The other user-facing errors — missing settings, an endpoint that is
+    /// gone, nothing selected — were already `Error::Invalid` before this
+    /// change; that prefix is pre-existing behaviour and is left alone.)
+    #[test]
+    fn the_no_project_message_stays_unprefixed() {
+        let host = host();
+        host.set_locale("zh-CN");
+        host.set_project_root(None);
+        let mut plugin = ApiMocktle::default();
+
+        // `start_export`, reached by both export commands.
+        let err = plugin.run_command("export-project", &host.invocation(), None).unwrap_err();
+        assert_eq!(err.to_string(), "先打开一个项目", "no variant prefix leaks in");
+
+        // `export_one`, reached by the dashboard's "sync this one".
+        let err = plugin.export_one(&host.invocation(), 0, None).unwrap_err();
+        assert_eq!(err.to_string(), "先打开一个项目", "same message from the single export");
+    }
+
+    /// The page asks for the language instead of waiting for a push: the host can
+    /// render a view before it has told the plugin the current language, so the
+    /// value baked in at render time is not trustworthy on its own. That stale
+    /// value is why the dashboard used to need a reload to switch.
+    #[test]
+    fn the_page_can_ask_for_the_current_language() {
+        let host = host();
+        host.set_locale("zh-CN");
+        let mut plugin = ApiMocktle::default();
+        plugin.render(VIEW, None, &host.invocation()).unwrap();
+
+        // The IDE switches to English after the page was drawn.
+        host.set_locale("en");
+
+        // The page asks; the answer is the *current* language, not the baked one.
+        plugin
+            .handle(VIEW, ViewEvent::Message(json!({ "op": "locale" }).to_string()), &host.invocation())
+            .unwrap();
+        let (view, payload) = host.view_messages().pop().expect("an answer");
+        assert_eq!(view, VIEW);
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["op"], "locale");
+        assert_eq!(payload["locale"], "en");
+        assert!(host.refreshed_views().is_empty(), "answering does not rebuild the page");
+
+        // Asking again is always answered, so the page can poll.
+        plugin
+            .handle(VIEW, ViewEvent::Message(json!({ "op": "locale" }).to_string()), &host.invocation())
+            .unwrap();
+        let (_, payload) = host.view_messages().pop().unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["locale"], "en");
+    }
+
+    /// The IDE's own setting decides the language, whatever the frame's system
+    /// language is: a user who set the IDE to English must get English even on a
+    /// Chinese Windows whose frame reports `zh-CN` (that is what `page.html`
+    /// cross-checks, and the plugin itself must not second-guess it).
+    #[test]
+    fn the_ide_setting_decides_the_language_not_the_system_one() {
+        let host = host();
+        // The IDE is English.
+        host.set_locale("en");
+        let mut plugin = ApiMocktle::default();
+        plugin.render(VIEW, None, &host.invocation()).unwrap();
+
+        // The page polling for the language gets the IDE's answer, not a guess.
+        plugin
+            .handle(VIEW, ViewEvent::Message(json!({ "op": "locale" }).to_string()), &host.invocation())
+            .unwrap();
+        let (_, payload) = host.view_messages().pop().unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["locale"], "en", "the IDE setting decides");
+
+        assert!(i18n::lang() == i18n::Lang::En, "the plugin's own text follows it");
+        let text = plugin.run_command("export-project", &host.invocation(), None).unwrap().unwrap();
+        assert!(text.contains("synced to ApiMocktle"), "{text}");
+
+        // And when the IDE itself is Chinese, that decides too.
+        host.set_locale("zh-CN");
+        let text = plugin.run_command("export-project", &host.invocation(), None).unwrap().unwrap();
+        assert!(text.contains("已同步到 ApiMocktle"), "{text}");
+    }
+
+    /// The same export path in English: everything the plugin builds itself
+    /// follows `host::locale()`, while the code does not change.
+    #[test]
+    fn the_same_export_reads_english_on_an_english_ide() {
+        let host = host();
+        host.set_locale("en");
+        let mut plugin = ApiMocktle::default();
+
+        let text = plugin.run_command("export-project", &host.invocation(), None).unwrap().unwrap();
+        assert!(text.contains("synced to ApiMocktle"), "{text}");
+        assert!(!text.chars().any(is_cjk), "an English IDE gets English text: {text}");
+        // The category description the plugin sends is prose too.
+        let cat = host
+            .requests()
+            .into_iter()
+            .find(|r| r.url.contains("/api/interface/add_cat"))
+            .expect("a category is created");
+        let body: Value = serde_json::from_str(&String::from_utf8(cat.body.unwrap()).unwrap()).unwrap();
+        assert_eq!(body["desc"], "Maintained by the OpenIDEA ApiMocktle plugin");
+
+        // And the settings error a user can hit before anything else.
+        host.set_setting("token", "\"\"");
+        let err = plugin.run_command("export-project", &host.invocation(), None).unwrap_err();
+        assert!(
+            err.to_string().contains("Set the personal token in Settings › ApiMocktle first"),
+            "{err}"
+        );
+    }
+
+    /// The page picks its own text from the `locale` in the start data: the host
+    /// leaves an `html` body alone. This is the page half of the guarantee; the
+    /// Rust half is `the_same_export_reads_english_on_an_english_ide`.
+    #[test]
+    fn the_page_carries_both_languages_and_picks_one() {
+        let page = include_str!("page.html");
+        // Both sides live in the table, so a switch needs no rebuild.
+        assert!(page.contains("扫描中…") && page.contains("Scanning…"));
+        assert!(page.contains("let ZH = isChinese(hostLocale"), "the page reads the start language");
+        // `host::locale()` decides; the frame's system language only fills a gap,
+        // so an English IDE stays English on a Chinese Windows.
+        assert!(
+            page.contains("isChinese(hostLocale || navigatorLanguage)"),
+            "the frame language is a fallback, never an override"
+        );
+        // The page asks for the language instead of trusting the baked value (the
+        // host can render before it pushes the language) and re-renders its labels
+        // in place when the answer differs, so the selection survives.
+        assert!(page.contains(r#"payload.op === "locale""#), "the page handles a locale answer");
+        assert!(page.contains(r#"askLocale();"#), "and asks for the language on load");
+        assert!(page.contains(r#"const relocalize ="#), "and applies the answer in place");
+        // Nothing the page renders is hardcoded Chinese outside that table: every
+        // CJK character sits between the table's braces.
+        let (before, after) = page.split_once("const STR = {").expect("the table");
+        let (_, after) = after.split_once("\n  };").expect("the table ends");
+        let outside = format!("{before}{after}");
+        assert!(!outside.chars().any(is_cjk), "the page keeps its Chinese in the table only");
     }
 
     #[test]
@@ -1165,7 +1390,7 @@ public class UploadController {
         let query: Vec<&str> = upload.query_params.iter().map(|p| p.name.as_str()).collect();
         assert!(query.is_empty(), "a cookie parameter is not a query parameter either: {query:?}");
 
-        let doc = yapi::api_doc(upload, &scanned.dto, 2);
+        let doc = yapi::api_doc(upload, &scanned.dto, 2, i18n::Lang::En);
         assert_eq!(doc["req_body_type"], "form");
         assert_eq!(doc["req_body_form"][0]["type"], "file");
         assert_eq!(doc["req_body_form"][1]["type"], "text");

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -95,17 +95,17 @@
 </head>
 <body>
 <header>
-  <input id="q" type="search" placeholder="搜索路径 / 方法名 / 控制器" autocomplete="off" spellcheck="false">
-  <select id="project" title="导出目标项目"><option value="">加载项目…</option></select>
+  <input id="q" type="search" autocomplete="off" spellcheck="false">
+  <select id="project"></select>
   <span id="count">—</span>
-  <button id="rescan" title="丢弃缓存并重新解析源码">重新扫描</button>
-  <button id="exportAll" class="primary">导出全部</button>
+  <button id="rescan"></button>
+  <button id="exportAll" class="primary"></button>
 </header>
 <main>
-  <ul id="list"><li class="group">加载中…</li></ul>
-  <section id="detail"><p class="empty">选择一个接口</p></section>
+  <ul id="list"></ul>
+  <section id="detail"></section>
 </main>
-<footer><span id="status">就绪</span><span class="pill" id="cfg"></span></footer>
+<footer><span id="status"></span><span class="pill" id="cfg"></span></footer>
 <script>
 (() => {
   const START = "__START__";
@@ -113,33 +113,162 @@
   const $ = (id) => document.getElementById(id);
   const list = $("list"), detail = $("detail"), status = $("status"), count = $("count"), projectBox = $("project");
 
+  // The start data carries the IDE's UI language: the host translates a
+  // package's declarations, but an `html` body it leaves alone, so this page
+  // picks its own text. Unknown languages fall back to English, like the host.
+  //
+  // `render` replaces the quoted placeholder below with a JSON *object
+  // literal*, so this reads it as a value — JSON.parse would only see
+  // "[object Object]" and throw. Opening the file directly leaves the string in
+  // place, which the `typeof` check also covers. (The placeholder name is not
+  // repeated literally anywhere else in this file: `render` substitutes the
+  // first occurrence, so a second one would silently win.)
+  const start = (typeof START === "object" && START) || {};
+  /**
+   * The page's language: `host::locale()` decides, with a narrow fallback.
+   *
+   * `start.locale` is the IDE's own answer (the `appearance.locale` setting,
+   * reported as a BCP 47 tag) and it is the only thing that may pick the
+   * language: a user on an English IDE must get English even when Windows itself
+   * is Chinese.
+   *
+   * The fallback is only for a host that reports nothing at all (`""`), which
+   * older builds can do before the language has been pushed. `navigator.language`
+   * is the *system* language, so it must never override a non-empty answer.
+   */
+  const isChinese = (tag) => String(tag || "").toLowerCase().split(/[-_]/)[0] === "zh";
+  const navigatorLanguage = (() => {
+    try {
+      return (typeof navigator !== "undefined" && (navigator.language || navigator.userLanguage)) || "";
+    } catch (_) {
+      return "";
+    }
+  })();
+  const hostLocale = String(start.locale || "").trim();
+  let ZH = isChinese(hostLocale || navigatorLanguage);
+
+  /** English source, then Chinese; `STR.k` is `[en, zh]`. */
+  const STR = {
+    search: ["Search path / method / controller", "搜索路径 / 方法名 / 控制器"],
+    projectTitle: ["Export target project", "导出目标项目"],
+    loadingProjects: ["Loading projects…", "加载项目…"],
+    loading: ["Loading…", "加载中…"],
+    noEndpoints: ["No endpoints match", "没有匹配的接口"],
+    selectOne: ["Select an endpoint", "选择一个接口"],
+    rescanTitle: ["Drop the cache and parse the sources again", "丢弃缓存并重新解析源码"],
+    rescan: ["Rescan", "重新扫描"],
+    exportAll: ["Export All", "导出全部"],
+    queryParams: ["Query parameters", "查询参数"],
+    requestBody: ["Request body", "请求体"],
+    source: ["Source", "来源"],
+    open: ["Go to source", "跳到源码"],
+    exportOne: ["Sync this one", "同步这一个"],
+    other: ["Other", "其他"],
+    notConnected: ["Not connected", "未连接"],
+    chooseProject: ["Choose a project", "选择项目"],
+    configured: ["Server configured", "服务器已配置"],
+    notConfigured: ["Server not configured", "未配置服务器"],
+    scanning: ["Scanning…", "扫描中…"],
+    ready: ["Ready", "就绪"],
+    rescanning: ["Rescanning…", "重新扫描…"],
+    starting: ["Starting sync…", "开始同步…"],
+    scanDone: ["Scan complete: ", "扫描完成："],
+    endpoints: [" endpoint(s) · ", " 个接口 · "],
+    files: [" file(s)", " 个文件"],
+    truncated: [" · search limit reached, results may be incomplete", " · 已达搜索上限，结果可能不全"],
+    projectList: ["Projects: ", "项目列表："],
+    syncOne: ["Syncing ", "同步 "],
+  };
+  /** `STR.k` is `[en, zh]`; a key that is not in the table cannot crash the page. */
+  const T = (key) => {
+    const pair = STR[key];
+    if (!pair) return key;
+    return ZH ? pair[1] : pair[0];
+  };
+
   let items = [];
   let selected = -1;
 
+  // What the footer/status currently says, described rather than stored as a
+  // finished string, so a language switch can re-render it in the new language
+  // instead of losing it. `kind` is always the last argument of `say`.
+  let statusState = { key: "ready", args: [], kind: "" };
+  let detailIndex = -1; // the endpoint the detail panel shows, -1 for none
+  let configured = null; // null until the plugin reports it
+  let projects = []; // the last `projects` message's items
+  let projectsError = null;
+  let hasProjects = false;
+
+  /** The text of a `statusState`, in the current language. */
+  const statusText = (s) => {
+    switch (s.key) {
+      case "scanDone":
+        return T("scanDone") + s.args[0] + T("endpoints") + s.args[1] + T("files") +
+          (s.args[2] ? T("truncated") : "");
+      case "projectList":
+        return T("projectList") + s.args[0];
+      case "syncOne":
+        return T("syncOne") + s.args[0] + " " + s.args[1] + " …";
+      case "raw":
+        return s.args[0]; // an error the plugin built (already localized)
+      default:
+        return T(s.key);
+    }
+  };
+
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  const say = (text, kind) => { status.textContent = text; status.className = kind || ""; };
+  /** Sets the status line from a description, remembering it for a re-render. */
+  const say = (key, args, kind) => {
+    statusState = { key, args: args || [], kind: kind || "" };
+    status.textContent = statusText(statusState);
+    status.className = statusState.kind;
+  };
+  /** Sets the status line to text the plugin already localized. */
+  const sayRaw = (text, kind) => {
+    statusState = { key: "raw", args: [text], kind: kind || "" };
+    status.textContent = text;
+    status.className = statusState.kind;
+  };
   const send = (payload) => { if (api.postMessage) api.postMessage(JSON.stringify(payload)); };
   const target = () => projectBox.value || undefined;
 
+  // The static text lives in the markup, so set it from the table; a language
+  // switch runs this again.
+  const applyStatic = () => {
+    document.documentElement.lang = ZH ? "zh-CN" : "en";
+    $("q").placeholder = T("search");
+    projectBox.title = T("projectTitle");
+    $("rescan").title = T("rescanTitle");
+    $("rescan").textContent = T("rescan");
+    $("exportAll").textContent = T("exportAll");
+    if (configured !== null) $("cfg").textContent = configured ? T("configured") : T("notConfigured");
+  };
+  applyStatic();
+  projectBox.innerHTML = '<option value="">' + esc(T("loadingProjects")) + '</option>';
+  list.innerHTML = '<li class="group">' + esc(T("loading")) + '</li>';
+  detail.innerHTML = '<p class="empty">' + esc(T("selectOne")) + '</p>';
+  say("ready");
+
   const renderDetail = (item, index) => {
-    if (!item) { detail.innerHTML = '<p class="empty">选择一个接口</p>'; return; }
+    detailIndex = item ? index : -1;
+    if (!item) { detail.innerHTML = '<p class="empty">' + esc(T("selectOne")) + '</p>'; return; }
     const verb = (item.method || "ANY").toUpperCase();
     const out = [];
     out.push('<h2>' + esc(item.path) + '</h2>');
     out.push('<div class="meta"><span class="pill">' + esc(verb) + '</span> ' + esc(item.summary || "") +
       ' · ' + esc(item.framework || "") + ' · ' + esc(item.handler || "") + '</div>');
     if (item.params && item.params.length) {
-      out.push("<h3>查询参数</h3>" + item.params.map((p) => '<div class="kv"><b>' + esc(p) + '</b> <span>query</span></div>').join(""));
+      out.push("<h3>" + esc(T("queryParams")) + "</h3>" + item.params.map((p) => '<div class="kv"><b>' + esc(p) + '</b> <span>query</span></div>').join(""));
     }
-    if (item.body) out.push('<h3>请求体</h3><div class="kv"><b>' + esc(item.body) + '</b></div>');
-    out.push('<h3>来源</h3><div class="kv"><span>' + esc(item.file) + ":" + esc(item.line) + '</span></div>');
+    if (item.body) out.push('<h3>' + esc(T("requestBody")) + '</h3><div class="kv"><b>' + esc(item.body) + '</b></div>');
+    out.push('<h3>' + esc(T("source")) + '</h3><div class="kv"><span>' + esc(item.file) + ":" + esc(item.line) + '</span></div>');
     out.push('<div class="actions">' +
-      '<button data-act="open">跳到源码</button>' +
-      '<button class="primary" data-act="export">同步这一个</button></div>');
+      '<button data-act="open">' + esc(T("open")) + '</button>' +
+      '<button class="primary" data-act="export">' + esc(T("exportOne")) + '</button></div>');
     detail.innerHTML = out.join("");
     detail.querySelector('[data-act="open"]').onclick = () => send({ op: "open", index });
     detail.querySelector('[data-act="export"]').onclick = () => {
-      say("同步 " + item.method + " " + item.path + " …");
+      say("syncOne", [item.method, item.path]);
       send({ op: "export-one", index, project: target() });
     };
   };
@@ -152,13 +281,13 @@
       if (!needle || hay.includes(needle)) shown.push([index, item]);
     });
     count.textContent = shown.length + " / " + items.length;
-    if (!shown.length) { list.innerHTML = '<li class="group">没有匹配的接口</li>'; return; }
+    if (!shown.length) { list.innerHTML = '<li class="group">' + esc(T("noEndpoints")) + '</li>'; return; }
 
     // One section per controller, wherever its routes sit in the sorted list.
     const order = [];
     const byClass = new Map();
     for (const [index, item] of shown) {
-      const name = item["class"] || "其他";
+      const name = item["class"] || T("other");
       let bucket = byClass.get(name);
       if (!bucket) { bucket = []; byClass.set(name, bucket); order.push(name); }
       bucket.push([index, item]);
@@ -191,46 +320,88 @@
     list.replaceChildren(frag);
   };
 
+  /** The target picker's options, from the last `projects` message. */
+  const renderProjects = () => {
+    const options = ['<option value="">' + esc(projectsError ? T("notConnected") : T("chooseProject")) + "</option>"];
+    for (const p of projects) {
+      options.push('<option value="' + esc(p.id) + '">' + esc(p.name) + "</option>");
+    }
+    projectBox.innerHTML = options.join("");
+    projectBox.disabled = !hasProjects;
+  };
+
   const handle = (raw) => {
     let payload = raw;
     if (typeof raw === "string") {
       try { payload = JSON.parse(raw); } catch (_) { return; }
     }
     if (!payload) return;
-    if (payload.op === "toast") { say(payload.text || "", payload.ok === false ? "warn" : "ok"); return; }
+    // The plugin noticed the IDE's language changed: swap the text in place so
+    // the list, the selection and the status line survive the switch.
+    if (payload.op === "locale") { relocalize(payload.locale); return; }
+    if (payload.op === "toast") { sayRaw(payload.text || "", payload.ok === false ? "warn" : "ok"); return; }
     if (payload.op === "projects") {
-      const options = ['<option value="">' + (payload.error ? "未连接" : "选择项目") + "</option>"];
-      for (const p of payload.items || []) {
-        options.push('<option value="' + esc(p.id) + '">' + esc(p.name) + "</option>");
-      }
-      projectBox.innerHTML = options.join("");
-      projectBox.disabled = !(payload.items || []).length;
-      if (payload.error) say("项目列表：" + payload.error, "warn");
+      projects = payload.items || [];
+      projectsError = payload.error || null;
+      hasProjects = projects.length > 0;
+      renderProjects();
+      if (payload.error) say("projectList", [payload.error], "warn");
       return;
     }
     if (payload.op !== "items") return;
-    if (payload.error) { say(payload.error, "warn"); items = []; renderList(); return; }
+    if (payload.error) { sayRaw(payload.error, "warn"); items = []; renderList(); return; }
     items = payload.items || [];
     count.textContent = items.length;
-    $("cfg").textContent = payload.configured ? "服务器已配置" : "未配置服务器";
-    say("扫描完成：" + items.length + " 个接口 · " + (payload.files || 0) + " 个文件" +
-      (payload.truncated ? " · 已达搜索上限，结果可能不全" : ""), payload.truncated ? "warn" : "ok");
+    configured = !!payload.configured;
+    $("cfg").textContent = configured ? T("configured") : T("notConfigured");
+    say("scanDone", [items.length, payload.files || 0, !!payload.truncated], payload.truncated ? "warn" : "ok");
     renderList();
     selected = -1;
     renderDetail(null, -1);
   };
 
+  /**
+   * The UI language changed while the page is open: re-render every label in
+   * place, keeping the list, the selection and the status line's meaning. The
+   * host does not re-render an `html` body, so without this the page would stay
+   * in the old language until it is reopened.
+   *
+   * `hostLocale` is the IDE's own setting and decides on its own; the frame's
+   * system language is only consulted when it is empty.
+   */
+  const relocalize = (hostLocale) => {
+    const next = isChinese(String(hostLocale || "").trim() || navigatorLanguage);
+    if (next === ZH) return;
+    ZH = next;
+    applyStatic();
+    renderProjects();
+    renderList();
+    // Rebuild the detail panel from the endpoint it was showing, not from the
+    // rendered markup, so the labels change and the selection survives.
+    renderDetail(detailIndex >= 0 ? items[detailIndex] : null, detailIndex);
+    status.textContent = statusText(statusState);
+    status.className = statusState.kind;
+  };
+
   if (api.onMessage) api.onMessage(handle);
   $("q").addEventListener("input", renderList);
-  $("rescan").onclick = () => { say("重新扫描…"); send({ op: "refresh" }); };
-  $("exportAll").onclick = () => { say("开始同步…"); send({ op: "export-all", project: target() }); };
+  $("rescan").onclick = () => { say("rescanning"); send({ op: "refresh" }); };
+  $("exportAll").onclick = () => { say("starting"); send({ op: "export-all", project: target() }); };
 
-  try {
-    const start = JSON.parse(START);
-    $("cfg").textContent = start.configured ? "服务器已配置" : "未配置服务器";
-  } catch (_) { /* the plugin replaces __START__ on render */ }
+  if (start.configured !== undefined) {
+    configured = !!start.configured;
+    $("cfg").textContent = configured ? T("configured") : T("notConfigured");
+  }
 
-  say("扫描中…");
+  say("scanning");
+  // Ask the plugin for the language instead of trusting only the one baked into
+  // the page at render time. The host renders a view *before* it may have pushed
+  // the current language to the plugin, so the start value can be stale — that is
+  // why the dashboard used to need a reload to switch. Asking on load, and then
+  // once in a while, makes the page follow the IDE by itself.
+  const askLocale = () => send({ op: "locale" });
+  askLocale();
+  if (typeof setInterval === "function") setInterval(askLocale, 5000);
   send({ op: "scan" });
   send({ op: "projects" });
 })();

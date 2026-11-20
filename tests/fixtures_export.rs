@@ -143,7 +143,7 @@ fn the_fixture_project_exports_end_to_end() {
     let mut docs: Vec<(String, Value)> = Vec::new();
     for endpoint in &scanned.endpoints {
         let cat = client.find_or_create_category(&endpoint.class_name, CATEGORY_DESC).expect("a category");
-        let doc = yapi::api_doc(endpoint, &scanned.dto, 4);
+        let doc = yapi::api_doc(endpoint, &scanned.dto, 4, openidea_apimocktle::i18n::Lang::En);
         client.save_api(&doc, &cat.id, None).expect("a save");
         docs.push((endpoint.key(), doc));
     }

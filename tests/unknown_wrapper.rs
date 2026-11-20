@@ -88,7 +88,7 @@ fn a_wrapper_from_a_jar_still_describes_its_argument() {
         .expect("the endpoint");
     assert_eq!(endpoint.return_type, "ApiEnvelope<Map<String, List<ItemInfoDTO>>>");
 
-    let doc = yapi::api_doc(endpoint, &scanned.dto, 3);
+    let doc = yapi::api_doc(endpoint, &scanned.dto, 3, openidea_apimocktle::i18n::Lang::En);
     let res: Value = serde_json::from_str(doc["res_body"].as_str().expect("a schema string")).expect("json");
 
     // `ApiEnvelope` has no source here, so the only thing left to describe is

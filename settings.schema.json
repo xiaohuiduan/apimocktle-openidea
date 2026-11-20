@@ -2,39 +2,39 @@
   "properties": {
     "serverUrl": {
       "type": "string",
-      "title": "服务器地址",
-      "description": "ApiMocktle 服务器根地址，例如 http://localhost:4000",
+      "title": "Server address",
+      "description": "Root address of the ApiMocktle server, e.g. http://localhost:4000",
       "default": "http://localhost:4000"
     },
     "token": {
       "type": "string",
-      "title": "个人令牌",
-      "description": "在 ApiMocktle 的「设置 › 令牌」里生成，保存在本机插件设置中",
+      "title": "Personal token",
+      "description": "Generate it in ApiMocktle under Settings › Tokens; it is kept in this machine's plugin settings",
       "default": ""
     },
     "includeKotlin": {
       "type": "boolean",
-      "title": "同时扫描 Kotlin 源码",
+      "title": "Also scan Kotlin sources",
       "default": true
     },
     "schemaDepth": {
       "type": "number",
-      "title": "请求/响应体展开深度",
-      "description": "DTO 字段递归解析的最大层数（1-4）；超过类型链深度后不再变化，实测 3 层已覆盖常见结构",
+      "title": "Request/response body depth",
+      "description": "How many levels of DTO fields are resolved (1-4); deeper type chains stop changing past this, and 3 levels already cover the usual shapes",
       "default": 3,
       "minimum": 1,
       "maximum": 4
     },
     "resolveDependencyJars": {
       "type": "boolean",
-      "title": "解析依赖 jar 里的类型",
-      "description": "从 Maven 本地仓库读取依赖 jar，解析源码里没有的 DTO / 包装类（如 Result<T>、ResponseEntity<T> 这类包装）",
+      "title": "Resolve types from dependency jars",
+      "description": "Read dependency jars from the local Maven repository to resolve DTOs and wrappers that are not in the sources (such as Result<T> or ResponseEntity<T>)",
       "default": true
     },
     "mavenRepository": {
       "type": "string",
-      "title": "Maven 本地仓库",
-      "description": "留空即用 ~/.m2/repository。换成别的目录后，还要把 plugin.toml 的 fs.read 改成同一路径并重新安装授权——文件权限是安装时按清单授予的，运行期改不了（详见 README）",
+      "title": "Local Maven repository",
+      "description": "Empty means ~/.m2/repository. After moving it, also change the fs.read entry in plugin.toml to the same path and reinstall to grant it — file permissions are granted from the manifest at install time and cannot change at runtime (see README)",
       "default": ""
     }
   }

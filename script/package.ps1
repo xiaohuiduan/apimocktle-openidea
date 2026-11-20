@@ -38,9 +38,13 @@ $stage = Join-Path $env:TEMP "apimocktle-pack-$version"
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'dist') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'icons') | Out-Null
-Copy-Item 'plugin.toml', 'settings.schema.json', 'README.md' $stage
+# `locales/` is read by the host directly: a package's catalogs live beside its
+# manifest, one `<tag>.json` per language, with no manifest entry.
+New-Item -ItemType Directory -Force -Path (Join-Path $stage 'locales') | Out-Null
+Copy-Item 'plugin.toml', 'settings.schema.json', 'README.md', 'README.zh-CN.md' $stage
 Copy-Item 'dist/plugin.wasm' (Join-Path $stage 'dist/plugin.wasm')
 Copy-Item 'icons/*.svg' (Join-Path $stage 'icons')
+Copy-Item 'locales/*.json' (Join-Path $stage 'locales')
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $out
 Remove-Item $stage -Recurse -Force
 

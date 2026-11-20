@@ -79,7 +79,7 @@ fn main() {
         let mut total = 0usize;
         let mut biggest = (0usize, String::new());
         for endpoint in &endpoints {
-            let doc = yapi::api_doc(endpoint, &dto, depth);
+            let doc = yapi::api_doc(endpoint, &dto, depth, openidea_apimocktle::i18n::Lang::En);
             let bytes = doc["req_body_other"].as_str().map_or(0, str::len)
                 + doc["res_body"].as_str().map_or(0, str::len);
             total += bytes;

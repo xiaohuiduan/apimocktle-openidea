@@ -1,294 +1,366 @@
 # ApiMocktle for OpenIDEA
 
-把 IntelliJ 版 [ApiMocktle-java-plugin](https://github.com/xiaohuiduan/ApiMocktle-java-plugin) 的核心能力搬到
-[OpenIDEA](https://openidea.sh/zh/plugins) 的插件模型上：从 Java / Kotlin 源码提取 HTTP 接口，浏览、跳转，
-并同步到 ApiMocktle。
+**English** | [简体中文](README.zh-CN.md)
 
-插件是一个 WebAssembly 组件，通过 `plugin.toml` 声明贡献点，代码只经 `wit/` 暴露的宿主接口访问项目和网络。
+The core of the IntelliJ [ApiMocktle-java-plugin](https://github.com/xiaohuiduan/ApiMocktle-java-plugin), brought to
+[OpenIDEA](https://openidea.sh/plugins)'s plugin model: extract HTTP endpoints from Java / Kotlin sources, browse and
+navigate them, and sync them to ApiMocktle. This is the English page; the [Chinese one is here](README.zh-CN.md).
 
-## ApiMocktle 是什么
+The plugin is a WebAssembly component. `plugin.toml` declares its contribution points, and its code reaches the
+project and the network only through the host interfaces exposed by `wit/`.
 
-[ApiMocktle](https://github.com/xiaohuiduan/ApiMocktle) 是一个本地运行的 API 管理桌面应用
-（Tauri + React + Rust + SQLite）：接口文档、请求调试、自动化测试编排、OpenAPI / Swagger 导入导出与
-局域网分享都在本机完成。本插件负责其中「从代码生成接口文档」这一段：扫描项目源码，用个人令牌把接口
-写进 ApiMocktle 的项目目录。
+## What ApiMocktle is
 
-## 和 IntelliJ 版的关系
+[ApiMocktle](https://github.com/xiaohuiduan/ApiMocktle) is a local API-management desktop app
+(Tauri + React + Rust + SQLite): API documents, request debugging, automated test runs, OpenAPI / Swagger import
+and export, and LAN sharing all happen on your machine. This plugin covers the "generate API docs from code" part:
+it scans a project's sources and writes the endpoints into an ApiMocktle project with a personal token.
 
-OpenIDEA 插件运行在 WASM 沙箱里，没有 Java PSI、没有 Swing、没有 JVM agent。所以这不是移植，而是按 OpenIDEA
-的能力重新实现的一版；语义保留，实现路径不同。
+## Relation to the IntelliJ plugin
 
-| IntelliJ 版 | 本插件 |
+OpenIDEA plugins run in a WASM sandbox — no Java PSI, no Swing, no JVM agent. So this is not a port but a
+reimplementation on OpenIDEA's own capabilities: the semantics are kept, the implementation path differs.
+
+| IntelliJ plugin | This plugin |
 | - | - |
-| Java PSI + 类型解析 | 自写词法分析 + 结构解析（`src/java.rs`、`src/spring.rs`） |
-| ToolWindow（Swing / JBList） | `[[contributes.views]]` + 沙箱 HTML 视图（`postMessage` 通信） |
-| AnAction / 右键菜单 | `[[contributes.commands]]` + `[[contributes.menus]]` |
+| Java PSI + type resolution | Hand-written lexer + structural parser (`src/java.rs`, `src/spring.rs`) |
+| ToolWindow (Swing / JBList) | `[[contributes.views]]` + sandboxed HTML view (`postMessage`) |
+| AnAction / context menu | `[[contributes.commands]]` + `[[contributes.menus]]` |
 | PersistentStateComponent | `host::storage` + `[[contributes.settings]]` |
 | Apache HttpClient | `host::fetch` |
 | GotoDeclaration | `host::open_location` |
-| Goto Symbol 全局搜索 | `[[contributes.endpoints]]`：接口直接进 **Search Everywhere**，并在 `.http` 文件里参与 URL 补全 |
+| Goto Symbol global search | `[[contributes.endpoints]]`: endpoints land in **Search Everywhere** and participate in `.http` URL completion |
 
-原插件的 `mock-agent`（JVM 运行时拦截）在 OpenIDEA 插件模型里没有对应物，本插件不包含这部分。
+The original plugin's `mock-agent` (JVM runtime interception) has no counterpart in the OpenIDEA plugin model and
+is not part of this plugin.
 
-## 功能
+## Features
 
-只有两件事：**看接口** 和 **导出到 ApiMocktle**。
+Two things only: **browsing endpoints** and **exporting to ApiMocktle**.
 
-- **接口扫描**：Spring MVC（`@RestController`、`@RequestMapping`、`@GetMapping` 等）、JAX-RS（`@Path` + `@GET`）、
-  Feign（`@FeignClient`）；Java 与 Kotlin（含 `data class`、`fun ... : T` 返回类型）。
-- **路由常量**：`@PostMapping(RouteConstant.ITEM_QUERY)` 这种把路径写成 `static final` 常量的写法，会跨文件
-  解析常量值。常量按**声明它的类的全限定名**识别：`com.a.Routes.PATH` 与 `com.b.Routes.PATH` 是两回事，
-  即使两个类同名、甚至两个控制器各 import 一个同名 `Routes` 也各取各的；注解里写全限定名时包名参与识别。
-  不带限定名时先看当前类，再看 `import static`，只有全项目唯一声明才按名字兜底，歧义时退回 `/` 而不是猜一个。
-  支持类级 `@RequestMapping` 前缀；解析不到时退回 `/`，不影响同类的其他接口。
-- **接口标题**：优先 `@Operation(summary)`（Swagger），其次方法 Javadoc，最后方法名；方法没有自己的 Javadoc
-  时**不会**拿类注释顶上。
-- **参数分类**：`@PathVariable` / `@RequestParam` / `@RequestHeader` / `@RequestBody` / `@CookieValue` / `@RequestPart`，
-  Java 与 Kotlin 两种参数写法都识别。Form 类参数（`@RequestPart` / `@FormParam` / `@ModelAttribute`）写入
-  `req_body_form` 且 `req_body_type` 为 `form`；Cookie 参数只识别、不导出（上游 IntelliJ 版同样不导出）。
-- **仪表盘**：底部工具窗口，按控制器分组、搜索、查看路径与参数、跳到源码。
-- **导出**：个人令牌 + 目标项目下拉选择，自动创建分类、按 `method + path` 识别已有接口并更新；
-  请求/响应体以 JSON Schema 写入：项目源码里定义的包装类型（`Result<T>`、`ApiResponse<T>`…）保留自己的
-  字段，并把泛型实参代入 `data` 等字段（`Result<List<UserDto>>` 导出为 `{code, msg, data: [...]}`）；
-  解析不到定义的框架包装（`ResponseEntity<T>`、`Optional<T>`）仍自动拆开。`Map<K, V>` 按 K 生成一个
-  示例键写进 `properties`（ApiMocktle 与 YApi 一样只渲染 `properties`，`additionalProperties` 会显示为 `{}`）。
-  认 `@JsonProperty` 改名、`@JsonIgnore` 排除、record 组件与 Kotlin 构造器属性。
-- **依赖 jar 里的类型**：源码里没有的 DTO / 包装类（`ApiEnvelope<T>` 这类放在公共 jar 里的）会按项目
-  POM 的依赖树（含传递依赖）找到本地 Maven 仓库里的 jar，读 `.class` 文件补全字段、泛型参数和父类字段
-  （`class ApiEnvelope<T> extends BaseReply` 会导出 `BaseReply` 的 `code`/`message` 加自己的
-  `errorNo`/`errorInfo`/`result: T`）。jar 按 import 包名匹配 Maven group / artifact 排序，命中的通常只读
-  一个 jar；每个项目第一次扫描会记住“类 → jar”，后续扫描直接命中。需要授予读取仓库目录的 `fs.read`
-  权限；没授权时退回旧行为，只导出泛型实参。
-- **Search Everywhere**：扫描到的接口出现在 Endpoints 分组，声明处还有 **Open in HTTP Client** 可用。
+- **Scanning**: Spring MVC (`@RestController`, `@RequestMapping`, `@GetMapping`, …), JAX-RS (`@Path` + `@GET`),
+  Feign (`@FeignClient`); Java and Kotlin (including `data class` and `fun ... : T` return types).
+- **Route constants**: paths written as `static final` constants — `@PostMapping(RouteConstant.ITEM_QUERY)` — are
+  resolved across files. A constant is identified by the fully qualified name of the class that declares it:
+  `com.a.Routes.PATH` and `com.b.Routes.PATH` are different, even when the classes share a simple name or two
+  controllers import a same-named `Routes`. Without a qualifier the current class is tried first, then
+  `import static`, and a bare name is only used when a single declaration exists project-wide; an ambiguous name
+  falls back to `/` instead of being guessed. Class-level `@RequestMapping` prefixes are supported; an unresolved
+  path falls back to `/` without affecting the class's other endpoints.
+- **Endpoint titles**: `@Operation(summary)` (Swagger) first, then the method's Javadoc, then the method name. A
+  method without its own Javadoc does **not** inherit the class comment.
+- **Parameter kinds**: `@PathVariable` / `@RequestParam` / `@RequestHeader` / `@RequestBody` / `@CookieValue` /
+  `@RequestPart`, in both the Java and the Kotlin forms. Form parameters (`@RequestPart` / `@FormParam` /
+  `@ModelAttribute`) go to `req_body_form` with `req_body_type` set to `form`; cookie parameters are recognized but
+  not exported (the upstream IntelliJ plugin does not export them either).
+- **Dashboard**: a bottom tool window grouped by controller, with search, path and parameter details, and
+  go-to-source.
+- **Export**: a personal token plus a target-project picker; categories are created automatically and existing
+  endpoints are matched and updated by `method + path`. Request and response bodies are written as JSON Schema:
+  wrapper types declared in the project (`Result<T>`, `ApiResponse<T>`, …) keep their own fields and have the type
+  argument substituted into `data` and friends (`Result<List<UserDto>>` exports as `{code, msg, data: [...]}`),
+  while framework wrappers with no definition (`ResponseEntity<T>`, `Optional<T>`) are still unwrapped.
+  `Map<K, V>` produces one example key under `properties` (both ApiMocktle and YApi render only `properties`;
+  `additionalProperties` shows as `{}`). `@JsonProperty` renames, `@JsonIgnore` exclusions, record components and
+  Kotlin constructor properties are all honoured.
+- **Types from dependency jars**: DTOs and wrappers that are not in the sources (`ApiEnvelope<T>` living in a
+  shared jar) are resolved by walking the project POM's dependency tree (transitive included) to jars in the local
+  Maven repository and reading their `.class` files for fields, generic parameters and superclass fields
+  (`class ApiEnvelope<T> extends BaseReply` exports `BaseReply`'s `code`/`message` plus its own
+  `errorNo`/`errorInfo`/`result: T`). Jars are matched by import package against Maven group / artifact ordering,
+  so usually only one jar is read; the first scan of a project remembers "class → jar" and later scans hit it
+  directly. This needs the `fs.read` grant for the repository directory; without it the plugin falls back to the old
+  behaviour and exports only the type argument.
+- **Search Everywhere**: scanned endpoints appear in the Endpoints group, and the declaration also offers
+  **Open in HTTP Client**.
 
-不包含：发请求、复制 curl、字段转 JSON、连接测试——这些已按要求移除。
+Not included: sending requests, copying as cURL, converting fields to JSON, connection tests — all removed on
+request.
 
-## 安装
+## Installing
 
-### 从已构建的产物
+### From a built package
 
-`dist/plugin.wasm` 已随仓库提供。执行 `pwsh script/package.ps1` 会重建组件并打出
-`dist/apimocktle-openidea-<version>.zip`（含 `plugin.toml`、`settings.schema.json`、`dist/plugin.wasm`），
-在 **设置 › 插件** 的齿轮菜单里选 **从插件包文件安装…** 装上即可。
+`dist/plugin.wasm` ships with the repository. `pwsh script/package.ps1` rebuilds the component and packs
+`dist/apimocktle-openidea-<version>.zip` (containing `plugin.toml`, `settings.schema.json`, `locales/`,
+`icons/`, `README.md` and `dist/plugin.wasm`). Install it with **Settings › Plugins › ⚙ › Install Plugin from
+Package File…**. After upgrading, use **Reload** on the plugin page — a full IDE restart is not needed.
 
-### 开发期链接
+### Linking during development
 
 ```sh
 rustup target add wasm32-wasip2
 cargo build --release --target wasm32-wasip2
-pwsh script/package.ps1      # 同时刷新 dist/plugin.wasm
+pwsh script/package.ps1      # also refreshes dist/plugin.wasm
 
-# 需要 openidea-plugin（校验 + 链接）：
+# openidea-plugin (validation + linking) is optional:
 cargo install --locked --git https://github.com/l0ng-ai/openidea ide-host --tag v0.1.44 --bin openidea-plugin
 openidea-plugin check
 openidea-plugin link
 ```
 
-`ide-host` 依赖 wasmtime 49，编译它需要 rustc ≥ 1.96；本机若是更低版本，`check`/`link` 就跑不了，
-改用打好的 zip 走「从插件包文件安装」这条路径。修改代码后重新构建，再在插件详情里点 **从磁盘重新加载**。
+`ide-host` depends on wasmtime 49 and needs rustc ≥ 1.96 to build; on an older toolchain `check`/`link` cannot run,
+so use the packed zip and **Install Plugin from Package File** instead. After rebuilding, use **Reload** on the
+plugin page.
 
-本机没有 MSVC 链接器（PATH 里的 `link.exe` 是 coreutils 的 `link`）时，用 GNU 工具链跑同样的步骤：
+When the machine has no MSVC linker (the `link.exe` on `PATH` is coreutils' `link`), run the same steps with the GNU
+toolchain:
 
 ```sh
 rustup toolchain install 1.96.0-x86_64-pc-windows-gnu --profile minimal
 rustup target add wasm32-wasip2 --toolchain 1.96.0-x86_64-pc-windows-gnu
-$env:CARGO_TARGET_DIR = "$env:TEMP\apimocktle-target"   # 项目路径含中文时，GNU ld 打不开非 ASCII 的输出路径
+$env:CARGO_TARGET_DIR = "$env:TEMP\apimocktle-target"   # GNU ld cannot open non-ASCII output paths
 cargo +1.96.0-x86_64-pc-windows-gnu test
-pwsh script/package.ps1 -Toolchain 1.96.0-x86_64-pc-windows-gnu   # 会沿用 CARGO_TARGET_DIR
+pwsh script/package.ps1 -Toolchain 1.96.0-x86_64-pc-windows-gnu   # reuses CARGO_TARGET_DIR
 ```
 
-组件要和宿主对齐：`wasm-tools component wit dist/plugin.wasm` 应列出 `wasi:*@0.2.6` 与
-`openidea:plugin/*@1.7.0`，导出 `commands`、`lifecycle`、`event-handler`、`endpoints-provider`、
-`view-provider` 五个 interface。
+The component must match the host: `wasm-tools component wit dist/plugin.wasm` should list `wasi:*` and
+`openidea:plugin/*@1.7.0`, exporting the `commands`, `lifecycle`, `event-handler`, `endpoints-provider` and
+`view-provider` interfaces.
 
-### 本机安装（Windows，OpenIDEA 0.1.44）
+### Local install notes (Windows, OpenIDEA 0.1.45)
 
-本机走「从插件包文件安装」：`%APPDATA%\ai.l0ng.openidea\plugins\apimocktle.openidea\<version>\` 是解包后的插件目录，
-`grants.json` 已记录 `apimocktle.openidea` 的授权（`project.read`、`storage`、`net:localhost`、`net:127.0.0.1`、`clipboard`）。
-安装或升级插件包后**重启 OpenIDEA**；改完代码重新打包后，也可以在插件详情里点 **从磁盘重新加载**。授权项可在插件
-详情里逐项撤销，改动前的账本备份为 `grants.json.bak`。
+`%APPDATA%\ai.l0ng.openidea\plugins\apimocktle.openidea\<version>\` is the unpacked plugin directory, and
+`grants.json` records the grants for `apimocktle.openidea` (`project.read`, `storage`, `net:localhost`,
+`net:127.0.0.1`). Grants can be revoked one by one on the plugin page; the ledger before a change is backed up as
+`grants.json.bak`.
 
-> 手写 `grants.json` 时必须用**无 BOM 的 UTF-8**。带 BOM 时宿主反序列化失败，账本被静默重置为空，
-> 插件停在「需要授权」且日志不报错——第一次尝试就栽在这里。
+> A hand-written `grants.json` must be **UTF-8 without a BOM**. With a BOM the host fails to deserialize it, the
+> ledger is silently reset to empty, and the plugin sits at "needs permission" without logging an error — this was
+> the first thing that went wrong here.
 
-## 真实项目验证
+## Verified on real projects
 
-在几个中大型 Spring 多模块工程上跑过（数百个 Java 源文件、二十多个含映射注解的文件），这类工程的名字不写进仓库：
+Run against several mid-sized multi-module Spring projects (hundreds of Java sources, twenty-odd files with mapping
+annotations); those projects' names stay out of the repository:
 
-- 提取几十个接口（Spring 与 Feign 混合），多模块路径前缀、参数分类、`Result<List<T>>` 返回类型都正确；
-- `@FeignClient(value = "服务名")` 不再被当成路径前缀——这个 bug 就是真实项目暴露后修掉的；
-- 带 `@RestController` + `@GetMapping` 的 XXL-Job handler 被正确识别为接口（项目作者有意暴露的触发端点）；
-- 路径写成 `static final` 常量、包装类放在依赖 jar 里的工程，也都能正确解析（见下面「功能」两段）。
+- Dozens of endpoints (Spring and Feign mixed) with correct multi-module path prefixes, parameter kinds and
+  `Result<List<T>>` return types.
+- `@FeignClient(value = "service-name")` is no longer treated as a path prefix — that bug was found on a real
+  project and fixed.
+- An XXL-Job handler carrying `@RestController` + `@GetMapping` is correctly recognized as an endpoint (the project
+  author deliberately exposed that trigger endpoint).
+- Projects with paths written as `static final` constants, and with wrapper classes living in dependency jars, also
+  resolve correctly (see the last two bullets under _Features_).
 
-复跑同样的扫描，或量一下不同展开深度下每条接口的 Schema 体积：
+To rerun the same scan, or to measure each endpoint's schema size at different depths:
 
 ```sh
 cargo run --example scan_dir -- C:\path\to\project
 cargo run --example schema_size -- C:\path\to\project
 ```
 
-`schema_size` 是上面「默认深度 3」这个结论的来源：它按 1–4 层各算一遍总字节数和最大单条，用来判断再深一层
-还值不值。两个 example 都只读源码，不需要工程能编译。
+`schema_size` is where the "default depth 3" conclusion comes from: it computes total and largest-per-endpoint byte
+sizes at depths 1–4, to judge whether one more level is worth it. Both examples read sources only; the project does
+not have to compile.
 
-> 用真实工程验证时请只记结论，别把工程名、包名、接口名写进代码或文档——`tests/` 和 `fixtures/` 里一律用
-> `com.acme` / `com.example` 这类示例命名。
+> When validating against real projects, record conclusions only — no project, package or endpoint names in code or
+> docs. `tests/` and `fixtures/` use `com.acme` / `com.example` example naming throughout.
 
-## 配置
+## Configuration
 
-**设置 › ApiMocktle**：
+**Settings › ApiMocktle**:
 
-| 项 | 说明 |
+| Setting | Meaning |
 | - | - |
-| 服务器地址 | ApiMocktle 服务器地址，默认 `http://localhost:4000` |
-| 个人令牌 | 在 ApiMocktle 里生成；保存在本机插件设置中 |
-| 同时扫描 Kotlin 源码 | 默认开 |
-| 请求/响应体展开深度 | DTO 递归层数，1–4，默认 3 |
-| 解析依赖 jar 里的类型 | 默认开；从 Maven 本地仓库读依赖 jar 补全源码里没有的 DTO / 包装类。需要 `fs.read` 授权 |
-| Maven 本地仓库 | 留空即用 `~/.m2/repository`（本机仓库在那儿时不用填）。换过目录就填绝对路径 |
+| Server address | ApiMocktle server address, default `http://localhost:4000` |
+| Personal token | Generated in ApiMocktle; stored in this machine's plugin settings |
+| Also scan Kotlin sources | On by default |
+| Request/response body depth | DTO recursion depth, 1–4, default 3 |
+| Resolve types from dependency jars | On by default; reads jars from the local Maven repository to fill in DTOs and wrappers missing from the sources. Needs the `fs.read` grant |
+| Local Maven repository | Empty means `~/.m2/repository` (leave it empty when your repository is there). Fill in an absolute path after moving it |
 
-仓库路径**手填**，没有目录选择器：设置是独立窗口，弹不出系统对话框，插件也没有运行期申请文件权限的办法。
+The repository path is **typed by hand** — there is no directory picker: the settings page is a separate window
+that cannot open a system dialog, and the plugin has no way to request file permissions at runtime.
 
-### 换了仓库目录时，权限怎么配
+### UI language
 
-`fs.read` 是安装时按 `plugin.toml` 一次性授权的，**运行期改不了**，而且匹配是字面量前缀比较——授权
-`~/.m2/repository` 不会覆盖 `D:\maven\repo`。所以两件事要一起做：
+The plugin's text follows the IDE's UI language (`appearance.locale` in the settings): a Chinese IDE shows Chinese,
+an English IDE shows English. Two mechanisms share the job:
 
-1. **设置页**填新路径（`插件 › ApiMocktle › Maven 本地仓库`）；
-2. **`plugin.toml`** 里把 `optional` 改成新目录：
+- **Manifest, settings and view toolbar buttons** are translated by the host from the package's
+  `locales/<tag>.json`. Those places are written in the catalog's source language (English) in `plugin.toml` and
+  `settings.schema.json`, with Chinese in `locales/zh-CN.json` (keys are the English source text). A language
+  without catalog entries shows English.
+- **The dashboard page, notifications and error messages** are built by the component itself, which reads
+  `host::locale()` when the text is made (`src/i18n.rs`); the page's text table lives in `src/page.html`.
+
+A view is rendered once, the host has no language-change event, and it does not re-render an HTML body by itself.
+So after loading, the page **asks the component for the current language** (and again every 5 seconds), and swaps
+its text **in place** — the list, the selected endpoint and the status line survive, no reopening needed. A switch
+is visible within seconds. To apply it immediately, close and reopen the dashboard, or run the command
+*ApiMocktle: Rescan Endpoints* (it calls `host::refresh_view`, which rebuilds the page). The "Rescan" buttons inside
+the view and on its toolbar only clear the cache and post a message; they do not re-render the page.
+The marketplace overview (`plugin.toml`'s `description`) and `change-notes` are not translated and always show
+Chinese: the host renders those two verbatim and has no translation entry for them.
+
+### Permissions when the repository moves
+
+`fs.read` is granted once at install time from `plugin.toml` and **cannot change at runtime**; matching is a literal
+prefix comparison, so granting `~/.m2/repository` does not cover `D:\maven\repo`. Do both of these:
+
+1. Put the new path in the settings page (`Plugins › ApiMocktle › Local Maven repository`);
+2. Change `optional` in **`plugin.toml`** to the new directory:
 
    ```toml
    [capabilities]
    required = ["project.read", "storage", "net:localhost", "net:127.0.0.1"]
-   optional = ["fs.read:~/公司仓库/m2"]        # 默认那条不再用就删掉，两个都留就都写上
+   optional = ["fs.read:~/company-repo/m2"]    # drop the default line if unused, keep both if both apply
    ```
 
-   然后重新打包安装，在 **设置 › 插件 › ApiMocktle › 权限** 里勾上这条新授权。
+   Then repackage, reinstall and tick the new grant under **Settings › Plugins › ApiMocktle › Permissions**.
 
-漏了第 2 步时插件不会静默失败：会弹一条通知、并在日志里写明该把 `fs.read:` 改成什么路径，接口的依赖类型
-退化成 `object`，其余功能照常。
+Skipping step 2 does not fail silently: the plugin posts a notification and logs the exact `fs.read:` path to use,
+the dependency types degrade to `object`, and everything else keeps working.
 
-分类固定按控制器类名生成（`TicketOrderController`、`PayController`…），不提供统一分类的开关。
+Categories are always generated from the controller class name (`TicketOrderController`, `PayController`, …); there
+is no switch for a single shared category.
 
-## 使用
+## Usage
 
-1. 打开一个 Spring / Kotlin 项目，底部 **ApiMocktle** 工具窗口会扫描并按控制器列出接口。
-2. 选中接口查看路径、参数与来源，点 **跳到源码** 定位到注解所在行。
-3. 顶栏下拉选择目标项目，**导出全部**；或对文件/目录右键 **ApiMocktle: 导出当前文件接口**（`Alt+Shift+E`）。
-4. `Ctrl/Cmd+Shift+A` → 搜索接口，或在 `.http` 文件里直接补全 URL。
+1. Open a Spring / Kotlin project; the **ApiMocktle** tool window at the bottom scans and lists endpoints grouped by
+   controller (or run *ApiMocktle: Open API Dashboard* from the command palette).
+2. Select an endpoint to see its path, parameters and origin; click **Go to source** to jump to the annotation.
+3. Pick the target project in the toolbar and click **Export All** (*ApiMocktle: Export Project Endpoints* in the
+   command palette); or right-click a file/folder and choose
+   **ApiMocktle: Export Endpoints in Current File** (`Alt+Shift+E`).
+4. `Ctrl/Cmd+Shift+A` → search endpoints, or complete URLs directly in a `.http` file.
 
-导出一次点击就够。宿主对单次插件调用的墙钟预算是 5 秒，而 `host::fetch` 是同步的，所以批次有上限；
-不过本机没有网络延迟，一个接口一次往返只有几毫秒，56 个接口不到一秒就写完。真正会触发分批的是慢服务器：
-循环在 4.2 秒处收手，剩下的进队列，插件靠 `on-schedule:60` 每分钟自动推进一批，状态栏显示
-「同步中 · 剩 N」，全部完成时补一条通知。
+One click is enough to export. The host gives a plugin call a 5-second wall-clock budget and `host::fetch` is
+synchronous, so a batch has a ceiling; on a local server a round trip is a few milliseconds, and 56 endpoints finish
+in under a second. Batching actually triggers on a slow server: the loop stops at 4.2 seconds, the rest is queued,
+and the plugin advances one batch per minute through `on-schedule:60` while the status bar shows
+"Syncing · N left"; a notification appears when everything is done.
 
-想立刻推下一批，仍可点通知里的 **立即继续** 或运行命令 *ApiMocktle: 继续同步剩余接口*。队列存在插件存储
-里，关窗口不丢，重启 IDE 后会接着走。
+To push the next batch immediately, click **Continue now** in the notification or run
+*ApiMocktle: Continue Syncing Remaining Endpoints*. The queue lives in plugin storage, survives closing the window,
+and resumes after an IDE restart.
 
-队列记住自己是为哪个服务器、哪个令牌建的。导出进行中改了服务器地址或令牌，剩余批次**暂停**而不是改投到
-新服务器：状态栏显示「同步已暂停 · 队列属于另一服务器」，点通知或改回原设置都能继续；确实要发到新服务器，
-重新点「导出全部」即可。
+The queue remembers which server and which token it was built for. Changing the server address or token mid-export
+**pauses** the remaining batches instead of sending them elsewhere: the status bar shows "Sync paused · the queue
+belongs to another server", and either clicking the notification or restoring the original settings continues; to
+send to the new server, click **Export All** again.
 
-## 权限与网络
+## Permissions and network
 
-清单里声明的能力：
+Capabilities declared in the manifest:
 
-- `project.read`：读取项目文件、文本搜索、文件枚举。
-- `storage`：导出队列、分类 id 缓存、jar 查找结果与扫描缓存。
-- `net:localhost`、`net:127.0.0.1`：访问本机 mock 服务器（回环地址允许明文 HTTP）。
-- `fs.read:~/.m2/repository`（**optional**）：读项目之外的依赖 jar。安装/升级插件时在权限列表里勾选，
-  或在 **设置 › 插件 › ApiMocktle › 权限** 里授予；不授权时插件照常工作，只是 jar 里的类型退化成 `object`。
-  仓库换了位置（比如公司 `settings.xml` 里的 `localRepository`）时，把这条 `fs.read:` 改成新目录后重新安装
-  并授权——授权路径是静态声明的，运行期无法追加（见上文「换了仓库目录时，权限怎么配」）。
+- `project.read`: read project files, text search, file enumeration.
+- `storage`: the export queue, category-id cache, jar lookup results and scan cache.
+- `net:localhost`, `net:127.0.0.1`: reach the local mock server (loopback allows plain HTTP).
+- `fs.read:~/.m2/repository` (**optional**): read dependency jars outside the project. Tick it in the permission
+  list when installing or upgrading, or grant it under **Settings › Plugins › ApiMocktle › Permissions**. Without
+  it the plugin works as before, but types from jars degrade to `object`. When the repository moves (say a company
+  `settings.xml`'s `localRepository`), change this `fs.read:` entry to the new directory and reinstall to grant it —
+  grant paths are declared statically and cannot be appended at runtime (see "Permissions when the repository
+  moves" above).
 
-宿主只放行清单里声明过的主机。服务器在局域网或走 HTTPS 时，需要改 `plugin.toml`：
+The host only allows hosts declared in the manifest. For a server on the LAN, or over HTTPS, edit `plugin.toml`:
 
 ```toml
 [capabilities]
 required = ["project.read", "storage", "net:api.example.com"]   # HTTPS
-# 或明文 HTTP：加 "net.http:192.168.1.20"
+# or plain HTTP: add "net.http:192.168.1.20"
 ```
 
-改完重新构建、重新授权。这不是插件的取舍，是宿主的能力模型。
+Rebuild and re-grant afterwards. This is the host's capability model, not a choice of this plugin.
 
-## 已知限制
+## Known limitations
 
-- **没有类型系统**：DTO 字段来自文本级解析，跨文件继承、复杂泛型推导、接口多态都不完整；`List<User>` 这类常见形状可靠，
-  `Result<? extends Base<T>>` 这类会退化成 `object`。
-- **路由常量只认纯字面量**：`Constants.PREFIX + "/x"` 这种拼接、以及 `String.format(...)`、枚举常量都不解析，
-  这类接口的路径会退回 `/`。常量的声明类按全限定名识别，但同名常量分属多个类、又既没写限定名也没 import 时
-  无法判断，同样退回 `/`。嵌套在别的类里的常量不支持（源码解析只读顶层类）。
-- **依赖 jar 解析的边界**：只走 Maven（读项目 `pom.xml` 的依赖与传递 POM，最多 200 个 POM），Gradle 项目
-  目前读不到仓库依赖；jar 要能在本地仓库里找到（`~/.m2/repository` 或设置里的路径），单个 jar 超过 12 MiB
-  就跳过，一次扫描最多读 120 个 jar、单个类最多 32 个（超了就当解析不到）；class 里的 `@JsonProperty` 等
-  Jackson 注解不读（源码 DTO 才读），Kotlin `@Metadata` 不解析（字段本身能读）；没有源码的接口/抽象类只
-  合并父类字段。拿不到 `fs.read` 授权时自动退回旧行为。一次扫描读到的类会按项目记进插件存储，下一次扫描
-  直接命中同一个 jar。
-- **Map 用示例键渲染**：`Map<K, V>` 导出为 `{ "type": "object", "properties": { "<K 的示例名>": V } }`，
-  而不是 `additionalProperties`——后者在 ApiMocktle / YApi 的字段表里是空对象。
-- **5 秒命令预算**：扫描和导出都按这个上限设计（分批发送），超大项目会命中文本搜索上限，仪表盘会提示结果可能不全。
-- **诊断级别的位置**：接口位置取注解所在行列（0-based 行、UTF-16 列），用于跳转，不做语法高亮。
-- **不做 mock 运行时**：没有 JVM agent，只在源码层面对齐。
+- **No type system**: DTO fields come from text-level parsing, so cross-file inheritance, complex generic inference
+  and interface polymorphism are incomplete; common shapes like `List<User>` are reliable, while
+  `Result<? extends Base<T>>` degrades to `object`.
+- **Route constants accept literals only**: concatenation such as `Constants.PREFIX + "/x"`, `String.format(...)`
+  and enum constants are not resolved, and those endpoints fall back to `/`. A constant's declaring class is
+  identified by fully qualified name, but when same-named constants live in several classes and there is neither a
+  qualifier nor an import, the name cannot be decided and the path falls back to `/`. Constants nested inside other
+  classes are not supported (source parsing reads top-level classes only).
+- **Dependency-jar boundaries**: Maven only (reading the project's `pom.xml` dependency and transitive POMs, at most
+  200 POMs); Gradle projects cannot see repository dependencies yet. A jar must be findable in the local repository
+  (`~/.m2/repository` or the path in the settings); a jar larger than 12 MiB is skipped, at most 120 jars are read
+  per scan and at most 32 classes per jar (beyond that the type counts as unresolved). Jackson annotations such as
+  `@JsonProperty` inside `.class` files are not read (source DTOs are), and Kotlin `@Metadata` is not parsed (the
+  fields themselves are readable). Interfaces and abstract classes without sources only merge superclass fields.
+  Without the `fs.read` grant the plugin falls back to the old behaviour. Classes read during a scan are remembered
+  per project in plugin storage, so the next scan hits the same jar directly.
+- **Map renders with an example key**: `Map<K, V>` exports as
+  `{ "type": "object", "properties": { "<example name for K>": V } }` rather than `additionalProperties` — the
+  latter shows as an empty object in ApiMocktle / YApi field tables.
+- **5-second command budget**: scanning and exporting are both designed around it (batched sending); very large
+  projects hit the text-search limit and the dashboard says results may be incomplete.
+- **Diagnostic-level positions**: an endpoint's position is the annotation's line and column (0-based line, UTF-16
+  column), used for navigation only — there is no syntax highlighting.
+- **No mock runtime**: no JVM agent; the alignment is at the source level only.
 
-## 代码结构
+## Code layout
 
-| 文件 | 作用 |
+| File | Purpose |
 | - | - |
-| `src/java.rs` | Java/Kotlin 词法分析：标识符、字符串、注释、括号匹配、UTF-16 位置 |
-| `src/spring.rs` | 结构化解析：类/方法/字段/参数/注解，生成 `RawEndpoint` |
-| `src/model.rs` | 接口模型、泛型拆分、JSON Schema 生成 |
-| `src/scan.rs` | 项目扫描：文本搜索 → 解析 → DTO 传递闭包（项目源码 + 依赖 jar） |
-| `src/deps.rs` | 依赖 jar 解析：POM 依赖树 → 本地仓库 jar → 类定义，带缓存与读取预算 |
-| `src/classfile.rs` | `.class` 文件解析：字段、泛型 `Signature`、父类与类型参数 |
-| `src/zip.rs` | jar 的最小 ZIP 读取（中央目录 + stored/deflate 条目） |
-| `src/yapi.rs` | YApi 协议客户端与接口文档构造 |
-| `src/lib.rs` | 命令、视图、`endpoints` 提供器、分批导出队列 |
-| `src/page.html` | 仪表盘页面（沙箱 iframe，与插件消息通信） |
+| `src/java.rs` | Java/Kotlin lexer: identifiers, strings, comments, bracket matching, UTF-16 positions |
+| `src/spring.rs` | Structural parsing: classes/methods/fields/parameters/annotations → `RawEndpoint` |
+| `src/model.rs` | Endpoint model, generic splitting, JSON Schema generation |
+| `src/scan.rs` | Project scan: text search → parsing → DTO transitive closure (project sources + dependency jars) |
+| `src/deps.rs` | Dependency-jar resolution: POM tree → local-repository jar → class definitions, with caching and read budgets |
+| `src/classfile.rs` | `.class` parsing: fields, generic `Signature`, superclass and type parameters |
+| `src/zip.rs` | Minimal ZIP reading for jars (central directory + stored/deflate entries) |
+| `src/yapi.rs` | YApi protocol client and endpoint-document construction |
+| `src/lib.rs` | Commands, view, the `endpoints` provider, batched export queue |
+| `src/i18n.rs` | Text the host does not translate (page/notifications/errors), chosen from `host::locale()` |
+| `src/page.html` | Dashboard page (sandboxed iframe, messaging with the component) |
 
-## 测试
+## Tests
 
 ```sh
-cargo test                      # 77 个用例：解析、Schema、ZIP/class、POM、路由常量、YApi 编码、队列，以及端到端链路
-pwsh script/package.ps1         # 重建组件并打包（含 icons/）
+cargo test                      # 88 tests: parsing, schema, ZIP/class, POM, route constants, YApi encoding, queue, i18n, and the end-to-end path
+node script/check-pages.mjs     # the dashboard's real rendering in both languages (cargo test cannot run JS)
+pwsh script/package.ps1         # rebuild the component and pack it (including icons/ and locales/)
 ```
 
-端到端用例跑在 SDK 的 `MockHost` 上：`tests/fixtures_export.rs` 把 `fixtures/spring-demo` 下的全部
-`.java`/`.kt` 注入成项目文件，走 `scan` → `api_doc` → `save_api` 全链路，断言 Feign 服务名不进路径、
-`Result<List<Order>>` 的 `data` 是数组、Kotlin 与 JAX-RS 资源都被识别、multipart 接口带两个 form part；
-`tests/unknown_wrapper.rs` 只放 Controller 和 DTO，让 `ApiEnvelope` 像依赖 jar 一样解析不到，断言
-`ApiEnvelope<Map<String, List<ItemInfoDTO>>>` 的响应仍是可读的 `Map` + DTO 字段；
-`tests/jar_deps.rs` 在内存里搭一个 Maven 仓库（POM 链 + `fixtures/deps/api-envelope.jar`），断言传递依赖里的
-`ApiEnvelope` 连父类 `code`/`message` 和泛型实参一起导出、实现了接口的包装类（`JailedEnvelope`）仍然保留
-泛型载荷字段，并验证没授权时安静退回；
-`tests/route_constants.rs` 覆盖“路径写成常量”的扫描：限定名按声明类解析（两个类各有 `PATH` 也不串）、
-两个包各有一个同名 `Routes` 时按各自 `import` 解析、注解里写全限定名时包名参与识别、
-不带限定名时当前类优先、`import static` 可解析、同名歧义不猜。
+The end-to-end cases run on the SDK's `MockHost`: `tests/fixtures_export.rs` injects every `.java`/`.kt` under
+`fixtures/spring-demo` as project files and walks the full `scan` → `api_doc` → `save_api` path, asserting that the
+Feign service name does not become a path, that `Result<List<Order>>`'s `data` is an array, that Kotlin and JAX-RS
+resources are both recognized, and that a multipart endpoint carries two form parts; `tests/unknown_wrapper.rs`
+keeps only a controller and a DTO so `ApiEnvelope` resolves like a dependency jar that cannot be found, asserting
+that `ApiEnvelope<Map<String, List<ItemInfoDTO>>>` still exports a readable `Map` plus DTO fields;
+`tests/jar_deps.rs` builds a Maven repository in memory (a POM chain plus `fixtures/deps/api-envelope.jar`) and
+asserts that `ApiEnvelope` from a transitive dependency exports its superclass `code`/`message` and its type
+argument, that a wrapper implementing an interface (`JailedEnvelope`) keeps its generic payload field, and that the
+plugin falls back quietly without the grant; `tests/route_constants.rs` covers constant-written paths: a qualified
+name resolves through its declaring class (two classes each with `PATH` do not cross), two packages each with a
+same-named `Routes` resolve through their own `import`, a fully qualified name in the annotation keeps the package,
+an unqualified name prefers the current class, `import static` resolves, and an ambiguous same-name is not guessed;
+`tests/translations.rs` replays the host's catalog-tag matching over `locales/zh-CN.json`, asserting a Chinese IDE
+finds it and an English one keeps the source text, that the file name is a valid language tag, and that every
+manifest/settings string has a Chinese entry.
 
-`fixtures/spring-demo` 只是扫描输入，不需要能编译或启动——插件读的是源码文本；`fixtures/deps` 里的
-`api-envelope.jar` 是 `BaseReply.java` / `ApiEnvelope.java` / `PageRequest.java` / `GenericBase.java` /
-`JailedEnvelope.java` / `PagedEnvelope.java` 用 `javac --release 8` 编译出的测试输入（后两个专门带接口与
-泛型父类，用来盯住 class Signature 的解析）。测试与文档里一律用 `com.acme` / `com.example` 这类示例命名，
-真实工程的类名不写进仓库。
+`fixtures/spring-demo` is scan input only and does not need to compile or run — the plugin reads source text;
+`fixtures/deps/api-envelope.jar` is built from `BaseReply.java` / `ApiEnvelope.java` / `PageRequest.java` /
+`GenericBase.java` / `JailedEnvelope.java` / `PagedEnvelope.java` with `javac --release 8` (the last two
+deliberately carry an interface and a generic superclass, to pin class `Signature` parsing). Tests and docs use
+`com.acme` / `com.example` example naming throughout; real projects' class names stay out of the repository.
 
-SDK 版本固定在 `Cargo.toml` 的 tag（当前 `v0.1.44`，插件 API 1.7）；升级 IDE 时同步改 tag 与
-`engines.openidea`，两者必须匹配，否则组件与宿主的 WIT 接口对不上。`dist/plugin.wasm` 的导入表已确认是
-`openidea:plugin/*@1.7.0`，并导出 `commands`、`lifecycle`、`view-provider`、`endpoints-provider`。
+The SDK version is pinned by the tag in `Cargo.toml` (currently `v0.1.44`, plugin API 1.7); when upgrading the IDE,
+change the tag and `engines.openidea` together — they must match or the component's WIT interfaces will not line up
+with the host. `dist/plugin.wasm`'s import table is confirmed to be `openidea:plugin/*@1.7.0`, exporting
+`commands`, `lifecycle`, `view-provider`, `endpoints-provider` and `event-handler`.
 
-## 发布
+## Releasing
 
-流程就是 registry 手册的两条命令，没有额外的构建步骤：
+The registry manual's two commands are the whole flow; there are no extra build steps:
 
 ```sh
-openidea-plugin build .                                    # 产出 dist/plugin.wasm
+openidea-plugin build .                                    # produces dist/plugin.wasm
 openidea-plugin pack . --key ~/.openidea-keys/apimocktle.key --publisher apimocktle
 ```
 
-`script/release.ps1` 把「打包 → 建 release → 上传附件」串成一条命令，并打印要写进
-[l0ng-ai/openidea-plugins](https://github.com/l0ng-ai/openidea-plugins) 的 `version` / `package` / `sha256`：
+`script/release.ps1` chains "pack → create release → upload assets" into one command and prints the `version` /
+`package` / `sha256` to put into [l0ng-ai/openidea-plugins](https://github.com/l0ng-ai/openidea-plugins):
 
 ```sh
 git tag v0.2.7 && git push origin v0.2.7
-pwsh script/release.ps1            # -DryRun 只构建签名，不碰 release
+pwsh script/release.ps1            # -DryRun only builds the signature, without touching the release
 ```
 
-签名密钥只在**本机**：它不入库（`.gitignore` 里的 `*.key`），也不放进 CI secrets。任何人读到它就能以
-`apimocktle.*` 的名义发布，所以这一步留在本机，交给一条可重复的命令，而不是交给流水线。
+The signing key lives **on this machine only**: it is not committed (`.gitignore` has `*.key`) and is not put into
+CI secrets. Anyone who reads it can publish as `apimocktle.*`, so that step stays local, behind a repeatable
+command rather than a pipeline.

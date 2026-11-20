@@ -1,7 +1,13 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
 version = "0.2.7"
-description = "扫描 Java/Kotlin 源码里的 HTTP 接口（Spring MVC、JAX-RS、Feign），在底部仪表盘按控制器浏览、搜索、跳到源码声明，接口也会进入 Search Everywhere，并在 .http 文件里补全 URL。导出到 ApiMocktle：选定目标项目，自动创建分类、按 method + path 更新已有接口，请求/响应体按项目里的 DTO 生成 JSON Schema（Result<T> 这类包装保留字段并代入泛型实参，multipart 文件字段一并导出；源码里没有的 DTO 会从 Maven 依赖 jar 的 class 文件里解析）。ApiMocktle（https://github.com/xiaohuiduan/ApiMocktle）是一个本地运行的 API 管理桌面应用，接口文档、请求调试、自动化测试和局域网分享都在本机完成。"
+# The overview is the one text the host renders verbatim: `description` is not in
+# the host's translatable keys (`pluginText.ts`), and the details page draws it as
+# a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
+# a line break cannot be produced from the manifest. The two languages are
+# therefore separated by a visible marker instead, English first (the marketplace
+# list row truncates to one line with an ellipsis).
+description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-RS, Feign) and browse them in a bottom dashboard grouped by controller, with search, go-to-source, Search Everywhere and .http URL completion. Export to ApiMocktle: pick a target project, and it creates categories, matches existing endpoints by method + path, and writes request/response bodies as JSON Schema from the project's DTOs (Result<T> wrappers keep their fields with the type argument substituted; multipart files are exported; DTOs missing from the source are read from Maven dependency jars). ApiMocktle (https://github.com/xiaohuiduan/ApiMocktle) is a local API-management desktop app. ▍中文：扫描 Java/Kotlin 源码里的 HTTP 接口（Spring MVC、JAX-RS、Feign），在底部仪表盘按控制器浏览、搜索、跳到源码声明，接口也会进入 Search Everywhere，并在 .http 文件里补全 URL。导出到 ApiMocktle：选定目标项目，自动创建分类、按 method + path 更新已有接口，请求/响应体按项目里的 DTO 生成 JSON Schema（Result<T> 这类包装保留字段并代入泛型实参，multipart 文件字段一并导出；源码里没有的 DTO 会从 Maven 依赖 jar 的 class 文件里解析）。ApiMocktle 是一个本地运行的 API 管理桌面应用，接口文档、请求调试、自动化测试和局域网分享都在本机完成。"
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
@@ -18,29 +24,34 @@ required = ["project.read", "storage", "net:localhost", "net:127.0.0.1"]
 # 插件照常工作，只是源码里没有的类型退化成 object。
 optional = ["fs.read:~/.m2/repository"]
 
+# Command, view and settings titles are the source text of `locales/<tag>.json`:
+# write them in English and put the translation in that catalog (see
+# `locales/zh-CN.json`). `description` and `change-notes` stay Chinese: the
+# plugin details page renders them as written and never translates them.
+
 [[contributes.commands]]
 id = "export-project"
-title = "ApiMocktle: 导出项目接口"
+title = "ApiMocktle: Export Project Endpoints"
 category = "ApiMocktle"
 
 [[contributes.commands]]
 id = "export-file"
-title = "ApiMocktle: 导出当前文件接口"
+title = "ApiMocktle: Export Endpoints in Current File"
 category = "ApiMocktle"
 
 [[contributes.commands]]
 id = "export-continue"
-title = "ApiMocktle: 继续同步剩余接口"
+title = "ApiMocktle: Continue Syncing Remaining Endpoints"
 category = "ApiMocktle"
 
 [[contributes.commands]]
 id = "open-dashboard"
-title = "ApiMocktle: 打开 API 仪表盘"
+title = "ApiMocktle: Open API Dashboard"
 category = "ApiMocktle"
 
 [[contributes.commands]]
 id = "refresh"
-title = "ApiMocktle: 重新扫描接口"
+title = "ApiMocktle: Rescan Endpoints"
 category = "ApiMocktle"
 
 [[contributes.keymaps]]
