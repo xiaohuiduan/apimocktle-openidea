@@ -38,7 +38,11 @@ $pkg = Join-Path $root "apimocktle.openidea-$version.oiplugin"
 $dirty = git status --porcelain
 if ($dirty) { throw "the working tree is dirty; commit first:`n$dirty" }
 $head = git rev-parse HEAD
-$tagCommit = git rev-parse "$tag" 2>$null
+# `git rev-parse <tag>` on an *annotated* tag returns the tag object's own SHA,
+# not the commit it points at, so comparing it with HEAD fails for annotated tags
+# while passing for lightweight ones. `<tag>^{commit}` peels either kind down to
+# the commit, which is what the check is actually about.
+$tagCommit = git rev-parse "$tag^{commit}" 2>$null
 if (-not $tagCommit) { throw "tag $tag does not exist; create it on the commit to release" }
 if ($tagCommit -ne $head) { throw "tag $tag points at $tagCommit, but HEAD is $head" }
 
