@@ -271,7 +271,7 @@ required = ["project.read", "storage", "net:api.example.com"]   # HTTPS
 ## 测试
 
 ```sh
-cargo test                      # 88 个用例：解析、Schema、ZIP/class、POM、路由常量、YApi 编码、队列、i18n，以及端到端链路
+cargo test                      # 89 个用例：解析、Schema、ZIP/class、POM、路由常量、YApi 编码、队列、i18n，以及端到端链路
 node script/check-pages.mjs     # 仪表盘在两种语言下的真实渲染（cargo test 跑不了 JS）
 pwsh script/package.ps1         # 重建组件并打包（含 icons/ 与 locales/）
 ```
@@ -314,7 +314,7 @@ openidea-plugin pack . --key ~/.openidea-keys/apimocktle.key --publisher apimock
 [l0ng-ai/openidea-plugins](https://github.com/l0ng-ai/openidea-plugins) 的 `version` / `package` / `sha256`：
 
 ```sh
-git tag v0.2.7 && git push origin v0.2.7
+git tag v0.3.0 && git push origin v0.3.0
 pwsh script/release.ps1            # -DryRun 只构建签名，不碰 release
 ```
 

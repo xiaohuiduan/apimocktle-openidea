@@ -311,7 +311,7 @@ Rebuild and re-grant afterwards. This is the host's capability model, not a choi
 ## Tests
 
 ```sh
-cargo test                      # 88 tests: parsing, schema, ZIP/class, POM, route constants, YApi encoding, queue, i18n, and the end-to-end path
+cargo test                      # 89 tests: parsing, schema, ZIP/class, POM, route constants, YApi encoding, queue, i18n, and the end-to-end path
 node script/check-pages.mjs     # the dashboard's real rendering in both languages (cargo test cannot run JS)
 pwsh script/package.ps1         # rebuild the component and pack it (including icons/ and locales/)
 ```
@@ -357,7 +357,7 @@ openidea-plugin pack . --key ~/.openidea-keys/apimocktle.key --publisher apimock
 `package` / `sha256` to put into [l0ng-ai/openidea-plugins](https://github.com/l0ng-ai/openidea-plugins):
 
 ```sh
-git tag v0.2.7 && git push origin v0.2.7
+git tag v0.3.0 && git push origin v0.3.0
 pwsh script/release.ps1            # -DryRun only builds the signature, without touching the release
 ```
 
