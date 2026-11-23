@@ -156,6 +156,35 @@ cargo run --example schema_size -- C:\path\to\project
 sizes at depths 1–4, to judge whether one more level is worth it. Both examples read sources only; the project does
 not have to compile.
 
+### Large projects and what a scan costs
+
+A scan's cost is not parsing — it is the **number of host round trips**. Resolving one DTO type used to take two
+project-wide file searches (`.java` then `.kt`), so 400 types meant 800 calls and the 5-second budget was gone. A
+single **type index** is now built per scan and looked up by file name; a miss falls back to one declaration search
+whose result is remembered.
+
+The dashboard and "go to source" render routes only — never DTO fields — so they use a **routes-only tier** that
+skips the DTO closure.
+
+Three tools reproduce and measure this (all under `examples/`, none of it in the wasm artifact):
+
+```sh
+cargo run --release --example gen_demo   -- --preset big        # generate a Spring project of a chosen size
+cargo run --release --example scan_bench -- "%TEMP%\apimocktle-demo\big"
+cargo run --release --example component_api -- dist/plugin.wasm # the component's plugin API version
+```
+
+`big` is 6 modules / 300 controllers / 1214 endpoints / 900 DTOs. Measured on `MockHost`, pricing a round trip at
+3 ms:
+
+| tier | round trips | estimated |
+| - | - | - |
+| export (DTO closure) | 716 | 2.1 s |
+| dashboard (routes only) | 316 | 0.9 s |
+
+The same project cost 1526 before the fix. **Caveat:** `MockHost` is in-memory — `read_file` and `find_files` are
+hash lookups — so the milliseconds are not real; only the round-trip counts transfer.
+
 > When validating against real projects, record conclusions only — no project, package or endpoint names in code or
 > docs. `tests/` and `fixtures/` use `com.acme` / `com.example` example naming throughout.
 
@@ -317,7 +346,7 @@ Rebuild and re-grant afterwards. This is the host's capability model, not a choi
 ## Tests
 
 ```sh
-cargo test                      # 90 tests: parsing, schema, ZIP/class, POM, route constants, YApi encoding, queue, i18n, and the end-to-end path
+cargo test                      # 109 tests: parsing, schema, ZIP/class, POM, route constants, the type index, the scan budget, YApi encoding, queue, i18n, and the end-to-end path
 node script/check-pages.mjs     # the dashboard's real rendering in both languages (cargo test cannot run JS)
 pwsh script/package.ps1         # rebuild the component and pack it (including icons/ and locales/)
 ```
@@ -351,8 +380,7 @@ with the host. A fresh build imports `openidea:plugin/*@1.14.0` and exports `com
 `endpoints-provider` and `event-handler`; check any component with
 `cargo run --example component_api -- dist/plugin.wasm`.
 
-`dist/plugin.wasm` is the previous release's build (0.3.0, SDK `v0.1.44` / API 1.7) and is **not** rebuilt when the
-source's SDK changes — running `script/package.ps1` before a release brings it back in step.
+`dist/plugin.wasm` is committed with the source and rebuilt by `script/package.ps1` before each release; check its plugin API version with `cargo run --example component_api -- dist/plugin.wasm`.
 
 ## Releasing
 
@@ -367,7 +395,7 @@ openidea-plugin pack . --key ~/.openidea-keys/apimocktle.key --publisher apimock
 `package` / `sha256` to put into [l0ng-ai/openidea-plugins](https://github.com/l0ng-ai/openidea-plugins):
 
 ```sh
-git tag v0.3.0 && git push origin v0.3.0
+git tag v0.3.1 && git push origin v0.3.1
 pwsh script/release.ps1            # -DryRun only builds the signature, without touching the release
 ```
 

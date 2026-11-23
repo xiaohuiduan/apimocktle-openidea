@@ -134,6 +134,32 @@ cargo run --example schema_size -- C:\path\to\project
 `schema_size` 是上面「默认深度 3」这个结论的来源：它按 1–4 层各算一遍总字节数和最大单条，用来判断再深一层
 还值不值。两个 example 都只读源码，不需要工程能编译。
 
+### 大项目与扫描成本
+
+`scan` 的成本不在解析，而在**跨宿主边界的调用次数**：每个 DTO 类型曾要两次全项目文件查找
+（`.java` + `.kt`），400 个类型就是 800 次往返，5 秒预算就这么没了。现在整项目只建**一次类型索引**，
+按文件名查表；查不到时才退回一次声明搜索，且结果会被记住。
+
+仪表盘和「跳到源码」只显示路由，不需要 DTO 字段，因此走**仅路由档**，不解析 DTO 闭包。
+
+复现与测量用三个工具（都在 `examples/`，不进 wasm 产物）：
+
+```sh
+cargo run --release --example gen_demo   -- --preset big        # 生成可调规模的 Spring 工程
+cargo run --release --example scan_bench -- "%TEMP%\apimocktle-demo\big"
+cargo run --release --example component_api -- dist/plugin.wasm # 读组件的接口版本
+```
+
+`big` 档是 6 模块 / 300 控制器 / 1214 接口 / 900 DTO。实测（MockHost，每次往返按 3 ms 估）：
+
+| 档位 | 宿主往返 | 估算耗时 |
+| - | - | - |
+| 导出（含 DTO） | 716 次 | 2.1 s |
+| 仪表盘（仅路由） | 316 次 | 0.9 s |
+
+修复前的同类项目是 1526 次。**注意**：`MockHost` 是内存实现，`read_file` / `find_files` 是哈希查找，
+所以绝对毫秒数不能当真，能外推的只有往返次数。
+
 > 用真实工程验证时请只记结论，别把工程名、包名、接口名写进代码或文档——`tests/` 和 `fixtures/` 里一律用
 > `com.acme` / `com.example` 这类示例命名。
 
@@ -277,7 +303,7 @@ required = ["project.read", "storage", "net:api.example.com"]   # HTTPS
 ## 测试
 
 ```sh
-cargo test                      # 90 个用例：解析、Schema、ZIP/class、POM、路由常量、YApi 编码、队列、i18n，以及端到端链路
+cargo test                      # 109 个用例：解析、Schema、ZIP/class、POM、路由常量、类型索引、扫描预算、YApi 编码、队列、i18n，以及端到端链路
 node script/check-pages.mjs     # 仪表盘在两种语言下的真实渲染（cargo test 跑不了 JS）
 pwsh script/package.ps1         # 重建组件并打包（含 icons/ 与 locales/）
 ```
@@ -307,8 +333,7 @@ SDK 版本固定在 `Cargo.toml` 的 tag（当前 `v0.1.50`，插件 API 1.14）
 `openidea:plugin/*@1.14.0`，并导出 `commands`、`lifecycle`、`view-provider`、`endpoints-provider`、
 `event-handler`；用 `cargo run --example component_api -- dist/plugin.wasm` 可以随时核对组件的接口版本。
 
-`dist/plugin.wasm` 是上一个发版（0.3.0，SDK `v0.1.44` / API 1.7）的产物，源码升级后**没有**重新构建它——
-发布前跑一次 `script/package.ps1` 就会同步。
+`dist/plugin.wasm` 随源码一起提交，发版前用 `script/package.ps1` 重建，并用 `cargo run --example component_api -- dist/plugin.wasm` 核对接口版本。
 
 ## 发布
 
@@ -323,7 +348,7 @@ openidea-plugin pack . --key ~/.openidea-keys/apimocktle.key --publisher apimock
 [l0ng-ai/openidea-plugins](https://github.com/l0ng-ai/openidea-plugins) 的 `version` / `package` / `sha256`：
 
 ```sh
-git tag v0.3.0 && git push origin v0.3.0
+git tag v0.3.1 && git push origin v0.3.1
 pwsh script/release.ps1            # -DryRun 只构建签名，不碰 release
 ```
 
