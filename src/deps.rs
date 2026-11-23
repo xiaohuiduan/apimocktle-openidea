@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use openidea_plugin::{Error, LogLevel, NotificationLevel, Project, host};
+use openidea_plugin::{DependencyNode, DependencyStatus, Error, LogLevel, NotificationLevel, Project, host};
 
 use crate::classfile::{self, ClassFile, JarField};
 use crate::spring::Field;
@@ -344,13 +344,99 @@ impl Deps {
                 .map(|path| JarRef { path, external: false, group: None, artifact: None })
                 .collect();
             if !self.denied {
-                jars.extend(self.repo_jars(project));
+                // The IDE already resolved the graph (API 1.10). Preferring it
+                // skips walking every POM ourselves — up to `MAX_POMS` host
+                // reads — and, more importantly, takes the conflict resolution
+                // from the one place that actually did it instead of guessing
+                // with `dep_version`. Only the coordinates change source: the
+                // jar path below is still ours to build.
+                match self.graph_jars(project) {
+                    Some(from_graph) => jars.extend(from_graph),
+                    None => jars.extend(self.repo_jars(project)),
+                }
             }
             let mut seen = HashSet::new();
             jars.retain(|jar| seen.insert(jar.path.clone()));
             self.jars = Some(jars);
         }
         self.jars.as_deref().unwrap_or_default()
+    }
+
+    /// The project's dependencies as the IDE resolved them, or `None` when that
+    /// is not available: the capability was not granted, the project is not
+    /// trusted, nothing has been resolved yet, or the build is not Maven/Gradle.
+    ///
+    /// Degrading is silent by design — the POM walk answers the same question,
+    /// only less accurately — but the log says which path ran, because "the
+    /// versions are still wrong" and "the graph was never used" look identical
+    /// from the outside.
+    fn graph_jars(&mut self, project: &Project) -> Option<Vec<JarRef>> {
+        let nodes = match project.build_dependencies(None) {
+            Ok(nodes) => nodes,
+            Err(Error::Denied(_)) => {
+                // Not granted, or the project is untrusted. Either way a scan
+                // must not fail over it.
+                host::log(LogLevel::Info, "ApiMocktle: 未获 build.read，改用 POM 解析依赖");
+                return None;
+            }
+            Err(_) => return None,
+        };
+        // A graph with no dependency below a module root carries no coordinates
+        // worth using (the IDE has not resolved anything yet); the POM walk is
+        // the better answer there.
+        let deps: Vec<&DependencyNode> = nodes
+            .iter()
+            .filter(|node| node.parent.is_some())
+            // `OmittedForConflict` means another version won: the jar for its
+            // `version` is the winner's, not this occurrence's, so adding it
+            // would map a class to the wrong artifact. Duplicates point at an
+            // occurrence that is already in the list.
+            .filter(|node| {
+                matches!(
+                    node.status,
+                    DependencyStatus::Resolved | DependencyStatus::VersionManaged
+                )
+            })
+            .filter(|node| !node.artifact.is_empty() && !node.version.is_empty())
+            .collect();
+        if deps.is_empty() {
+            return None;
+        }
+        if self.home.is_none() {
+            // A module root declares no version; it names the project's own
+            // group, which is what `jar_score` wants to rank project jars first.
+            self.home = nodes
+                .iter()
+                .find(|node| node.parent.is_none() && !node.group.is_empty())
+                .map(|node| node.group.clone());
+        }
+
+        let mut jars = Vec::with_capacity(deps.len());
+        for node in deps {
+            // The same shape `repo_jars` produces, so ranking and caching below
+            // do not care which path filled the list.
+            let dep = PomDep {
+                g: node.group.clone(),
+                a: node.artifact.clone(),
+                v: Some(node.version.clone()),
+                classifier: None,
+                scope: Some(node.scope.clone()),
+                optional: false,
+            };
+            for path in jar_paths(&self.cfg.repo, &dep) {
+                jars.push(JarRef {
+                    path,
+                    external: true,
+                    group: Some(node.group.clone()),
+                    artifact: Some(node.artifact.clone()),
+                });
+            }
+        }
+        host::log(
+            LogLevel::Info,
+            &format!("ApiMocktle: 用 IDE 依赖图解析 {} 个坐标，跳过 POM 遍历", jars.len()),
+        );
+        Some(jars)
     }
 
     /// The jars of the project's Maven dependencies, read from the local

@@ -22,7 +22,9 @@ activation = ["on-command:*", "on-view:dashboard", "on-schedule:60"]
 required = ["project.read", "storage", "net:localhost", "net:127.0.0.1"]
 # 依赖 jar 在项目之外：读取 ~/.m2/repository 需要这条授权。用户不勾选时
 # 插件照常工作，只是源码里没有的类型退化成 object。
-optional = ["fs.read:~/.m2/repository"]
+# `build.read` 读 IDE 已解析的依赖图：有它就不必自己遍历 POM，版本与冲突消解也
+# 由 IDE 给。不勾选时退回自己解析 POM，功能不变。
+optional = ["fs.read:~/.m2/repository", "build.read"]
 
 # Command, view and settings titles are the source text of `locales/<tag>.json`:
 # write them in English and put the translation in that catalog (see
