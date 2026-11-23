@@ -94,7 +94,7 @@ cargo build --release --target wasm32-wasip2
 pwsh script/package.ps1      # also refreshes dist/plugin.wasm
 
 # openidea-plugin (validation + linking) is optional:
-cargo install --locked --git https://github.com/l0ng-ai/openidea ide-host --tag v0.1.44 --bin openidea-plugin
+cargo install --locked --git https://github.com/l0ng-ai/openidea ide-host --tag v0.1.50 --bin openidea-plugin
 openidea-plugin check
 openidea-plugin link
 ```
@@ -115,7 +115,7 @@ pwsh script/package.ps1 -Toolchain 1.96.0-x86_64-pc-windows-gnu   # reuses CARGO
 ```
 
 The component must match the host: `wasm-tools component wit dist/plugin.wasm` should list `wasi:*` and
-`openidea:plugin/*@1.7.0`, exporting the `commands`, `lifecycle`, `event-handler`, `endpoints-provider` and
+`openidea:plugin/*@1.14.0`, exporting the `commands`, `lifecycle`, `event-handler`, `endpoints-provider` and
 `view-provider` interfaces.
 
 ### Local install notes (Windows, OpenIDEA 0.1.45)
@@ -339,10 +339,14 @@ manifest/settings string has a Chinese entry.
 deliberately carry an interface and a generic superclass, to pin class `Signature` parsing). Tests and docs use
 `com.acme` / `com.example` example naming throughout; real projects' class names stay out of the repository.
 
-The SDK version is pinned by the tag in `Cargo.toml` (currently `v0.1.44`, plugin API 1.7); when upgrading the IDE,
+The SDK version is pinned by the tag in `Cargo.toml` (currently `v0.1.50`, plugin API 1.14); when upgrading the IDE,
 change the tag and `engines.openidea` together — they must match or the component's WIT interfaces will not line up
-with the host. `dist/plugin.wasm`'s import table is confirmed to be `openidea:plugin/*@1.7.0`, exporting
-`commands`, `lifecycle`, `view-provider`, `endpoints-provider` and `event-handler`.
+with the host. A fresh build imports `openidea:plugin/*@1.14.0` and exports `commands`, `lifecycle`, `view-provider`,
+`endpoints-provider` and `event-handler`; check any component with
+`cargo run --example component_api -- dist/plugin.wasm`.
+
+`dist/plugin.wasm` is the previous release's build (0.3.0, SDK `v0.1.44` / API 1.7) and is **not** rebuilt when the
+source's SDK changes — running `script/package.ps1` before a release brings it back in step.
 
 ## Releasing
 

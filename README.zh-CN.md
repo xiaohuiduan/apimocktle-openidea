@@ -82,7 +82,7 @@ cargo build --release --target wasm32-wasip2
 pwsh script/package.ps1      # 同时刷新 dist/plugin.wasm
 
 # 需要 openidea-plugin（校验 + 链接）：
-cargo install --locked --git https://github.com/l0ng-ai/openidea ide-host --tag v0.1.44 --bin openidea-plugin
+cargo install --locked --git https://github.com/l0ng-ai/openidea ide-host --tag v0.1.50 --bin openidea-plugin
 openidea-plugin check
 openidea-plugin link
 ```
@@ -101,7 +101,7 @@ pwsh script/package.ps1 -Toolchain 1.96.0-x86_64-pc-windows-gnu   # 会沿用 CA
 ```
 
 组件要和宿主对齐：`wasm-tools component wit dist/plugin.wasm` 应列出 `wasi:*` 与
-`openidea:plugin/*@1.7.0`，导出 `commands`、`lifecycle`、`event-handler`、`endpoints-provider`、
+`openidea:plugin/*@1.14.0`，导出 `commands`、`lifecycle`、`event-handler`、`endpoints-provider`、
 `view-provider` 五个 interface。
 
 ### 本机安装说明（Windows，OpenIDEA 0.1.45）
@@ -296,10 +296,13 @@ pwsh script/package.ps1         # 重建组件并打包（含 icons/ 与 locales
 泛型父类，用来盯住 class Signature 的解析）。测试与文档里一律用 `com.acme` / `com.example` 这类示例命名，
 真实工程的类名不写进仓库。
 
-SDK 版本固定在 `Cargo.toml` 的 tag（当前 `v0.1.44`，插件 API 1.7）；升级 IDE 时同步改 tag 与
-`engines.openidea`，两者必须匹配，否则组件与宿主的 WIT 接口对不上。`dist/plugin.wasm` 的导入表已确认是
-`openidea:plugin/*@1.7.0`，并导出 `commands`、`lifecycle`、`view-provider`、`endpoints-provider`、
-`event-handler`。
+SDK 版本固定在 `Cargo.toml` 的 tag（当前 `v0.1.50`，插件 API 1.14）；升级 IDE 时同步改 tag 与
+`engines.openidea`，两者必须匹配，否则组件与宿主的 WIT 接口对不上。新构建的组件导入表是
+`openidea:plugin/*@1.14.0`，并导出 `commands`、`lifecycle`、`view-provider`、`endpoints-provider`、
+`event-handler`；用 `cargo run --example component_api -- dist/plugin.wasm` 可以随时核对组件的接口版本。
+
+`dist/plugin.wasm` 是上一个发版（0.3.0，SDK `v0.1.44` / API 1.7）的产物，源码升级后**没有**重新构建它——
+发布前跑一次 `script/package.ps1` 就会同步。
 
 ## 发布
 
