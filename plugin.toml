@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.0"
+version = "0.3.1"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.0 — 界面文案接入国际化：命令、设置项、仪表盘、通知与错误提示都跟随 IDE 的界面语言，中文界面保持原样，英文界面不再夹中文；README 增加中英双版（默认英文，顶部可切换）。同时修掉三个问题：仪表盘读取启动数据的方式有误，导致中文界面上页面显示英文；请求失败时错误消息会带出完整 URL，个人令牌因此明文出现在状态栏与通知里；服务器返回 HTTP 200 但正文不是 JSON 时（代理错误页、网关提示页），正文回显的请求地址同样会泄露令牌。三条错误路径现已统一脱敏。设置与导出行为未变。"
+change-notes = "0.3.1 — 扫描链路提速，并升到插件 API 1.14（需要 OpenIDEA 0.1.50 及以上）。扫描超时的成因不是计算量而是宿主往返次数：大项目上每解析一个 DTO 都要做两次全项目文件查找，1500 多次往来把 5 秒预算吃光，宿主掐掉调用还会连带清空内存缓存，于是打开仪表盘就一直超时。现在整项目只建一次类型索引，实测往返减少 53%。仪表盘只在列表里显示路由，不再为它解析 DTO 字段，这一档又省掉一半。另外加了扫描时间预算：4.2 秒内没收完就返回已找到的部分并提示结果可能不全，而不是被宿主回收。依赖坐标改为优先读 IDE 已解析好的 Maven 依赖图（build.read，需在权限里勾选），版本与冲突消解由 IDE 给出；没有该授权时仍按原方式读 POM。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

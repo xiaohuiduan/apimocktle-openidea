@@ -73,10 +73,15 @@ struct TypeIndex {
     /// File stem → paths, in the order `find_files` returned them.
     java: HashMap<String, Vec<String>>,
     kotlin: HashMap<String, Vec<String>>,
-    /// Names already looked for in the sources and not found. A miss costs one
-    /// `search_text`, and asking twice for the same absent type would pay it
-    /// again.
-    missed: HashSet<String>,
+    /// Names a declaration search ran for, with what it found. An empty list
+    /// means the search ran and the name is genuinely absent, so a second
+    /// lookup can answer without paying for the search again.
+    ///
+    /// This has to remember the *result*, not merely that a search happened:
+    /// the type index is built from file names, so a class kept in a file named
+    /// otherwise is never in it — yet it exists, and caching "already searched"
+    /// would make only the first controller that mentions it work.
+    searched: HashMap<String, Vec<String>>,
 }
 
 impl TypeIndex {
@@ -88,7 +93,7 @@ impl TypeIndex {
         } else {
             HashMap::new()
         };
-        TypeIndex { java, kotlin, missed: HashSet::new() }
+        TypeIndex { java, kotlin, searched: HashMap::new() }
     }
 
     /// The candidate files for `name`, Java first. Empty means the index has
@@ -98,6 +103,16 @@ impl TypeIndex {
         let mut out: Vec<String> = self.java.get(name).cloned().unwrap_or_default();
         out.extend(self.kotlin.get(name).cloned().unwrap_or_default());
         out
+    }
+
+    /// The declaration search, run at most once per name and cached by result.
+    fn fallback(&mut self, project: &Project, options: &Options, name: &str) -> Vec<String> {
+        if let Some(hit) = self.searched.get(name) {
+            return hit.clone();
+        }
+        let found = declaration_candidates(project, options, name);
+        self.searched.insert(name.to_owned(), found.clone());
+        found
     }
 }
 
@@ -613,12 +628,13 @@ fn load_source_for(
     let mut candidates = index.candidates(name);
     if candidates.is_empty() {
         // The route-constant class is never among the scanned controllers (it
-        // declares no mapping), so a miss here is normal — remember it so a
-        // qualifier that cannot be resolved is not searched for again.
-        if !index.missed.insert(name.to_owned()) {
-            return None;
-        }
-        candidates = declaration_candidates(project, options, name);
+        // declares no mapping), so a miss here is normal. The name is looked up
+        // through `index.fallback` so the declaration search runs once — but
+        // only when that search *finds nothing* is the name remembered as
+        // absent. Remembering it up front would poison the very lookup that
+        // populates the candidates, and every controller after the first would
+        // lose its constants.
+        candidates = index.fallback(project, options, name);
     }
     // The class' directory is the part before the simple name:
     // `com.a.Routes` → `com/a`, `Outer.Inner` → nothing to match on.
@@ -799,13 +815,10 @@ fn load_class(
     let mut candidates = index.candidates(name);
     if candidates.is_empty() {
         // Some projects keep a class away from its file name; search for the
-        // declaration instead of guessing a path. The miss is remembered, so a
-        // type that genuinely does not exist costs one search, not one per
+        // declaration instead of guessing a path. `fallback` caches the result,
+        // so a type that genuinely does not exist costs one search, not one per
         // endpoint that mentions it.
-        if !index.missed.insert(name.to_owned()) {
-            return None;
-        }
-        candidates = declaration_candidates(project, options, name);
+        candidates = index.fallback(project, options, name);
     }
     for path in candidates {
         let src = match sources.get(&path) {
