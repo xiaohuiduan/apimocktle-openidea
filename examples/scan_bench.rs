@@ -214,6 +214,13 @@ fn main() {
     let round_trips = search_calls + index_walks + fallback_searches + reads;
     let estimated = round_trips as f64 * call_ms / 1_000.0;
 
+    // The dashboard does not resolve the DTO closure, so its read count is the
+    // controllers and the constant classes only. Printing it beside the full
+    // tier is the point of that split: the same input, two different bills.
+    let display_reads = scanned.files + constant_classes;
+    let display_round_trips = search_calls + index_walks + display_reads;
+    let display_estimated = display_round_trips as f64 * call_ms / 1_000.0;
+
     println!("== 宿主往返预算（决定真实 IDE 会不会超时）==");
     println!("{} {}", pad("来源", 34), pad("次数", 8).to_string() + "说明");
     line("① search_text", search_calls, "全项目文本搜索");
@@ -227,10 +234,17 @@ fn main() {
     println!("{}", "-".repeat(76));
     println!(
         "{} {} 次 × {call_ms} ms ≈ {:.1} s  （命令预算 5 s）{}",
-        pad("合计", 34),
+        pad("合计（导出档，含 DTO）", 34),
         round_trips,
         estimated,
         if estimated > COMMAND_BUDGET.as_secs_f64() { "  !! 超预算" } else { "" }
+    );
+    println!(
+        "{} {} 次 × {call_ms} ms ≈ {:.1} s  （同一份输入，仪表盘档）{}",
+        pad("合计（仪表盘档，仅路由）", 34),
+        display_round_trips,
+        display_estimated,
+        if display_estimated > COMMAND_BUDGET.as_secs_f64() { "  !! 超预算" } else { "" }
     );
     println!();
     // The number this change is measured by: the DTO closure used to cost two

@@ -109,6 +109,21 @@ fn route_options() -> scan::Options {
     }
 }
 
+/// Routes only, but over every candidate file.
+///
+/// The dashboard and "go to source" need the route list and nothing else —
+/// `scan::to_json` reads `body_type`, not the DTO graph, and the page shows the
+/// request body's *type name*, never its fields. Resolving the closure for them
+/// read one source file per DTO type for nothing: on a 300-controller project
+/// that was 388 of 713 `read_file` calls.
+///
+/// `route_options()` cannot be reused here: its 400-file cap exists for the
+/// endpoints provider's 2 s budget, and a dashboard that silently listed fewer
+/// controllers than the project has would be a wrong answer, not a fast one.
+fn route_only_options() -> scan::Options {
+    scan::Options { resolve_dto: false, ..scan_options() }
+}
+
 fn post(message: Value) {
     let _ = host::post_view_message(VIEW, &message.to_string());
 }
@@ -221,6 +236,9 @@ impl ApiMocktle {
         if let Some(hit) = self.cache.get(&root) {
             return Ok(hit.clone());
         }
+        // A route-only scan may already be cached (the dashboard ran first).
+        // Its endpoints are already correct, but its `dto` is empty, and export
+        // needs the graph — so it cannot be reused as the full result.
         let result = Rc::new(scan::scan(project, &scan_options())?);
         host::log(
             LogLevel::Info,
@@ -232,7 +250,9 @@ impl ApiMocktle {
                 if result.truncated { "（已达搜索上限）" } else { "" }
             ),
         );
-        self.cache.insert(root, result.clone());
+        self.cache.insert(root.clone(), result.clone());
+        // The route-only entry is now redundant: `scan()` prefers `cache`.
+        self.routes.remove(&root);
         Ok(result)
     }
 
@@ -246,6 +266,30 @@ impl ApiMocktle {
             return Ok(hit.clone());
         }
         let result = Rc::new(scan::scan(project, &route_options())?);
+        self.routes.insert(root, result.clone());
+        Ok(result)
+    }
+
+    /// Route list over every candidate file, for the dashboard and for
+    /// "go to source". Skips the DTO closure, which neither of them reads.
+    fn routes_for_display(&mut self, project: &Project) -> Result<Rc<ScanResult>, Error> {
+        let root = project.root()?;
+        if let Some(hit) = self.cache.get(&root) {
+            return Ok(hit.clone());
+        }
+        if let Some(hit) = self.routes.get(&root) {
+            return Ok(hit.clone());
+        }
+        let result = Rc::new(scan::scan(project, &route_only_options())?);
+        host::log(
+            LogLevel::Info,
+            &format!(
+                "ApiMocktle: {} 个控制器文件 → {} 个接口（仅路由，未解析 DTO）{}",
+                result.files,
+                result.endpoints.len(),
+                if result.truncated { "（已达搜索上限）" } else { "" }
+            ),
+        );
         self.routes.insert(root, result.clone());
         Ok(result)
     }
@@ -700,7 +744,9 @@ impl Views for ApiMocktle {
                     Some("open") => {
                         let index = value.get("index").and_then(Value::as_u64).unwrap_or(u64::MAX) as usize;
                         if let Some(project) = ctx.project()
-                            && let Ok(scanned) = self.scan(&project)
+                            // Only a file and a position are needed; resolving
+                            // the DTO closure for this would be wasted reads.
+                            && let Ok(scanned) = self.routes_for_display(&project)
                             && let Some(endpoint) = scanned.endpoints.get(index)
                         {
                             let _ = host::open_location(&endpoint.file, endpoint.line, endpoint.col);
@@ -721,7 +767,10 @@ impl ApiMocktle {
             let error = i18n::OPEN_A_PROJECT.get(i18n::lang());
             return json!({ "op": "items", "error": error, "items": [], "count": 0 });
         };
-        match self.scan(&project) {
+        // The dashboard renders routes only — `to_json` never reads `dto` — so
+        // it does not pay for the closure. Export still asks `scan()` for the
+        // full result when it needs the graph.
+        match self.routes_for_display(&project) {
             Ok(scanned) => {
                 let mut payload = scan::to_json(&scanned);
                 payload["op"] = Value::String("items".into());
@@ -997,6 +1046,25 @@ public class UserController {
         let payload: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(payload["op"], "items");
         assert_eq!(payload["count"], 2);
+
+        // The dashboard scan skips the DTO closure, but that must not thin out
+        // what the page receives: every route and every field the page renders
+        // still has to be there.
+        let items = payload["items"].as_array().expect("items");
+        assert_eq!(items.len(), 2);
+        for item in items {
+            assert!(item["method"].is_string(), "method: {item}");
+            assert!(item["path"].as_str().is_some_and(|p| p.starts_with('/')), "path: {item}");
+            assert!(item["class"].is_string(), "class: {item}");
+            assert!(item["handler"].is_string(), "handler: {item}");
+            assert!(item["framework"].is_string(), "framework: {item}");
+            assert!(item["file"].is_string(), "file: {item}");
+            assert!(item["line"].is_number(), "line: {item}");
+            assert!(item["params"].is_array(), "params: {item}");
+            // `body` is the request body's type name — a string or null. The
+            // page never renders DTO fields, which is why the closure is skipped.
+            assert!(item["body"].is_string() || item["body"].is_null(), "body: {item}");
+        }
     }
 
     /// Both "no project" messages were `ok_or("…")` — that is `Error::Failed`,
@@ -1422,6 +1490,81 @@ public class UploadController {
         assert!(light.dto.fields.is_empty(), "routes do not need the DTO graph");
         let full = scan::scan(&project, &scan::Options { resolve_dto: true, ..route_options() }).unwrap();
         assert!(!full.dto.fields.is_empty());
+    }
+
+    /// The dashboard shows routes and nothing else, so opening it must not pay
+    /// for the DTO closure — but an export started afterwards must still get the
+    /// graph. Those two pulls in opposite directions and only the cache layers
+    /// keep them apart.
+    #[test]
+    fn the_dashboard_scan_skips_dtos_and_an_export_still_finds_them() {
+        let host = host();
+        let mut plugin = ApiMocktle::default();
+        let ctx = host.invocation();
+        let project = ctx.project().expect("a project");
+
+        // What the dashboard does on open.
+        let display = plugin.routes_for_display(&project).expect("a display scan");
+        assert_eq!(display.endpoints.len(), 2, "the dashboard still lists every route");
+        assert!(display.dto.fields.is_empty(), "the dashboard does not resolve DTOs");
+
+        // What export does next: it must not be handed the route-only result.
+        let full = plugin.scan(&project).expect("a full scan");
+        assert!(
+            !full.dto.fields.is_empty(),
+            "export needs the DTO graph even when the dashboard scanned first"
+        );
+        assert!(full.dto.fields.contains_key("UserDto") || full.dto.fields.contains_key("CreateUser"));
+        assert_eq!(full.endpoints.len(), 2);
+
+        // And the full result now serves the dashboard too, rather than
+        // scanning again.
+        let again = plugin.routes_for_display(&project).expect("a cached display scan");
+        assert!(!again.dto.fields.is_empty(), "the full result is reused");
+    }
+
+    /// The dashboard must not borrow the endpoints provider's 400-file cap: a
+    /// project with more controllers than that would silently list fewer.
+    #[test]
+    fn a_display_scan_keeps_the_full_file_limit() {
+        // `route_only_options` reads the host's settings, so a mock must be
+        // installed before it is called.
+        let _host = host();
+        assert_ne!(
+            route_only_options().file_limit,
+            route_options().file_limit,
+            "the display tier must not inherit the provider's cap"
+        );
+        assert_eq!(route_only_options().file_limit, scan::FILE_LIMIT);
+        assert!(!route_only_options().resolve_dto);
+    }
+
+    /// "Go to source" reads the same route-only scan the dashboard does, so it
+    /// has to keep working off it: the file and the annotation's position are
+    /// what it needs, and both are route-level data.
+    #[test]
+    fn going_to_source_works_from_the_route_only_scan() {
+        let host = host();
+        let mut plugin = ApiMocktle::default();
+        plugin.render(VIEW, None, &host.invocation()).unwrap();
+
+        plugin
+            .handle(
+                VIEW,
+                ViewEvent::Message(json!({ "op": "open", "index": 1 }).to_string()),
+                &host.invocation(),
+            )
+            .expect("the open message must not fail");
+
+        let opened = host.opened_locations();
+        assert_eq!(opened.len(), 1, "one jump was requested: {opened:?}");
+        let (path, line, col) = &opened[0];
+        assert!(path.ends_with("UserController.java"), "the route's own file: {path}");
+        // Sorted by path, so index 1 is `/api/users/create`, whose annotation is
+        // on line 11 (zero-based). The exact numbers matter less than the fact
+        // that a real position came through rather than the 0/0 default.
+        assert!(*line > 0, "the annotation's line, not 0: {line}");
+        assert!(*col > 0, "the annotation's column, not 0: {col}");
     }
 
     #[test]
