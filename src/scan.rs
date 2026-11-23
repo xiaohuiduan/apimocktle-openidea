@@ -11,13 +11,17 @@ use crate::model::{Endpoint, FieldSpec, ParamSpec, simple_name, split_type};
 use crate::spring::{self, ParamKind};
 
 /// The HTTP verbs whose annotations mark a controller file.
-const MARKERS: &str = "@(RestController|Controller|RequestMapping|GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|FeignClient|Path)";
+///
+/// Public together with the three budgets below so a benchmark can measure the
+/// real pipeline with the real numbers instead of a drifting copy of them
+/// (`examples/scan_bench.rs`).
+pub const MARKERS: &str = "@(RestController|Controller|RequestMapping|GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|FeignClient|Path)";
 /// Candidate files handed to the text search.
-const FILE_LIMIT: u32 = 5_000;
+pub const FILE_LIMIT: u32 = 5_000;
 /// Text matches asked for; one controller file yields several.
-const MATCH_LIMIT: u32 = 40_000;
+pub const MATCH_LIMIT: u32 = 40_000;
 /// DTO types resolved per scan, so a cyclic or huge model cannot run away.
-const TYPE_BUDGET: usize = 400;
+pub const TYPE_BUDGET: usize = 400;
 
 #[derive(Clone, Debug)]
 pub struct Options {
