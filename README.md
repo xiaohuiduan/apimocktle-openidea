@@ -64,13 +64,15 @@ Two things only: **browsing endpoints** and **exporting to ApiMocktle**.
   `additionalProperties` shows as `{}`). `@JsonProperty` renames, `@JsonIgnore` exclusions, record components and
   Kotlin constructor properties are all honoured.
 - **Types from dependency jars**: DTOs and wrappers that are not in the sources (`ApiEnvelope<T>` living in a
-  shared jar) are resolved by walking the project POM's dependency tree (transitive included) to jars in the local
-  Maven repository and reading their `.class` files for fields, generic parameters and superclass fields
-  (`class ApiEnvelope<T> extends BaseReply` exports `BaseReply`'s `code`/`message` plus its own
-  `errorNo`/`errorInfo`/`result: T`). Jars are matched by import package against Maven group / artifact ordering,
-  so usually only one jar is read; the first scan of a project remembers "class → jar" and later scans hit it
-  directly. This needs the `fs.read` grant for the repository directory; without it the plugin falls back to the old
-  behaviour and exports only the type argument.
+  shared jar) are resolved to jars in the local Maven repository and their `.class` files read for fields, generic
+  parameters and superclass fields (`class ApiEnvelope<T> extends BaseReply` exports `BaseReply`'s
+  `code`/`message` plus its own `errorNo`/`errorInfo`/`result: T`). Coordinates come from the dependency graph the
+  IDE already resolved (`build.read` grant): multi-module layouts, BOMs and version conflicts are its work, so the
+  plugin neither walks the POMs itself nor guesses a version. Without that grant it falls back to reading the POMs
+  (transitive included) — usually the same answer, just slower. Jars are matched by import package against Maven
+  group / artifact ordering, so usually only one jar is read; the first scan of a project remembers "class → jar"
+  and later scans hit it directly. Reading the repository still needs the `fs.read` grant; with neither, the plugin
+  exports only the type argument.
 - **Search Everywhere**: scanned endpoints appear in the Endpoints group, and the declaration also offers
   **Open in HTTP Client**.
 
@@ -254,6 +256,9 @@ Capabilities declared in the manifest:
   `settings.xml`'s `localRepository`), change this `fs.read:` entry to the new directory and reinstall to grant it —
   grant paths are declared statically and cannot be appended at runtime (see "Permissions when the repository
   moves" above).
+- `build.read` (**optional**): read the Maven / Gradle dependency graph the IDE already resolved, instead of walking
+  the POMs yourself. Without it the plugin reads the POMs, and nothing else changes. The project must be trusted or
+  the host answers `denied`, which falls back the same way.
 
 The host only allows hosts declared in the manifest. For a server on the LAN, or over HTTPS, edit `plugin.toml`:
 

@@ -55,12 +55,14 @@ OpenIDEA 插件运行在 WASM 沙箱里，没有 Java PSI、没有 Swing、没�
   解析不到定义的框架包装（`ResponseEntity<T>`、`Optional<T>`）仍自动拆开。`Map<K, V>` 按 K 生成一个
   示例键写进 `properties`（ApiMocktle 与 YApi 一样只渲染 `properties`，`additionalProperties` 会显示为 `{}`）。
   认 `@JsonProperty` 改名、`@JsonIgnore` 排除、record 组件与 Kotlin 构造器属性。
-- **依赖 jar 里的类型**：源码里没有的 DTO / 包装类（`ApiEnvelope<T>` 这类放在公共 jar 里的）会按项目
-  POM 的依赖树（含传递依赖）找到本地 Maven 仓库里的 jar，读 `.class` 文件补全字段、泛型参数和父类字段
+- **依赖 jar 里的类型**：源码里没有的 DTO / 包装类（`ApiEnvelope<T>` 这类放在公共 jar 里的）会找到本地
+  Maven 仓库里的 jar，读 `.class` 文件补全字段、泛型参数和父类字段
   （`class ApiEnvelope<T> extends BaseReply` 会导出 `BaseReply` 的 `code`/`message` 加自己的
-  `errorNo`/`errorInfo`/`result: T`）。jar 按 import 包名匹配 Maven group / artifact 排序，命中的通常只读
-  一个 jar；每个项目第一次扫描会记住“类 → jar”，后续扫描直接命中。需要授予读取仓库目录的 `fs.read`
-  权限；没授权时退回旧行为，只导出泛型实参。
+  `errorNo`/`errorInfo`/`result: T`）。坐标优先用 IDE 已经解析好的依赖图（`build.read` 授权）：
+  多模块、BOM、版本冲突都由 IDE 算过，插件不再自己遍历 POM，也不用猜版本；没有这条授权时退回自己读
+  POM（含传递依赖），结果通常相同，只是慢一些。jar 按 import 包名匹配 Maven group / artifact 排序，
+  命中的通常只读一个 jar；每个项目第一次扫描会记住“类 → jar”，后续扫描直接命中。真正读仓库仍需
+  `fs.read` 权限；两条都没授权时只导出泛型实参。
 - **Search Everywhere**：扫描到的接口出现在 Endpoints 分组，声明处还有 **Open in HTTP Client** 可用。
 
 不包含：发请求、复制 curl、字段转 JSON、连接测试——这些已按要求移除。
@@ -222,6 +224,8 @@ cargo run --example schema_size -- C:\path\to\project
   或在 **设置 › 插件 › ApiMocktle › 权限** 里授予；不授权时插件照常工作，只是 jar 里的类型退化成 `object`。
   仓库换了位置（比如公司 `settings.xml` 里的 `localRepository`）时，把这条 `fs.read:` 改成新目录后重新安装
   并授权——授权路径是静态声明的，运行期无法追加（见上文「换了仓库目录时，权限怎么配」）。
+- `build.read`（**optional**）：读 IDE 已解析的 Maven / Gradle 依赖图，用它代替自己遍历 POM。
+  不授权时退回自己解析 POM，功能不变。需要项目处于 trusted 状态，否则宿主返回 `denied`，同样是静默退回。
 
 宿主只放行清单里声明过的主机。服务器在局域网或走 HTTPS 时，需要改 `plugin.toml`：
 
