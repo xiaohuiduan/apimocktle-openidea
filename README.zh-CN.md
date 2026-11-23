@@ -252,7 +252,9 @@ required = ["project.read", "storage", "net:api.example.com"]   # HTTPS
   直接命中同一个 jar。
 - **Map 用示例键渲染**：`Map<K, V>` 导出为 `{ "type": "object", "properties": { "<K 的示例名>": V } }`，
   而不是 `additionalProperties`——后者在 ApiMocktle / YApi 的字段表里是空对象。
-- **5 秒命令预算**：扫描和导出都按这个上限设计（分批发送），超大项目会命中文本搜索上限，仪表盘会提示结果可能不全。
+- **5 秒命令预算**：扫描和导出都按这个上限设计。导出分批发送；扫描在 4.2 秒处收手
+  （endpoints provider 是 1.5 秒），没收完就返回已找到的部分并提示结果可能不全，而不是被宿主掐掉。
+  超大项目另外会命中文本搜索上限。
 - **诊断级别的位置**：接口位置取注解所在行列（0-based 行、UTF-16 列），用于跳转，不做语法高亮。
 - **不做 mock 运行时**：没有 JVM agent，只在源码层面对齐。
 

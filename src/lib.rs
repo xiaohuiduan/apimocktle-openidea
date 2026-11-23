@@ -77,6 +77,15 @@ fn config() -> Result<Config, Error> {
     Ok(Config { base, token })
 }
 
+/// Stop a scan just under the host's five-second call limit. Overrunning gets
+/// the instance reaped — and the in-memory scan cache with it — so the next
+/// call starts from zero and overruns again. 4.2 s leaves 800 ms to finish and
+/// return, the same margin the export batch uses.
+const SCAN_BUDGET: Duration = Duration::from_millis(4_200);
+/// The endpoints provider only gets 2 s, and a SoftTimeout reaps the instance
+/// just the same, so its scan stops earlier still.
+const ROUTE_BUDGET: Duration = Duration::from_millis(1_500);
+
 fn scan_options() -> scan::Options {
     scan::Options {
         include_kotlin: host::setting_bool("includeKotlin").unwrap_or(true),
@@ -85,13 +94,19 @@ fn scan_options() -> scan::Options {
             enabled: host::setting_bool("resolveDependencyJars").unwrap_or(true),
             repo: crate::deps::repository(),
         },
+        budget: Some(SCAN_BUDGET),
         ..scan::Options::default()
     }
 }
 
 /// Routes only: no DTO resolution, fewer candidate files.
 fn route_options() -> scan::Options {
-    scan::Options { resolve_dto: false, file_limit: 400, ..scan_options() }
+    scan::Options {
+        resolve_dto: false,
+        file_limit: 400,
+        budget: Some(ROUTE_BUDGET),
+        ..scan_options()
+    }
 }
 
 fn post(message: Value) {

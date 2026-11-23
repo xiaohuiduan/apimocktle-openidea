@@ -182,30 +182,43 @@ fn main() {
     //
     // Counted from the code paths in `src/scan.rs`, not guessed:
     //   * `scan::scan` searches once for the annotation markers.
-    //   * `scan::load_class` calls `find_files("**/X.java")` and
-    //     `find_files("**/X.kt")` before reading anything, for every DTO type
-    //     the closure reaches.
-    //   * `scan::value_of` does the same pair for a route-constant class, then
-    //     reads it — a controller file never declares a mapping, so it is never
-    //     among the search hits.
+    //   * `scan::TypeIndex::build` walks the project once per language to index
+    //     every source file by name — that replaced one `find_files` pair per
+    //     DTO type, which is what used to dominate.
+    //   * a type whose name is not in the index costs one declaration search
+    //     (`search_text`), and the miss is remembered.
     //   * every candidate controller and every resolved DTO costs one
     //     `read_file`.
+    //
+    // `find_files` is not hooked by MockHost, so the index count is derived
+    // from the configuration rather than observed: one glob per included
+    // language, plus a fallback search only when the index cannot answer.
     let constant_classes = sources
         .iter()
         .filter(|(path, _)| path.rsplit('/').next().is_some_and(|name| name == "RouteConstants.java"))
         .count();
     let dto_types = scanned.dto.fields.len();
-    let dto_finds = dto_types * 2;
-    let constant_finds = constant_classes * 2;
+    let index_walks = if scanned.files > 0 {
+        // Built before any lookup, and only once: `.java`, plus `.kt` when the
+        // project is scanned with Kotlin enabled.
+        if sources.iter().any(|(path, _)| path.ends_with(".kt")) { 2 } else { 1 }
+    } else {
+        0
+    };
+    // The index answers every type whose file is named after it; anything else
+    // falls back to one declaration search. The demo keeps them consistent, so
+    // this is 0 there — printed as its own row rather than folded away, because
+    // on a real project it is not.
+    let fallback_searches = 0;
     let reads = scanned.files + dto_types + constant_classes;
-    let round_trips = search_calls + dto_finds + constant_finds + reads;
+    let round_trips = search_calls + index_walks + fallback_searches + reads;
     let estimated = round_trips as f64 * call_ms / 1_000.0;
 
     println!("== 宿主往返预算（决定真实 IDE 会不会超时）==");
     println!("{} {}", pad("来源", 34), pad("次数", 8).to_string() + "说明");
     line("① search_text", search_calls, "全项目文本搜索");
-    line("⑤ find_files（DTO）", dto_finds, &format!("{dto_types} 类型 × 2（.java + .kt）"));
-    line("③ find_files（常量）", constant_finds, &format!("{constant_classes} 个常量类 × 2"));
+    line("② 类型索引 find_files", index_walks, "整项目一次，替代每类型 2 次");
+    line("③ 兜底声明搜索", fallback_searches, &format!("{dto_types} DTO + {constant_classes} 常量类全部命中索引"));
     line(
         "②③⑤ read_file",
         reads,
@@ -218,6 +231,15 @@ fn main() {
         round_trips,
         estimated,
         if estimated > COMMAND_BUDGET.as_secs_f64() { "  !! 超预算" } else { "" }
+    );
+    println!();
+    // The number this change is measured by: the DTO closure used to cost two
+    // project walks per type, so that is the baseline the same scan would have
+    // paid before the type index existed.
+    let before = search_calls + dto_types * 2 + constant_classes * 2 + reads;
+    println!(
+        "对比修复前的逐类型查找：{} 次（{dto_types} DTO × 2 + {constant_classes} 常量 × 2）→ {} 次",
+        before, round_trips
     );
     println!();
 

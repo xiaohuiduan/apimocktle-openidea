@@ -291,8 +291,9 @@ Rebuild and re-grant afterwards. This is the host's capability model, not a choi
 - **Map renders with an example key**: `Map<K, V>` exports as
   `{ "type": "object", "properties": { "<example name for K>": V } }` rather than `additionalProperties` — the
   latter shows as an empty object in ApiMocktle / YApi field tables.
-- **5-second command budget**: scanning and exporting are both designed around it (batched sending); very large
-  projects hit the text-search limit and the dashboard says results may be incomplete.
+- **5-second command budget**: scanning and exporting are both designed around it. Exporting sends in batches;
+  scanning stops itself at 4.2 s (1.5 s for the endpoints provider) and returns what it found with a "results may be
+  incomplete" note, instead of being killed by the host. Very large projects also hit the text-search limit.
 - **Diagnostic-level positions**: an endpoint's position is the annotation's line and column (0-based line, UTF-16
   column), used for navigation only — there is no syntax highlighting.
 - **No mock runtime**: no JVM agent; the alignment is at the source level only.

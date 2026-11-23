@@ -35,6 +35,15 @@ pub struct Options {
     pub file_limit: u32,
     /// Read dependency jars for types the project does not contain.
     pub deps: crate::deps::Config,
+    /// Stop collecting and return what was found once this much wall clock has
+    /// passed.
+    ///
+    /// `None` disables the guard, which is what tests and examples want. The
+    /// plugin's own entry points set it just under the host's limit: a scan
+    /// that overruns is *killed* by the host, and the instance is reaped along
+    /// with the in-memory scan cache, so the next call starts over and overruns
+    /// again. Returning a partial result instead keeps the cache alive.
+    pub budget: Option<std::time::Duration>,
 }
 
 impl Default for Options {
@@ -45,8 +54,67 @@ impl Default for Options {
             resolve_dto: true,
             file_limit: FILE_LIMIT,
             deps: crate::deps::Config::default(),
+            budget: None,
         }
     }
+}
+
+/// Simple class name → the source files that may declare it, built from **one**
+/// `find_files` call instead of one per type.
+///
+/// The scanner used to ask the host for `**/{name}.java` and `**/{name}.kt` for
+/// every DTO it reached — up to `TYPE_BUDGET` × 2 project-wide walks, each a
+/// synchronous host call. On a few hundred controllers that alone spent most of
+/// the host's five-second limit. Matching by file name is exactly what
+/// `find_files("**/{name}.java")` did, so the candidate set is the same; only
+/// the number of round trips changes.
+#[derive(Default)]
+struct TypeIndex {
+    /// File stem → paths, in the order `find_files` returned them.
+    java: HashMap<String, Vec<String>>,
+    kotlin: HashMap<String, Vec<String>>,
+    /// Names already looked for in the sources and not found. A miss costs one
+    /// `search_text`, and asking twice for the same absent type would pay it
+    /// again.
+    missed: HashSet<String>,
+}
+
+impl TypeIndex {
+    fn build(project: &Project, options: &Options) -> TypeIndex {
+        let limit = options.file_limit.max(1);
+        let java = index_of(project.find_files("**/*.java", limit).unwrap_or_default());
+        let kotlin = if options.include_kotlin {
+            index_of(project.find_files("**/*.kt", limit).unwrap_or_default())
+        } else {
+            HashMap::new()
+        };
+        TypeIndex { java, kotlin, missed: HashSet::new() }
+    }
+
+    /// The candidate files for `name`, Java first. Empty means the index has
+    /// nothing, and the caller should fall back to searching for the
+    /// declaration (some projects keep a class away from its file name).
+    fn candidates(&self, name: &str) -> Vec<String> {
+        let mut out: Vec<String> = self.java.get(name).cloned().unwrap_or_default();
+        out.extend(self.kotlin.get(name).cloned().unwrap_or_default());
+        out
+    }
+}
+
+/// Groups paths by file stem, skipping the directories a scan never parses.
+fn index_of(paths: Vec<String>) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for path in paths {
+        let Some(stem) = path
+            .rsplit(['/', '\\'])
+            .next()
+            .and_then(|file| file.strip_suffix(".java").or_else(|| file.strip_suffix(".kt")))
+        else {
+            continue;
+        };
+        out.entry(stem.to_owned()).or_default().push(path);
+    }
+    out
 }
 
 /// The DTO graph. Fields and declared type parameters travel together because
@@ -69,6 +137,13 @@ pub struct ScanResult {
 
 /// Scans the project for controller routes.
 pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
+    let started = std::time::Instant::now();
+    // One wall-clock deadline for the whole scan. `Options::default()` leaves it
+    // off; the plugin's entry points set it below the host's own limit. See
+    // `Options::budget` for why overrunning is worse than returning less.
+    let deadline = options.budget.map(|budget| started + budget);
+    let out_of_time = || deadline.is_some_and(|at| std::time::Instant::now() >= at);
+
     let mut include = vec!["**/*.java".to_owned()];
     if options.include_kotlin {
         include.push("**/*.kt".to_owned());
@@ -94,6 +169,11 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
     }
     paths.sort();
 
+    // Built before any type lookup: one project-wide `find_files` per language
+    // instead of one per type. The DTO closure is what makes this matter — it
+    // used to issue two walks for each of `TYPE_BUDGET` types.
+    let mut types = TypeIndex::build(project, options);
+
     let mut endpoints: Vec<Endpoint> = Vec::new();
     let mut classes: HashMap<String, (Vec<String>, Vec<spring::Field>)> = HashMap::new();
     let mut sources: HashMap<String, String> = HashMap::new();
@@ -105,8 +185,13 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
     // before any endpoint is built (a second pass over the sources).
     let mut parsed: Vec<(String, String, spring::FileModel)> = Vec::new();
     let mut constants = Consts::default();
+    let mut stopped_early = false;
 
     for path in &paths {
+        if out_of_time() {
+            stopped_early = true;
+            break;
+        }
         let src = match project.read_file(path) {
             Ok(s) => s,
             Err(_) => continue,
@@ -130,10 +215,14 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
     }
 
     for (path, src, mut model) in parsed {
+        if out_of_time() {
+            stopped_early = true;
+            break;
+        }
         // `@PostMapping(RouteConstant.ITEM_QUERY)` names the route instead of
         // writing it, so the constant is substituted before the routes are
         // built; otherwise every method of the controller shares path `/`.
-        constants.resolve_in(project, options, &mut model);
+        constants.resolve_in(project, options, &mut types, &mut model);
         let lexed = lex(&src);
         let mut index = LineIndex::new(&src);
         for raw in spring::endpoints(&model, &src) {
@@ -179,10 +268,15 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
     endpoints.sort_by(|a, b| a.path.cmp(&b.path).then(a.method.cmp(&b.method)));
     endpoints.dedup_by(|a, b| a.key() == b.key() && a.class_name == b.class_name);
 
-    let dto = if options.resolve_dto {
+    let dto = if options.resolve_dto && !out_of_time() {
         let mut deps = crate::deps::Deps::new(options.deps.clone());
-        resolve_dtos(project, options, &endpoints, &classes, &sources, &mut deps, &hints)
+        resolve_dtos(project, options, &mut types, &endpoints, &classes, &sources, &mut deps, &hints, deadline)
     } else {
+        if options.resolve_dto {
+            // No time left for the DTO closure: report the routes found so far
+            // rather than losing the whole scan to the host's trap.
+            stopped_early = true;
+        }
         DtoIndex::default()
     };
 
@@ -190,7 +284,7 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
         endpoints,
         dto,
         files,
-        truncated: found.limit_hit || paths.len() as u32 >= limit,
+        truncated: found.limit_hit || paths.len() as u32 >= limit || stopped_early,
     })
 }
 
@@ -271,7 +365,7 @@ impl Consts {
     }
 
     /// Substitutes constants in every mapping annotation of `model`.
-    fn resolve_in(&mut self, project: &Project, options: &Options, model: &mut spring::FileModel) {
+    fn resolve_in(&mut self, project: &Project, options: &Options, index: &mut TypeIndex, model: &mut spring::FileModel) {
         let imports = model.imports.clone();
         let package = model.package.clone();
         for class in &mut model.classes {
@@ -282,9 +376,9 @@ impl Consts {
             } else {
                 format!("{package}.{}", class.name)
             };
-            resolve_anns(self, project, options, &imports, &mut class.anns, Some(&owner));
+            resolve_anns(self, project, options, index, &imports, &mut class.anns, Some(&owner));
             for method in &mut class.methods {
-                resolve_anns(self, project, options, &imports, &mut method.anns, Some(&owner));
+                resolve_anns(self, project, options, index, &imports, &mut method.anns, Some(&owner));
             }
         }
     }
@@ -296,6 +390,7 @@ impl Consts {
         &mut self,
         project: &Project,
         options: &Options,
+        index: &mut TypeIndex,
         idents: &[String],
         imports: &[String],
         owner: Option<&str>,
@@ -306,7 +401,7 @@ impl Consts {
             // names the declaring class, so only that class' constant may
             // answer.
             let qualifier = idents[..idents.len() - 1].join(".");
-            return self.qualified_class(project, options, &qualifier, name, imports, owner);
+            return self.qualified_class(project, options, index, &qualifier, name, imports, owner);
         }
         // `ITEM_QUERY` on its own: the enclosing class first, then a static
         // import, then a name only one class declares.
@@ -316,7 +411,7 @@ impl Consts {
             return Some(value.clone());
         }
         for owner in static_import_owners(imports, name) {
-            if let Some(value) = self.qualified_class(project, options, &owner, name, imports, None) {
+            if let Some(value) = self.qualified_class(project, options, index, &owner, name, imports, None) {
                 return Some(value);
             }
         }
@@ -328,10 +423,12 @@ impl Consts {
 
     /// Resolves a class name as it appears in an annotation (`Routes`,
     /// `com.a.Routes`, `R.Constants`) to the value of `NAME` in that class.
+    #[allow(clippy::too_many_arguments)]
     fn qualified_class(
         &mut self,
         project: &Project,
         options: &Options,
+        index: &mut TypeIndex,
         qualifier: &str,
         name: &str,
         imports: &[String],
@@ -342,7 +439,7 @@ impl Consts {
             if tried.contains(&class) {
                 continue;
             }
-            if let Some(value) = self.value_of(project, options, &class, name, imports) {
+            if let Some(value) = self.value_of(project, options, index, &class, name, imports) {
                 return Some(value);
             }
             tried.push(class);
@@ -423,6 +520,7 @@ impl Consts {
         &mut self,
         project: &Project,
         options: &Options,
+        index: &mut TypeIndex,
         class: &str,
         name: &str,
         imports: &[String],
@@ -441,7 +539,7 @@ impl Consts {
         for candidate in [simple, outer] {
             // `com.a.Routes` must not be read out of `com/b/Routes.java`: the
             // package decides which file is meant.
-            let Some(model) = load_source_for(project, options, candidate, class, imports) else { continue };
+            let Some(model) = load_source_for(project, options, index, candidate, class, imports) else { continue };
             self.absorb(&model);
             if let Some(value) = self.values.get(&key) {
                 return Some(value.clone());
@@ -482,6 +580,7 @@ fn resolve_anns(
     consts: &mut Consts,
     project: &Project,
     options: &Options,
+    index: &mut TypeIndex,
     imports: &[String],
     anns: &mut [spring::Ann],
     class: Option<&str>,
@@ -493,7 +592,7 @@ fn resolve_anns(
             if !arg.strings.is_empty() || arg.idents.is_empty() {
                 continue;
             }
-            if let Some(value) = consts.lookup(project, options, &arg.idents, imports, class) {
+            if let Some(value) = consts.lookup(project, options, index, &arg.idents, imports, class) {
                 arg.strings.push(value);
             }
         }
@@ -506,13 +605,20 @@ fn resolve_anns(
 fn load_source_for(
     project: &Project,
     options: &Options,
+    index: &mut TypeIndex,
     name: &str,
     class: &str,
     imports: &[String],
 ) -> Option<spring::FileModel> {
-    let mut candidates: Vec<String> = project.find_files(&format!("**/{name}.java"), 3).unwrap_or_default();
-    if options.include_kotlin {
-        candidates.extend(project.find_files(&format!("**/{name}.kt"), 3).unwrap_or_default());
+    let mut candidates = index.candidates(name);
+    if candidates.is_empty() {
+        // The route-constant class is never among the scanned controllers (it
+        // declares no mapping), so a miss here is normal — remember it so a
+        // qualifier that cannot be resolved is not searched for again.
+        if !index.missed.insert(name.to_owned()) {
+            return None;
+        }
+        candidates = declaration_candidates(project, options, name);
     }
     // The class' directory is the part before the simple name:
     // `com.a.Routes` → `com/a`, `Outer.Inner` → nothing to match on.
@@ -554,14 +660,17 @@ fn load_source_for(
 }
 
 /// Loads every type the endpoints mention, then every type those mention.
+#[allow(clippy::too_many_arguments)]
 fn resolve_dtos(
     project: &Project,
     options: &Options,
+    types: &mut TypeIndex,
     endpoints: &[Endpoint],
     classes: &HashMap<String, (Vec<String>, Vec<spring::Field>)>,
     sources: &HashMap<String, String>,
     deps: &mut crate::deps::Deps,
     hints: &HashMap<String, String>,
+    deadline: Option<std::time::Instant>,
 ) -> DtoIndex {
     let mut queue: Vec<String> = Vec::new();
     for endpoint in endpoints {
@@ -575,6 +684,11 @@ fn resolve_dtos(
     let mut tried: HashSet<String> = HashSet::new();
     let mut budget = TYPE_BUDGET;
     while let Some(name) = queue.pop() {
+        // The closure is the most expensive stage; stopping here keeps the
+        // routes that were already found instead of losing the whole call.
+        if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            break;
+        }
         if !tried.insert(name.clone()) {
             continue;
         }
@@ -584,7 +698,7 @@ fn resolve_dtos(
         budget -= 1;
         let found = match classes.get(&name) {
             Some(hit) => Some(hit.clone()),
-            None => load_class(project, options, &name, sources)
+            None => load_class(project, options, types, &name, sources)
                 .or_else(|| deps.fields(project, &name, hints.get(&name).map(String::as_str))),
         };
         let Some((params, fields)) = found else { continue };
@@ -651,37 +765,47 @@ fn push_names(ty: &str, out: &mut Vec<String>) {
     }
 }
 
+/// The declaration search a class away from its file name falls back to.
+fn declaration_candidates(project: &Project, options: &Options, name: &str) -> Vec<String> {
+    let query = TextQuery {
+        pattern: format!(r"(class|interface|record)\s+{name}\b"),
+        regex: true,
+        include: if options.include_kotlin {
+            vec!["**/*.java".to_owned(), "**/*.kt".to_owned()]
+        } else {
+            vec!["**/*.java".to_owned()]
+        },
+        ..TextQuery::default()
+    };
+    let mut out = Vec::new();
+    if let Ok(found) = project.search_text(&query, 8) {
+        let mut seen = HashSet::new();
+        for hit in found.matches {
+            if seen.insert(hit.location.path.clone()) {
+                out.push(hit.location.path);
+            }
+        }
+    }
+    out
+}
+
 fn load_class(
     project: &Project,
     options: &Options,
+    index: &mut TypeIndex,
     name: &str,
     sources: &HashMap<String, String>,
 ) -> Option<(Vec<String>, Vec<spring::Field>)> {
-    let mut candidates: Vec<String> = project.find_files(&format!("**/{name}.java"), 3).unwrap_or_default();
-    if options.include_kotlin {
-        candidates.extend(project.find_files(&format!("**/{name}.kt"), 3).unwrap_or_default());
-    }
+    let mut candidates = index.candidates(name);
     if candidates.is_empty() {
         // Some projects keep a class away from its file name; search for the
-        // declaration instead of guessing a path.
-        let query = TextQuery {
-            pattern: format!(r"(class|interface|record)\s+{name}\b"),
-            regex: true,
-            include: if options.include_kotlin {
-                vec!["**/*.java".to_owned(), "**/*.kt".to_owned()]
-            } else {
-                vec!["**/*.java".to_owned()]
-            },
-            ..TextQuery::default()
-        };
-        if let Ok(found) = project.search_text(&query, 8) {
-            let mut seen = HashSet::new();
-            for hit in found.matches {
-                if seen.insert(hit.location.path.clone()) {
-                    candidates.push(hit.location.path);
-                }
-            }
+        // declaration instead of guessing a path. The miss is remembered, so a
+        // type that genuinely does not exist costs one search, not one per
+        // endpoint that mentions it.
+        if !index.missed.insert(name.to_owned()) {
+            return None;
         }
+        candidates = declaration_candidates(project, options, name);
     }
     for path in candidates {
         let src = match sources.get(&path) {
