@@ -106,6 +106,18 @@ pub const SYNC_LEFT_TOOLTIP: Text = Text::new(
 pub const BACKGROUND_DONE: Text =
     Text::new("Background sync finished; every endpoint is synced.", "后台续传完成，接口已全部同步。");
 
+/// Export refused because the DTO graph never finished.
+///
+/// OpenIDEA limits one call to five seconds and the scan has to cut the DTO
+/// closure short to stay inside it. The routes are still good, but schemas
+/// built from a partial graph lose fields — and a document that has been saved
+/// without them replaces the correct one on the server. Refusing is the only
+/// outcome that does not silently damage the project's API documents.
+pub const DTO_INCOMPLETE: Text = Text::new(
+    "The DTO types were not fully resolved within the 5-second limit, so nothing was exported; the server's documents are unchanged. Retry, or raise the timeout by scanning a smaller scope (export the current file or folder).",
+    "未能在 5 秒限时内解析完 DTO 类型，因此没有导出，服务器上的接口文档保持不变。可以重试，或用「导出当前文件/目录」缩小范围后再导出。",
+);
+
 /// The token the queue was built with differs from the one in the settings.
 pub fn queue_other_token() -> String {
     Text::new("The export queue was built with another personal token", "导出队列用的是另一个个人令牌")
@@ -344,6 +356,7 @@ mod tests {
             CONTINUE_NOW,
             SYNC_LEFT_TOOLTIP,
             BACKGROUND_DONE,
+            DTO_INCOMPLETE,
             YAPI_SET_SERVER,
             YAPI_SET_TOKEN,
             YAPI_TOKEN_REJECTED,

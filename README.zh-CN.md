@@ -281,6 +281,12 @@ required = ["project.read", "storage", "net:api.example.com"]   # HTTPS
 - **5 秒命令预算**：扫描和导出都按这个上限设计。导出分批发送；扫描在 4.2 秒处收手
   （endpoints provider 是 1.5 秒），没收完就返回已找到的部分并提示结果可能不全，而不是被宿主掐掉。
   超大项目另外会命中文本搜索上限。
+- **DTO 解析没跑完时不导出**：路由列表不完整只是显示问题，可以退化成「接口少几条」；DTO 图不完整则是
+  另一种性质——按不完整的图生成的 Schema 会缺字段，而导出是按 `method + path` 更新已有接口的，发出去
+  就会把服务器上原本正确的文档覆盖成更差的一份，并且还报告「已全部同步」。所以 DTO 闭包因为 4.2 秒预算
+  没跑完时（`ScanResult::dto_complete` 为 false），导出会直接拒绝、一条请求都不发，并说明原因；这份
+  不完整结果也不会写进完整扫描缓存，重试会重新扫描而不是复用残缺的图。仪表盘只看路由，不受影响。
+  想绕开就缩小范围（导出当前文件或目录），或重试一次。
 - **诊断级别的位置**：接口位置取注解所在行列（0-based 行、UTF-16 列），用于跳转，不做语法高亮。
 - **不做 mock 运行时**：没有 JVM agent，只在源码层面对齐。
 
@@ -303,7 +309,7 @@ required = ["project.read", "storage", "net:api.example.com"]   # HTTPS
 ## 测试
 
 ```sh
-cargo test                      # 109 个用例：解析、Schema、ZIP/class、POM、路由常量、类型索引、扫描预算、YApi 编码、队列、i18n，以及端到端链路
+cargo test                      # 115 个用例：解析、Schema、ZIP/class、POM、路由常量、类型索引、扫描预算、DTO 超时不导出、YApi 编码、队列、i18n，以及端到端链路
 node script/check-pages.mjs     # 仪表盘在两种语言下的真实渲染（cargo test 跑不了 JS）
 pwsh script/package.ps1         # 重建组件并打包（含 icons/ 与 locales/）
 ```

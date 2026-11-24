@@ -57,6 +57,15 @@ pub struct ApiMocktle {
     cache: HashMap<String, Rc<ScanResult>>,
     /// Routes only, for the endpoints provider and its 2-second budget.
     routes: HashMap<String, Rc<ScanResult>>,
+    /// Overrides `SCAN_BUDGET`, for tests that need the DTO pass to run out of
+    /// time on purpose. `None` in production; not a plugin setting.
+    ///
+    /// This is not `#[cfg(test)]` on purpose: `tests/` links the library as a
+    /// normal dependency, where `cfg(test)` is off, so a test-gated field would
+    /// be invisible to exactly the integration test that needs it. The entry
+    /// point that sets it carries `#[doc(hidden)]` and the shipped wasm build
+    /// never calls it.
+    scan_budget_override: Option<Duration>,
 }
 
 struct Config {
@@ -97,6 +106,15 @@ fn scan_options() -> scan::Options {
         budget: Some(SCAN_BUDGET),
         ..scan::Options::default()
     }
+}
+
+/// `scan_options`, with the scan deadline replaced.
+///
+/// Production always uses `SCAN_BUDGET`; the tests that pin the DTO-deadline
+/// refusal need to place the expiry inside the closure, which they can only do
+/// by moving the deadline.
+fn scan_options_with_budget(budget: Duration) -> scan::Options {
+    scan::Options { budget: Some(budget), ..scan_options() }
 }
 
 /// Routes only: no DTO resolution, fewer candidate files.
@@ -231,6 +249,11 @@ fn target_path(ctx: &Invocation, arg: Option<&str>) -> Option<String> {
 }
 
 impl ApiMocktle {
+    /// The scan deadline in force: `SCAN_BUDGET`, unless a test overrode it.
+    fn scan_budget(&self) -> Duration {
+        self.scan_budget_override.unwrap_or(SCAN_BUDGET)
+    }
+
     fn scan(&mut self, project: &Project) -> Result<Rc<ScanResult>, Error> {
         let root = project.root()?;
         if let Some(hit) = self.cache.get(&root) {
@@ -239,7 +262,8 @@ impl ApiMocktle {
         // A route-only scan may already be cached (the dashboard ran first).
         // Its endpoints are already correct, but its `dto` is empty, and export
         // needs the graph — so it cannot be reused as the full result.
-        let result = Rc::new(scan::scan(project, &scan_options())?);
+        let budget = self.scan_budget();
+        let result = Rc::new(scan::scan(project, &scan_options_with_budget(budget))?);
         host::log(
             LogLevel::Info,
             &format!(
@@ -250,9 +274,24 @@ impl ApiMocktle {
                 if result.truncated { "（已达搜索上限）" } else { "" }
             ),
         );
-        self.cache.insert(root.clone(), result.clone());
-        // The route-only entry is now redundant: `scan()` prefers `cache`.
-        self.routes.remove(&root);
+        // A partial DTO graph is never cached as the full result: it would be
+        // handed to every later export in this session. The route list stays
+        // correct, so it is kept for display, and the next call retries the
+        // closure from scratch.
+        if result.dto_complete {
+            self.cache.insert(root.clone(), result.clone());
+            // The route-only entry is now redundant: `scan()` prefers `cache`.
+            self.routes.remove(&root);
+        } else {
+            host::log(
+                LogLevel::Warn,
+                &format!(
+                    "ApiMocktle: DTO 解析未完成（{} 个类型），本次结果不写入缓存，导出会重新扫描",
+                    result.dto.fields.len()
+                ),
+            );
+            self.routes.insert(root, result.clone());
+        }
         Ok(result)
     }
 
@@ -308,6 +347,21 @@ impl ApiMocktle {
             ctx.project().ok_or_else(|| Error::Failed(i18n::OPEN_A_PROJECT.get(i18n::lang()).into()))?;
         let cfg = config()?;
         let scanned = self.scan(&project)?;
+        // A truncated DTO graph would produce schemas with missing fields, and
+        // `save_api` updates the existing document by `method + path` — so
+        // sending it would replace a correct document with a poorer one, then
+        // report success. Refuse before any request goes out.
+        if !scanned.dto_complete {
+            host::log(
+                LogLevel::Warn,
+                &format!(
+                    "ApiMocktle: 拒绝导出：DTO 解析未完成（已解析 {} 个类型，路由 {} 个）",
+                    scanned.dto.fields.len(),
+                    scanned.endpoints.len()
+                ),
+            );
+            return Err(Error::Failed(i18n::DTO_INCOMPLETE.get(i18n::lang()).into()));
+        }
         let picked: Vec<&Endpoint> = scanned
             .endpoints
             .iter()
@@ -552,6 +606,23 @@ impl ApiMocktle {
             );
         }
         Ok(())
+    }
+
+    /// Runs an export command with a chosen scan deadline.
+    ///
+    /// The production entry points read `SCAN_BUDGET`, which no host setting can
+    /// change — so the integration test that pins the DTO-deadline refusal (it
+    /// has to make the closure miss its deadline while a complete scan still
+    /// succeeds) drives the command through this door instead.
+    #[doc(hidden)]
+    pub fn run_command_in_tests(
+        &mut self,
+        id: &str,
+        ctx: &Invocation,
+        scan_budget: Option<Duration>,
+    ) -> Result<String, Error> {
+        self.scan_budget_override = scan_budget;
+        self.run_command(id, ctx, None)?.ok_or_else(|| Error::Failed("no text".into()))
     }
 }
 

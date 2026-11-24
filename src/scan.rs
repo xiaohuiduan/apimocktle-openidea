@@ -148,6 +148,14 @@ pub struct ScanResult {
     pub files: usize,
     /// The text search stopped at its limit, so some routes may be missing.
     pub truncated: bool,
+    /// The DTO closure finished, so `dto` describes every reachable type.
+    ///
+    /// `false` means the closure stopped on its deadline or its type budget and
+    /// the graph is partial: schemas built from it would silently lose fields.
+    /// `truncated` covers routes only, and a partial route list is still useful
+    /// for display — a partial DTO graph is not, because it is written to the
+    /// server as if it were the whole document. Export must refuse it.
+    pub dto_complete: bool,
 }
 
 /// Scans the project for controller routes.
@@ -283,16 +291,21 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
     endpoints.sort_by(|a, b| a.path.cmp(&b.path).then(a.method.cmp(&b.method)));
     endpoints.dedup_by(|a, b| a.key() == b.key() && a.class_name == b.class_name);
 
-    let dto = if options.resolve_dto && !out_of_time() {
+    // `resolve_dto: false` is a route-only scan by construction: it produces no
+    // DTO graph at all, so there is no partial graph to warn about. Export never
+    // uses those options, and `dto_complete` stays true so the dashboard's
+    // route-only results are not mistaken for damage.
+    let (dto, dto_complete) = if options.resolve_dto && !out_of_time() {
         let mut deps = crate::deps::Deps::new(options.deps.clone());
         resolve_dtos(project, options, &mut types, &endpoints, &classes, &sources, &mut deps, &hints, deadline)
+    } else if options.resolve_dto {
+        // No time left for the DTO closure: report the routes found so far
+        // rather than losing the whole scan to the host's trap. The graph is
+        // empty, which is the most partial it can be.
+        stopped_early = true;
+        (DtoIndex::default(), false)
     } else {
-        if options.resolve_dto {
-            // No time left for the DTO closure: report the routes found so far
-            // rather than losing the whole scan to the host's trap.
-            stopped_early = true;
-        }
-        DtoIndex::default()
+        (DtoIndex::default(), true)
     };
 
     Ok(ScanResult {
@@ -300,6 +313,7 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
         dto,
         files,
         truncated: found.limit_hit || paths.len() as u32 >= limit || stopped_early,
+        dto_complete,
     })
 }
 
@@ -675,7 +689,11 @@ fn load_source_for(
     None
 }
 
-/// Loads every type the endpoints mention, then every type those mention.
+/// Resolves the DTO closure and reports whether it finished.
+///
+/// The `bool` is `false` when the loop stopped on the deadline or ran out of
+/// `TYPE_BUDGET` while types were still queued: the returned graph is then
+/// partial and must not be exported as a complete document.
 #[allow(clippy::too_many_arguments)]
 fn resolve_dtos(
     project: &Project,
@@ -687,7 +705,7 @@ fn resolve_dtos(
     deps: &mut crate::deps::Deps,
     hints: &HashMap<String, String>,
     deadline: Option<std::time::Instant>,
-) -> DtoIndex {
+) -> (DtoIndex, bool) {
     let mut queue: Vec<String> = Vec::new();
     for endpoint in endpoints {
         if let Some(ty) = &endpoint.body_type {
@@ -699,16 +717,21 @@ fn resolve_dtos(
     let mut dto = DtoIndex::default();
     let mut tried: HashSet<String> = HashSet::new();
     let mut budget = TYPE_BUDGET;
+    let mut complete = true;
     while let Some(name) = queue.pop() {
         // The closure is the most expensive stage; stopping here keeps the
-        // routes that were already found instead of losing the whole call.
+        // routes that were already found instead of losing the whole call. The
+        // caller must still know the graph is partial, so this is reported back
+        // instead of being swallowed.
         if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            complete = false;
             break;
         }
         if !tried.insert(name.clone()) {
             continue;
         }
         if budget == 0 {
+            complete = false;
             break;
         }
         budget -= 1;
@@ -734,7 +757,7 @@ fn resolve_dtos(
         dto.params.insert(name.clone(), params);
         dto.fields.insert(name, specs);
     }
-    dto
+    (dto, complete)
 }
 
 /// Fields that never reach the wire format.
@@ -842,6 +865,7 @@ pub fn to_json(result: &ScanResult) -> Value {
         "count": result.endpoints.len(),
         "files": result.files,
         "truncated": result.truncated,
+        "dtoComplete": result.dto_complete,
         "items": result.endpoints.iter().map(|e| serde_json::json!({
             "method": e.method.clone().unwrap_or_else(|| "ANY".into()),
             "path": e.path,

@@ -323,6 +323,14 @@ Rebuild and re-grant afterwards. This is the host's capability model, not a choi
 - **5-second command budget**: scanning and exporting are both designed around it. Exporting sends in batches;
   scanning stops itself at 4.2 s (1.5 s for the endpoints provider) and returns what it found with a "results may be
   incomplete" note, instead of being killed by the host. Very large projects also hit the text-search limit.
+- **No export when the DTO closure did not finish**: an incomplete route list is a display problem — a few endpoints
+  are simply missing. An incomplete DTO graph is different: schemas built from it lose fields, and export updates an
+  existing interface by `method + path`, so sending one would replace the server's correct document with a poorer
+  copy and still report "all endpoints synced". When the closure misses the 4.2 s budget
+  (`ScanResult::dto_complete` is false), export therefore refuses before a single request goes out and says why. The
+  partial result is also not cached as a complete scan, so a retry scans again instead of replaying the damaged
+  graph. The dashboard only reads routes and is unaffected. To get past it, narrow the scope (export the current
+  file or folder) or retry.
 - **Diagnostic-level positions**: an endpoint's position is the annotation's line and column (0-based line, UTF-16
   column), used for navigation only — there is no syntax highlighting.
 - **No mock runtime**: no JVM agent; the alignment is at the source level only.
@@ -346,7 +354,7 @@ Rebuild and re-grant afterwards. This is the host's capability model, not a choi
 ## Tests
 
 ```sh
-cargo test                      # 109 tests: parsing, schema, ZIP/class, POM, route constants, the type index, the scan budget, YApi encoding, queue, i18n, and the end-to-end path
+cargo test                      # 115 tests: parsing, schema, ZIP/class, POM, route constants, the type index, the scan budget, refusing an export on a DTO deadline, YApi encoding, queue, i18n, and the end-to-end path
 node script/check-pages.mjs     # the dashboard's real rendering in both languages (cargo test cannot run JS)
 pwsh script/package.ps1         # rebuild the component and pack it (including icons/ and locales/)
 ```
