@@ -333,24 +333,21 @@ impl ApiMocktle {
         Ok(result)
     }
 
-    /// Builds one export queue for the endpoints and sends its first batch.
-    /// `only_path` limits it to one file or folder.
-    fn start_export(
+    /// Scans for an export, refusing a partial DTO graph.
+    ///
+    /// Both export entry points need this: a schema built from a graph that
+    /// stopped on the deadline silently loses fields, and `save_api` *updates*
+    /// the existing document by `method + path`, so sending one would replace a
+    /// correct document with a poorer one and still report success. Refusing
+    /// before any request goes out is the only outcome that cannot damage the
+    /// project's API documents.
+    fn scan_for_export(
         &mut self,
         ctx: &Invocation,
-        only_path: Option<String>,
-        target: Option<String>,
-    ) -> Result<String, Error> {
-        // `Failed` rather than `Invalid`: these strings are shown to the user as
-        // written (`Display`), while `Invalid` would prefix them with "invalid: ".
+    ) -> Result<(std::rc::Rc<ScanResult>, Project), Error> {
         let project =
             ctx.project().ok_or_else(|| Error::Failed(i18n::OPEN_A_PROJECT.get(i18n::lang()).into()))?;
-        let cfg = config()?;
         let scanned = self.scan(&project)?;
-        // A truncated DTO graph would produce schemas with missing fields, and
-        // `save_api` updates the existing document by `method + path` — so
-        // sending it would replace a correct document with a poorer one, then
-        // report success. Refuse before any request goes out.
         if !scanned.dto_complete {
             host::log(
                 LogLevel::Warn,
@@ -362,6 +359,21 @@ impl ApiMocktle {
             );
             return Err(Error::Failed(i18n::DTO_INCOMPLETE.get(i18n::lang()).into()));
         }
+        Ok((scanned, project))
+    }
+
+    /// Builds one export queue for the endpoints and sends its first batch.
+    /// `only_path` limits it to one file or folder.
+    fn start_export(
+        &mut self,
+        ctx: &Invocation,
+        only_path: Option<String>,
+        target: Option<String>,
+    ) -> Result<String, Error> {
+        // `Failed` rather than `Invalid`: these strings are shown to the user as
+        // written (`Display`), while `Invalid` would prefix them with "invalid: ".
+        let cfg = config()?;
+        let (scanned, _project) = self.scan_for_export(ctx)?;
         let picked: Vec<&Endpoint> = scanned
             .endpoints
             .iter()
@@ -624,6 +636,24 @@ impl ApiMocktle {
         self.scan_budget_override = scan_budget;
         self.run_command(id, ctx, None)?.ok_or_else(|| Error::Failed("no text".into()))
     }
+
+    /// Delivers one dashboard message with a chosen scan deadline.
+    ///
+    /// The dashboard's own entry point (`ViewEvent::Message`) reports through a
+    /// toast and reads the production budget — so a test that needs the DTO pass
+    /// to run out of time while checking the page's outcome drives it through
+    /// this door instead. The page's payload is read back with
+    /// `MockHost::view_messages`, exactly as the other dashboard tests do.
+    #[doc(hidden)]
+    pub fn run_view_message_in_tests(
+        &mut self,
+        ctx: &Invocation,
+        message: &str,
+        scan_budget: Option<Duration>,
+    ) -> Result<(), Error> {
+        self.scan_budget_override = scan_budget;
+        self.handle(VIEW, ViewEvent::Message(message.to_owned()), ctx)
+    }
 }
 
 impl Plugin for ApiMocktle {
@@ -854,10 +884,10 @@ impl ApiMocktle {
     }
 
     fn export_one(&mut self, ctx: &Invocation, index: usize, target: Option<String>) -> Result<String, Error> {
-        let project = ctx
-            .project()
-            .ok_or_else(|| Error::Failed(i18n::OPEN_A_PROJECT.get(i18n::lang()).into()))?;
-        let scanned = self.scan(&project)?;
+        // The dashboard's per-endpoint sync writes the same documents
+        // `export-project` does, so it needs the same refusal: a partial graph
+        // here would overwrite one correct document with a poorer one.
+        let (scanned, _project) = self.scan_for_export(ctx)?;
         let endpoint = scanned
             .endpoints
             .get(index)

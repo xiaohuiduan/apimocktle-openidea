@@ -339,3 +339,83 @@ fn a_complete_graph_exports_and_keeps_the_nested_field() {
         "the nested field survived: {response}"
     );
 }
+
+#[test]
+fn export_one_also_refuses_a_partial_dto_graph() {
+    // The dashboard's per-endpoint sync reaches `export_one`, which writes the
+    // same documents `export-project` does. It used to call `scan()` directly
+    // and skip the completeness check, so a partial graph could overwrite one
+    // correct document from a channel the project-wide guard never covered.
+    let pause = Duration::from_millis(120);
+    let (host, requests) = host(pause);
+    let mut plugin = ApiMocktle::default();
+
+    plugin
+        .run_view_message_in_tests(
+            &host.invocation(),
+            &serde_json::json!({ "op": "export-one", "index": 0 }).to_string(),
+            Some(dto_phase_budget(pause)),
+        )
+        .expect("the view event itself must not fail");
+
+    // The page is told through a toast, so that is where the refusal shows up.
+    let toasts: Vec<serde_json::Value> = host
+        .view_messages()
+        .into_iter()
+        .filter_map(|(_, payload)| serde_json::from_str::<serde_json::Value>(&payload).ok())
+        .filter(|v| v["op"] == "toast")
+        .collect();
+    let toast = toasts.last().expect("the page was told the outcome");
+    assert_eq!(toast["ok"], false, "the sync did not succeed: {toast}");
+    let text = toast["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("DTO") || text.contains("not fully resolved"),
+        "the message says why: {text}"
+    );
+
+    let sent = requests.borrow();
+    assert!(
+        !sent.iter().any(|r| r.url.contains("/api/interface/save")),
+        "nothing was written from a partial graph: {:?}",
+        sent.iter().map(|r| r.url.clone()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn export_one_exports_when_the_graph_is_complete() {
+    // The control: the per-endpoint path still works when the closure finishes,
+    // so the refusal above cannot be passing just because the path is broken.
+    let (host, requests) = host(Duration::ZERO);
+    let mut plugin = ApiMocktle::default();
+
+    plugin
+        .run_view_message_in_tests(
+            &host.invocation(),
+            &serde_json::json!({ "op": "export-one", "index": 0 }).to_string(),
+            None,
+        )
+        .expect("the view event itself must not fail");
+
+    let toasts: Vec<serde_json::Value> = host
+        .view_messages()
+        .into_iter()
+        .filter_map(|(_, payload)| serde_json::from_str::<serde_json::Value>(&payload).ok())
+        .filter(|v| v["op"] == "toast")
+        .collect();
+    let toast = toasts.last().expect("the page was told the outcome");
+    assert_eq!(toast["ok"], true, "the sync succeeded: {toast}");
+
+    let saved = requests.borrow();
+    let save = saved
+        .iter()
+        .find(|r| r.url.contains("/api/interface/save"))
+        .expect("the document was written");
+    let doc: serde_json::Value =
+        serde_json::from_slice(save.body.as_ref().expect("a body")).expect("valid json");
+    let response: serde_json::Value =
+        serde_json::from_str(doc["res_body"].as_str().expect("a schema")).expect("valid schema");
+    assert_eq!(
+        response["properties"]["detail"]["properties"]["message"]["type"], "string",
+        "the nested field survived: {response}"
+    );
+}
