@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.8"
+version = "0.3.9"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.8 — 补完 import 优先级的另一半：同包类型与控制器在同一个文件里时仍会被抢先。上一版把解析顺序改成「成员类型 → 单类型 import → 同包」，但扫描侧的 scoped_lookup 用 first 标志做边界，第一次向外时 first 还是 true，守卫不生效，于是走到了包、命中同包类型；另外 scoped 落空后还有个全局 class_lookup 会再命中一次。两处都只在独立 DTO 文件时侥幸通过，同文件声明就会暴露。现在 scoped_lookup 与 resolve_in 用完全相同的边界（到包为止），且当该文件明确 import 了这个名字时，同包回退和全局查找都跳过，只按 import 的包解析。验证：三文件场景下 AController 用 com.alpha.Payload（alpha）、BController 用同文件的 com.web.Payload（beta），请求与响应都正确；150 个用例全绿，yudao 实测 3603 接口 / 1663 DTO 无回归；两个修复各自反向验证，去掉任一个对应用例立刻失败。"
+change-notes = "0.3.9 — 修全限定类型名被作用域覆盖。字段或参数直接写 com.alpha.Payload 时，本该就是那个类型（全限定名由语法指定，与作用域规则无关），但解析时先把名字压成简单名 Payload、限定信息丢失，随后按作用域解析命中了同包的 com.web.Payload。@RequestBody 参数同样受影响。这类代码合法且无歧义，错的 schema 会覆盖服务器上正确的文档。现在队列携带显式限定名，解析时优先按它取类；通配符 import（import com.alpha.*）不享有这个优先级——按 Java 规范它排在同包类型之后。新增 5 个用例覆盖字段/参数/泛型实参的全限定写法与通配符 import，155 个用例全绿，yudao 实测 3603 接口 / 1663 DTO 无回归。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

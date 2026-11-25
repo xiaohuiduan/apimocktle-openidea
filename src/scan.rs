@@ -1241,7 +1241,9 @@ fn resolve_dtos(
             imports_of.insert(endpoint_scope(endpoint), table.clone());
         }
     }
-    let mut queue: Vec<(String, String)> = Vec::new();
+    // (simple name, scope it was written in, explicit qualifier when the source
+    // wrote one). A fully qualified reference is not subject to the scope walk.
+    let mut queue: Vec<(String, String, Option<String>)> = Vec::new();
     for endpoint in endpoints {
         let scope = endpoint_scope(endpoint);
         if let Some(ty) = &endpoint.body_type {
@@ -1262,7 +1264,7 @@ fn resolve_dtos(
     // the bar can stall, but never jump back, which is what "stuck at 80%" was.
     let mut peak_total = queue.len().max(1);
     let mut stop = None;
-    while let Some((name, scope)) = queue.pop() {
+    while let Some((name, scope, explicit)) = queue.pop() {
         // The closure is the most expensive stage; stopping here keeps the
         // routes that were already found instead of losing the whole call. The
         // caller must still know the graph is partial, so this is reported back
@@ -1279,7 +1281,14 @@ fn resolve_dtos(
         // than save a document built from the wrong type.
         // This endpoint's file says which package a bare name comes from; that is
         // the only thing that tells two same-named top-level types apart.
-        let imported_package = imports_of.get(&scope).and_then(|t| t.get(&name)).cloned();
+        // A dotted reference (`com.alpha.Payload`) names the type outright, so it
+        // outranks every scope rule and is used as given.
+        let explicit_package = explicit.as_ref().and_then(|raw| {
+            raw.rsplit_once('.').map(|(package, _)| package.to_owned())
+        });
+        let imported_package = explicit_package
+            .clone()
+            .or_else(|| imports_of.get(&scope).and_then(|t| t.get(&name)).cloned());
         // JLS 6.4.1, in the same order `DtoIndex::resolve_in` uses so the scan and
         // the schema agree: member types, then the file's single-type import, then a
         // type in the same package. A controller that imports `com.alpha.Payload`
@@ -1297,11 +1306,21 @@ fn resolve_dtos(
                 .and_then(|(package, _)| classes.get_key_value(&format!("{package}::{name}")))
                 .map(|(key, hit)| (key.clone(), hit.clone())),
         };
-        let scoped = scoped_lookup(classes, &scope, &name)
-            .or_else(|| imported_lookup(classes, imports_of.get(&scope), &name))
-            .or(same_package);
+        let scoped = match &explicit {
+            // `com.alpha.Payload` is not a simple name: resolve it directly.
+            Some(raw) => classes
+                .get_key_value(&raw.replace('.', "::"))
+                .map(|(key, hit)| (key.clone(), hit.clone())),
+            None => scoped_lookup(classes, &scope, &name)
+                .or_else(|| imported_lookup(classes, imports_of.get(&scope), &name))
+                .or(same_package),
+        };
         let identity = match &scoped {
             Some((qualified, _)) => qualified.clone(),
+            None if explicit.is_some() => explicit
+                .as_ref()
+                .map(|raw| raw.replace('.', "::"))
+                .unwrap_or_else(|| name.clone()),
             // With no table entry the import decides the type's identity, so two files
             // importing different same-named types are resolved separately. Without an
             // import the bare name is used, so one type reached from several endpoints
@@ -1321,9 +1340,11 @@ fn resolve_dtos(
         budget -= 1;
         // The endpoint's scope decides which declaration a bare name means, so the
         // scoped key is tried before the global one.
-        let global = match &imported_package {
-            Some(_) => None,
-            None => class_lookup(classes, &name),
+        let global = match (&imported_package, &explicit) {
+            // An import or a dotted reference decides; a bare-name search would
+            // override it with whichever type happens to be indexed.
+            (Some(_), _) | (_, Some(_)) => None,
+            (None, None) => class_lookup(classes, &name),
         };
         let found = match scoped.or(global) {
             // A controller from the class table: its file's imports were recorded
@@ -1626,11 +1647,20 @@ fn qualified_name(package: &str, class: &spring::Class) -> String {
     out
 }
 
-fn push_names(ty: &str, out: &mut Vec<(String, String)>, scope: &str) {
+fn push_names(ty: &str, out: &mut Vec<(String, String, Option<String>)>, scope: &str) {
     let (base, args) = split_type(ty);
-    let base = simple_name(&base);
-    if !base.is_empty() && base.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-        out.push((base, scope.to_owned()));
+    let raw = base.trim();
+    let simple = simple_name(raw);
+    if !simple.is_empty() && simple.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        // A dotted reference (`com.alpha.Payload`) is the source naming the exact
+        // type, so it is kept: dropping it to the simple name made a fully
+        // qualified field resolve against the enclosing package instead.
+        let explicit = if raw.contains('.') && !raw.starts_with('\'') {
+            Some(raw.to_owned())
+        } else {
+            None
+        };
+        out.push((simple, scope.to_owned(), explicit));
     }
     for arg in args {
         push_names(&arg, out, scope);
