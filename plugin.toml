@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.10"
+version = "0.3.11"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.10 — 修 Schema 阶段丢弃全限定名。上一版让扫描队列保留 com.alpha.Payload，但生成 Schema 时第一行就把点号后面的部分截掉、只剩 Payload，交给 resolver 时限定信息已丢失，于是按作用域规则选中了同包的 com.web.Payload。这个问题只在两个同名 DTO 都可达时暴露：只导出其中一个时恰好是唯一候选，看起来正常。现在 Schema 阶段保留原始写法，简单名只用于判断内建类型；resolver 收到带点的名字时直接按精确身份解析（包名保留点号，只有最后一段转成 ::）。新增 3 个用例覆盖请求/响应全限定、经字段持有、泛型实参三种路径；158 个用例全绿，yudao 实测 3603 接口 / 1663 DTO 无回归。"
+change-notes = "0.3.11 — 修全限定嵌套类解析。com.acme.Outer.Inner 这种写法（真实工程常见，如 MidjourneyApi.Notify 做 @RequestBody）之前解析成空 schema：一是按简单名 Inner 查不到文件（它声明在 Outer.java 里），二是身份算成了 com.acme::Inner 而非 com.acme::Outer::Inner。现在从限定名取出外部类名定位文件，并保留外部类身份拼出正确限定名；resolve_in 的带点分支也改成尝试每个包边界，多层嵌套才对得上。验证：yudao 的 DTO 类型从 1663 增加到 1694（+31），接口数 3603 不变；160 个用例全绿。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

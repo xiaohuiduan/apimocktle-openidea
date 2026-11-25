@@ -161,6 +161,20 @@ impl TypeIndex {
     /// The candidate files for `name`, Java first. Empty means the index has
     /// nothing, and the caller should fall back to looking for the declaration
     /// (some projects keep a class away from its file name).
+    /// The path of the file whose stem is `stem`, when exactly one exists.
+    ///
+    /// A nested type is declared in the file named after its outermost class, so
+    /// this is how `com.acme.Outer.Inner` reaches `Outer.java` after the simple
+    /// name `Inner` produced no candidates.
+    fn file_named(&self, stem: &str) -> Option<String> {
+        let mut hits = self.java.get(stem).into_iter().flatten();
+        let first = hits.next()?;
+        if hits.next().is_some() {
+            return None;
+        }
+        Some(first.clone())
+    }
+
     fn candidates(&self, name: &str) -> Vec<String> {
         let mut out: Vec<String> = self.java.get(name).cloned().unwrap_or_default();
         out.extend(self.kotlin.get(name).cloned().unwrap_or_default());
@@ -359,17 +373,22 @@ impl DtoIndex {
         // syntax, so it outranks every scope rule. It used to be reduced to the
         // simple name before it reached here, which let a same-named type in the
         // endpoint's package win.
-        if name.contains('.') && let Some((package, type_name)) = name.rsplit_once('.') {
-            let key = format!("{package}::{type_name}");
-            // The last segment may itself be a nested type (`a.b.Outer.Inner`),
-            // which the scan stores as `a.b::Outer::Inner`; try the whole path and
-            // then each split point from the right.
-            if let Some(fields) = self.scopes.get(&key) {
-                return Some(ResolvedClass {
-                    params: self.scope_params.get(&key).cloned().unwrap_or_default(),
-                    fields: fields.clone(),
-                    qualified: key,
-                });
+        if name.contains('.') {
+            // `a.b.C` is `a.b::C`; `a.b.Outer.Inner` is `a.b::Outer::Inner`. The
+            // package keeps its dots, so try every point where the package ends:
+            // the scan stores exactly one of these keys.
+            let segments: Vec<&str> = name.split('.').collect();
+            for at in (1..segments.len()).rev() {
+                let package = segments[..at].join(".");
+                let rest = segments[at..].join("::");
+                let key = format!("{package}::{rest}");
+                if let Some(fields) = self.scopes.get(&key) {
+                    return Some(ResolvedClass {
+                        params: self.scope_params.get(&key).cloned().unwrap_or_default(),
+                        fields: fields.clone(),
+                        qualified: key,
+                    });
+                }
             }
             return None;
         }
@@ -1374,8 +1393,8 @@ fn resolve_dtos(
                     None => scope.clone(),
                 };
                 load_class(project, options, types, &name, &lookup_scope, sources)
-                    .map(|(path, params, fields, imports)| {
-                        (package_of_path(&path, &name), (params, fields), imports)
+                    .map(|(path, outer, params, fields, imports)| {
+                        (package_of_path(&path, &name, &outer), (params, fields), imports)
                     })
                     .or_else(|| {
                         deps.fields(project, &name, imported_package.as_deref())
@@ -1562,6 +1581,7 @@ type ClassEntry = (Vec<String>, Vec<spring::Field>);
 /// resolve against).
 type LoadedClass = (
     String,
+    String,
     Vec<String>,
     Vec<spring::Field>,
     HashMap<String, String>,
@@ -1608,7 +1628,7 @@ fn class_lookup(classes: &HashMap<String, ClassEntry>, name: &str) -> Option<(St
 /// yields `com.alpha::Payload`. Running past the root instead would make the
 /// project directory part of every package name, and then no scope would ever
 /// match.
-fn package_of_path(path: &str, name: &str) -> String {
+fn package_of_path(path: &str, name: &str, outer: &str) -> String {
     let normalised = path.replace('\\', "/");
     let segments: Vec<&str> = normalised.split('/').collect();
     // The package starts after the last `java`/`kotlin` source root, or after
@@ -1625,6 +1645,9 @@ fn package_of_path(path: &str, name: &str) -> String {
             .collect(),
         None => Vec::new(),
     };
+    if !outer.is_empty() {
+        return format!("{}::{outer}::{name}", package.join("."));
+    }
     if package.is_empty() {
         return name.to_owned();
     }
@@ -1782,7 +1805,21 @@ fn load_class(
     scope: &str,
     sources: &HashMap<String, String>,
 ) -> Option<LoadedClass> {
-    let mut candidates = index.candidates(name);
+    // A nested type lives in the file named after its outermost class:
+    // `com.acme.Outer.Inner` is declared in `Outer.java`, so the file index
+    // (keyed by simple name) cannot answer `Inner`. The qualifier says which file
+    // to read, so it is offered as an extra candidate ahead of the index hits.
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some((package, rest)) = scope.rsplit_once("::")
+        && !package.is_empty()
+        && !rest.is_empty()
+        && let Some(outer) = package.rsplit('.').next()
+        && let Some(path) = index.file_named(outer)
+    {
+        candidates.push(path);
+    }
+    candidates.extend(index.candidates(name));
+    candidates.dedup();
     // A same-named file in the endpoint's own package is the type it means; without
     // this, two `Payload.java` in different packages resolved to whichever the index
     // listed first and the other endpoint got the wrong fields.
@@ -1823,6 +1860,7 @@ fn load_class(
             }
             return Some((
                 path.clone(),
+                class.outer.clone(),
                 class.type_params.clone(),
                 class.fields.clone(),
                 file_imports,
