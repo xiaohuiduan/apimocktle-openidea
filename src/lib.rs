@@ -33,14 +33,21 @@ use crate::scan::ScanResult;
 
 pub const VIEW: &str = "dashboard";
 const PAGE: &str = include_str!("page.html");
-/// Interfaces sent per call. A command runs inside a five-second budget, so
-/// the loop also stops itself on `BUDGET`.
-/// Interfaces one call may start. A local ApiMocktle answers in a few
-/// milliseconds, so this is only a guard; `BUDGET` is what actually stops a
-/// batch when the server is slow.
-const BATCH: usize = 200;
-/// Stop starting new interfaces past this; the host kills a command at 5 s.
-const BUDGET: Duration = Duration::from_millis(4_200);
+/// Interfaces one call may start.
+///
+/// A guard, not the real limit: the loop also stops itself on the budget, and a
+/// local ApiMocktle answers in a few milliseconds, so the budget is what stops a
+/// slow server. High enough that a whole project fits in one call — 3 598
+/// interfaces at the measured ~7.7 ms each is ~28 s, inside the task budget.
+const BATCH: usize = 20_000;
+/// How long one batch may keep starting interfaces.
+///
+/// Export always runs inside a `host::begin_task` (`flush_export`), which raises
+/// the call from the host's 5 s to 60 s and renews it on every report — so 50 s
+/// is the real allowance, leaving 10 s to finish and report. At the measured
+/// ~7.7 ms per interface this fits ~6 500 of them, i.e. a whole project in one
+/// call instead of one batch per minute.
+const EXPORT_BUDGET: Duration = Duration::from_millis(50_000);
 const QUEUE_KEY: &str = "export:queue";
 /// Category ids per server and project, kept across batches. The base URL is
 /// part of the key so a `catid` from one server is never used on another.
@@ -139,6 +146,8 @@ pub struct ApiMocktle {
     /// Overrides `scan::TYPE_BUDGET`, for the same reason: the test that pins
     /// the cap's refusal has to reach the cap without a 5 000-type project.
     type_budget_override: Option<usize>,
+    /// Overrides `EXPORT_BUDGET`; see `set_export_budget_for_tests`.
+    export_budget_override: Option<Duration>,
 }
 
 struct Config {
@@ -573,7 +582,27 @@ impl ApiMocktle {
 
     /// Sends the next batch of the queued export. `notify` false keeps the
     /// interface quiet when the host's schedule drives the batch.
+    ///
+    /// Opens a background task first: the host gives a plain command 5 s, and at
+    /// the measured ~7.7 ms per interface that is about 200 of them — which is
+    /// why a large project needed eighteen clicks of "continue". A task raises
+    /// the call to 60 s and every `report` renews it, so the whole queue goes out
+    /// in one call instead.
     fn flush_export(&mut self, cfg: &Config, notify: bool) -> Result<String, Error> {
+        let task = host::begin_task(i18n::EXPORT_TASK_TITLE.get(i18n::lang()), true);
+        task.report(0, None, Some(i18n::EXPORT_TASK_SENDING.get(i18n::lang())));
+        let result = self.flush_export_on_task(cfg, notify, &task);
+        drop(task);
+        result
+    }
+
+    /// The batch loop, reporting progress on `task` so its budget keeps renewing.
+    fn flush_export_on_task(
+        &mut self,
+        cfg: &Config,
+        notify: bool,
+        task: &host::Task,
+    ) -> Result<String, Error> {
         let Some(raw) = host::storage::get(QUEUE_KEY)? else {
             return Ok(i18n::NOTHING_TO_EXPORT.get(i18n::lang()).into());
         };
@@ -622,15 +651,22 @@ impl ApiMocktle {
         let mut rest: Vec<Value> = Vec::new();
         let mut sent = 0usize;
         let started = Instant::now();
+        let total = items.len();
+        let budget = self.export_budget_override.unwrap_or(EXPORT_BUDGET);
 
         for item in items {
             // The clock guard never fires before a few interfaces went out, so
-            // an unexpected clock cannot shrink a batch to one.
-            if sent >= BATCH || (sent >= 5 && started.elapsed() > BUDGET) {
+            // an unexpected clock cannot shrink a batch to one. The budget is the
+            // task's now (50 s, renewed by every report below), so a normal
+            // project finishes in one call instead of one batch per minute.
+            if sent >= BATCH || (sent >= 5 && started.elapsed() > budget) {
                 rest.push(item);
                 continue;
             }
             sent += 1;
+            // Renews the task's 60 s allowance. Cheap enough to do per interface:
+            // the host throttles UI updates to ~10/s on its side.
+            task.report(sent as u32, Some(total as u32), None);
             let category = item
                 .get("cat")
                 .and_then(Value::as_str)
@@ -778,6 +814,17 @@ impl ApiMocktle {
     #[doc(hidden)]
     pub fn set_type_budget_for_tests(&mut self, budget: Option<usize>) {
         self.type_budget_override = budget;
+    }
+
+    /// Overrides the export batch budget, for the tests that need a queue to
+    /// span more than one call.
+    ///
+    /// Production sends a whole project in one call (50 s task budget); a test
+    /// that wants to observe the multi-batch path cannot wait for that, and
+    /// cannot make a mock server slow on demand.
+    #[doc(hidden)]
+    pub fn set_export_budget_for_tests(&mut self, budget: Option<Duration>) {
+        self.export_budget_override = budget;
     }
 
     /// Delivers one dashboard message with a chosen scan deadline.
@@ -1517,6 +1564,10 @@ public class UserController {
         host::storage::set(QUEUE_KEY, &queue.to_string()).unwrap();
 
         let mut plugin = ApiMocktle::default();
+        // Production sends a whole project in one call (50 s task budget), so the
+        // cross-call behaviour only shows up when a batch stops early. A budget
+        // spent from the start does that deterministically.
+        plugin.set_export_budget_for_tests(Some(Duration::ZERO));
         // The first wake-up posts the batch the queue was built for.
         plugin.handle_events(&[Event::Scheduled], &host.invocation());
         let left = {
@@ -1619,14 +1670,23 @@ public class UserController {
         host::storage::set(QUEUE_KEY, &queue.to_string()).unwrap();
 
         let mut plugin = ApiMocktle::default();
+        // One batch per call, so what is left of the queue is observable.
+        plugin.set_export_budget_for_tests(Some(Duration::ZERO));
         plugin.handle_events(&[Event::Scheduled], &host.invocation());
         let raw = host::storage::get(QUEUE_KEY).unwrap().expect("the first batch leaves the rest");
         let queued: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(queued["items"].as_array().map(Vec::len), Some(1), "one item is left over");
+        // The loop never stops before five interfaces went out, so a spent
+        // budget still sends a small batch; the point here is that the rest stays
+        // queued with its target intact.
+        let left = queued["items"].as_array().map(Vec::len).unwrap_or(0);
+        assert!(left > 0 && left < 201, "one batch went out, the rest stayed queued: {left}");
         assert_eq!(queued["base"], "http://localhost:4000", "the write-back keeps its target");
         assert_eq!(queued["auth"], fingerprint("secret-token"));
         assert!(host.status_items()["sync"].text.contains("同步中"), "{:?}", host.status_items());
 
+        // The next call gets the real budget, so it finishes the queue: that is
+        // what a project sees now that a batch is no longer capped at 200.
+        plugin.set_export_budget_for_tests(None);
         plugin.handle_events(&[Event::Scheduled], &host.invocation());
         assert!(host::storage::get(QUEUE_KEY).unwrap().is_none(), "the second wake-up drains it");
         assert!(!host.status_items().contains_key("sync"), "no pause is reported");

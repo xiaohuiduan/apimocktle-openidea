@@ -134,9 +134,17 @@ pub const DTO_TYPE_LIMIT: Text = Text::new(
     "这个项目用到的 DTO 类型超过了单次扫描的上限，因此没有导出，服务器上的接口文档保持不变。请用「导出当前文件/目录」只解析这部分接口用到的类型。",
 );
 
-/// The background task an export opens to get a 60-second call budget.
+/// The background task a scan opens to get a 60-second call budget.
 pub const SCAN_TASK_TITLE: Text = Text::new("ApiMocktle: resolving request and response types", "ApiMocktle: 解析请求响应类型");
 pub const SCAN_TASK_ROUTES: Text = Text::new("reading controllers", "读取控制器");
+
+/// The background task an export opens to get a 60-second call budget.
+///
+/// Sending a whole project in one call is only possible on a task: the host
+/// gives a plain command 5 s, which fits about 200 interfaces and made a large
+/// project need a click of "continue" every minute.
+pub const EXPORT_TASK_TITLE: Text = Text::new("ApiMocktle: syncing endpoints", "ApiMocktle: 同步接口");
+pub const EXPORT_TASK_SENDING: Text = Text::new("sending interfaces", "发送接口");
 
 /// The token the queue was built with differs from the one in the settings.
 pub fn queue_other_token() -> String {

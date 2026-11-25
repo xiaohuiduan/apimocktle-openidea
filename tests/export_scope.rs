@@ -427,13 +427,25 @@ fn an_export_opens_a_task_so_the_scan_is_not_on_the_five_second_clock() {
         .run_command_in_tests("export-project", &host.invocation(), None)
         .expect("the export runs");
 
+    // Two tasks: the scan opens one, and the send opens its own so a whole
+    // project fits in a single call instead of 200 interfaces per minute.
     let tasks = host.tasks();
-    assert_eq!(tasks.len(), 1, "exactly one background task: {tasks:?}");
+    assert_eq!(tasks.len(), 2, "a scan task and a send task: {tasks:?}");
+    for task in &tasks {
+        assert!(
+            task.title.contains("ApiMocktle"),
+            "each task names the plugin: {}",
+            task.title
+        );
+        assert!(
+            !task.reports.is_empty(),
+            "progress was reported, which is what renews the budget: {task:?}"
+        );
+        assert!(task.ended, "both tasks were dropped when their work finished");
+    }
     assert!(
-        tasks[0].title.contains("ApiMocktle"),
-        "the task names the plugin: {}",
-        tasks[0].title
+        tasks.iter().any(|t| t.title.contains("同步") || t.title.contains("syncing")),
+        "one of them is the send task: {:?}",
+        tasks.iter().map(|t| t.title.as_str()).collect::<Vec<_>>()
     );
-    assert!(!tasks[0].reports.is_empty(), "progress was reported, which is what renews the budget");
-    assert!(tasks[0].ended, "the task was dropped when the scan finished");
 }
