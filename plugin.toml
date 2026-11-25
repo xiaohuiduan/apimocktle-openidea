@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.13"
+version = "0.3.14"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.13 — 修跨包 import 外层类后的成员类型解析。控制器写 import com.alpha.Outer 再用 Outer.Request 时，schema 变成空对象、导出会清空服务器上已有字段。原因是解析带点名字时只按当前包和裸包边界拼候选，没考虑限定词本身可能是 file import 进来的类型。现在先按当前文件的 import 解析限定词，再沿成员路径拼接；同时把每个文件的全部 import 都登记为别名，不再依赖该类型是否曾被当作请求体解析过。新增 1 个跨包 import 用例，164 个用例全绿。"
+change-notes = "0.3.14 — 类型引用的六种写法全部覆盖。连续三轮 review 都是「新增一种写法、打坏另一种」，这版改为主动把 Java 允许的类型引用写法列全一次性固定，跑出两个此前一直存在但从未被覆盖的 bug：两级成员路径 Outer.Middle.Inner 解析成空对象；通配符 import（import com.alpha.*）后的限定词 Outer.Request 也是空。根因都是候选构造只按「包名加剩余部分」拼接、没有逐级解析限定词。现在保留通配符 import、按当前作用域逐段解析前缀再沿成员路径拼接，且中间层不要求是已知类型（外部类通常没有自己的条目）。新增六种写法的矩阵测试，170 个用例全绿。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

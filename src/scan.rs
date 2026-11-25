@@ -333,6 +333,9 @@ pub struct DtoIndex {
     /// `import` names. Consulted before the global simple-name fallback, because
     /// two controllers in one package can import different same-named types.
     aliases: HashMap<(String, String), String>,
+    /// Per scope, the package an on-demand import names — `import a.b.*` means a
+    /// bare type in `a.b`, which a qualifier like `Outer.Request` needs.
+    wildcards: HashMap<String, String>,
 }
 
 impl DtoIndex {
@@ -404,6 +407,39 @@ impl DtoIndex {
                     segments[..at].join("."),
                     segments[at..].join("::")
                 ));
+            }
+            // Resolve the leading segments one at a time: an imported qualifier and a
+            // multi-level member path both need this, and `lookup_prefix` answers the
+            // whole path directly.
+            if let Some(found) = self.lookup_prefix(name, scope) {
+                candidates.push(found);
+            }
+            // Every prefix is resolved on its own and the remaining segments are
+            // appended, which handles an imported qualifier and a multi-level member
+            // path alike: `import com.alpha.Outer` + `Outer.Middle.Inner` becomes
+            // `com.alpha::Outer`, then `com.alpha::Outer::Middle`, then the full path.
+            for at in 1..segments.len() {
+                let prefix = segments[..at].join(".");
+                let mut bases: Vec<String> = Vec::new();
+                if let Some(found) = self.lookup_prefix(&prefix, scope) {
+                    bases.push(found);
+                }
+                if let Some(found) = self.aliases.get(&(scope.to_owned(), prefix.clone())) {
+                    bases.push(found.clone());
+                }
+                if let Some((package, _)) = scope.rsplit_once("::")
+                    && let Some(found) = self.scopes.get_key_value(&format!("{package}::{prefix}"))
+                {
+                    bases.push(found.0.clone());
+                }
+                for base in bases {
+                    let mut key = base;
+                    for segment in &segments[at..] {
+                        key.push_str("::");
+                        key.push_str(segment);
+                    }
+                    candidates.push(key);
+                }
             }
             for key in candidates {
                 if let Some(fields) = self.scopes.get(&key) {
@@ -491,6 +527,42 @@ impl DtoIndex {
     /// imports, so the scan records them here: a bare `Payload` in a controller
     /// that imported `com.alpha.Payload` then means that type, and one that
     /// imported `com.beta.Payload` means the other.
+    /// Resolves a dotted prefix (one or more segments) to the identity it names.
+    ///
+    /// The first segment may be a type the file imported, on demand or by name, and
+    /// a later one may be a member type; the walk follows the whole path and fails
+    /// at the first segment that does not land.
+    fn lookup_prefix(&self, prefix: &str, scope: &str) -> Option<String> {
+        let segments: Vec<&str> = prefix.split('.').collect();
+        let first = *segments.first()?;
+        let mut current: Option<String> = None;
+        // A single-type import, then the same package, then an on-demand import.
+        if let Some(found) = self.aliases.get(&(scope.to_owned(), first.to_owned())) {
+            current = Some(found.clone());
+        } else if let Some((package, _)) = scope.rsplit_once("::") {
+            // The class itself usually has no entry (only the reachable DTO does), so
+            // the candidate is built unconditionally and the caller's lookup decides.
+            let same_package = format!("{package}::{first}");
+            current = Some(match self.scopes.contains_key(&same_package) {
+                true => same_package,
+                false => match self.wildcards.get(scope) {
+                    Some(wildcard) => format!("{wildcard}::{first}"),
+                    None => same_package,
+                },
+            });
+        }
+        // The remaining segments are appended to whatever the first one named. The
+        // intermediate levels do not have to be known types of their own: a scan
+        // records `Outer::Request` but usually not the enclosing `Outer`, since only
+        // the reachable DTO gets an entry.
+        let mut found = current?;
+        for segment in &segments[1..] {
+            found.push_str("::");
+            found.push_str(segment);
+        }
+        Some(found)
+    }
+
     fn add_alias(&mut self, scope: &str, name: &str, qualified: &str) {
         self.aliases
             .insert((scope.to_owned(), name.to_owned()), qualified.to_owned());
@@ -689,6 +761,10 @@ pub fn scan_with_progress(
         let model = spring::parse(&src);
         let file_hints = hints.entry(path.clone()).or_default();
         for import in &model.imports {
+            if let Some(package) = import.strip_suffix(".*") {
+                file_hints.insert("*".to_owned(), package.to_owned());
+                continue;
+            }
             let Some((package, simple)) = import.rsplit_once('.') else {
                 continue;
             };
@@ -1320,6 +1396,10 @@ fn resolve_dtos(
     // appended to it. Registering only resolved types left the table empty here.
     for (scope_of_file, table) in &imports_of {
         for (simple, package) in table {
+            if simple == "*" {
+                dto.wildcards.insert(scope_of_file.clone(), package.clone());
+                continue;
+            }
             dto.add_alias(scope_of_file, simple, &format!("{package}::{simple}"));
         }
     }
