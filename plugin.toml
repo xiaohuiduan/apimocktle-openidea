@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.14"
+version = "0.3.15"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.14 — 类型引用的六种写法全部覆盖。连续三轮 review 都是「新增一种写法、打坏另一种」，这版改为主动把 Java 允许的类型引用写法列全一次性固定，跑出两个此前一直存在但从未被覆盖的 bug：两级成员路径 Outer.Middle.Inner 解析成空对象；通配符 import（import com.alpha.*）后的限定词 Outer.Request 也是空。根因都是候选构造只按「包名加剩余部分」拼接、没有逐级解析限定词。现在保留通配符 import、按当前作用域逐段解析前缀再沿成员路径拼接，且中间层不要求是已知类型（外部类通常没有自己的条目）。新增六种写法的矩阵测试，170 个用例全绿。"
+change-notes = "0.3.15 — 修两处全限定类型定位问题。一是不同包里各有一个 Outer.java 时，B 的全限定类型被更新成空对象：文件查找要求文件名全项目唯一，遇到同名直接放弃，而全限定名其实已经指明包名，现在按包路径匹配文件。二是直接 import 嵌套类型（import com.alpha.AlphaOuter.Request）后用裸名时全变空：别名登记成 com.alpha.AlphaOuter::Request，实际身份是 com.alpha::AlphaOuter::Request，两边不一致永远命中不了，现在统一规范化成包名保留点、类边界转双冒号的形式。新增 2 个两个同名类型都可达的用例，172 个用例全绿。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

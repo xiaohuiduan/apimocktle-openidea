@@ -175,6 +175,23 @@ impl TypeIndex {
         Some(first.clone())
     }
 
+    /// The file holding `stem` that is declared in `package`, when one exists.
+    ///
+    /// `file_named` refuses a stem that appears more than once, but two packages
+    /// may each declare `Outer.java`; the package picks the right one.
+    fn file_named_in(&self, stem: &str, package: &str) -> Option<String> {
+        self.java
+            .get(stem)
+            .into_iter()
+            .flatten()
+            .find(|path| {
+                let normalised = path.replace('\\', "/");
+                let marker = format!("/{}/", package.replace('.', "/"));
+                normalised.contains(&marker)
+            })
+            .cloned()
+    }
+
     fn candidates(&self, name: &str) -> Vec<String> {
         let mut out: Vec<String> = self.java.get(name).cloned().unwrap_or_default();
         out.extend(self.kotlin.get(name).cloned().unwrap_or_default());
@@ -1400,7 +1417,15 @@ fn resolve_dtos(
                 dto.wildcards.insert(scope_of_file.clone(), package.clone());
                 continue;
             }
-            dto.add_alias(scope_of_file, simple, &format!("{package}::{simple}"));
+            // `import a.b.C` names a top-level type; `import a.b.C.D` names a
+            // nested one. The scan's identity keeps the package's dots and turns
+            // class boundaries into `::`, so a two-segment class path becomes
+            // `a.b::C::D` rather than `a.b.C::D`.
+            let qualified = match self::split_import(package) {
+                Some((owner, class)) => format!("{owner}::{class}::{simple}"),
+                None => format!("{package}::{simple}"),
+            };
+            dto.add_alias(scope_of_file, simple, &qualified);
         }
     }
     let mut tried: HashSet<String> = HashSet::new();
@@ -1741,6 +1766,17 @@ fn class_lookup(classes: &HashMap<String, ClassEntry>, name: &str) -> Option<(St
 /// yields `com.alpha::Payload`. Running past the root instead would make the
 /// project directory part of every package name, and then no scope would ever
 /// match.
+/// Splits an import's owner prefix into `(owner, class)` when it names a nested
+/// type: `a.b.C` has owner `a.b`; `a.b.C.D` has owner `a.b.C`.
+fn split_import(prefix: &str) -> Option<(&str, &str)> {
+    let last = prefix.rsplit('.').next()?;
+    if !last.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        return None;
+    }
+    let at = prefix.rfind('.')?;
+    Some((&prefix[..at], last))
+}
+
 fn package_of_path(path: &str, name: &str, outer: &str) -> String {
     let normalised = path.replace('\\', "/");
     let segments: Vec<&str> = normalised.split('/').collect();
@@ -1923,13 +1959,21 @@ fn load_class(
     // (keyed by simple name) cannot answer `Inner`. The qualifier says which file
     // to read, so it is offered as an extra candidate ahead of the index hits.
     let mut candidates: Vec<String> = Vec::new();
-    if let Some((package, rest)) = scope.rsplit_once("::")
-        && !package.is_empty()
+    if let Some((owner, rest)) = scope.rsplit_once("::")
+        && !owner.is_empty()
         && !rest.is_empty()
-        && let Some(outer) = package.rsplit('.').next()
-        && let Some(path) = index.file_named(outer)
     {
-        candidates.push(path);
+        // `owner` is `pkg.Outer` (or `pkg.Outer.Middle`): the file is named after
+        // the outermost class and lives in the package. Two packages may each have
+        // their own `Outer.java`, so the package picks the right one; only when it
+        // says nothing is a unique stem used.
+        let segments: Vec<&str> = owner.split('.').collect();
+        let outer = *segments.last().unwrap_or(&owner);
+        let package = segments[..segments.len().saturating_sub(1)].join(".");
+        let by_package = index.file_named_in(outer, &package);
+        if let Some(path) = by_package.or_else(|| index.file_named(outer)) {
+            candidates.push(path);
+        }
     }
     candidates.extend(index.candidates(name));
     candidates.dedup();
