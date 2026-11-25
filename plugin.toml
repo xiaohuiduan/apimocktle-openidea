@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.6"
+version = "0.3.7"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.6 — 修递归进入独立 DTO 文件后丢失该文件的 import。上一版按文件保留了导入表，但只对接口所在的文件建立：com.alpha.AlphaRequest import com.detailalpha.Detail、com.beta.BetaRequest import com.detailbeta.Detail 时，递归进 AlphaRequest 后查 Detail 拿不到它自己的 import，两个 Detail 混用，导出把 /b 的 detail.beta 覆盖成 alpha。根因有两层：一是加载类型时没有带回该文件的 import（主扫描只读控制器），二是 Schema 递归用「父作用域 + 字段里写的简单名」拼下一层作用域，而真实类型身份来自 import 解析，两者对不上。现在 ResolvedClass 携带解析到的真实限定身份，递归沿它继续；load_class 同时返回被加载文件的 import 并登记。验证：六文件场景下 /a 的请求与响应都是 detail.alpha、/b 都是 detail.beta；四轮 review 的 9 个回归用例全过，144 个用例全绿，yudao 实测 3603 接口 / 1663 DTO 无回归。"
+change-notes = "0.3.7 — 修显式 import 被同包同名类型抢先的问题。com.web.AController 写了 import com.alpha.Payload，同包又存在 com/web/Payload.java；按 Java 语言规范（JLS 6.4.1），单类型 import 优先于同包其他文件的同名顶层类型，所以 A 用的是 com.alpha 那个。之前的解析先沿作用域向外走到包，命中 com.web::Payload 就返回，import 来不及生效：A 的请求和响应 schema 变成了 beta，导出会覆盖服务器上正确的 alpha 文档。现在解析顺序按规范来——成员类型（不含包）→ 文件的单类型 import → 同包 → 全项目唯一，扫描侧与 Schema 侧使用同一顺序。验证：该四文件场景下 /a 保留 alpha、/b 保留 beta，控制器内嵌类型仍优先于 import；149 个用例全绿，yudao 实测 3603 接口 / 1663 DTO 无回归。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

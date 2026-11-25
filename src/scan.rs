@@ -150,7 +150,12 @@ impl TypeIndex {
         } else {
             HashMap::new()
         };
-        TypeIndex { java, kotlin, all_paths, searched: HashMap::new() }
+        TypeIndex {
+            java,
+            kotlin,
+            all_paths,
+            searched: HashMap::new(),
+        }
     }
 
     /// The candidate files for `name`, Java first. Empty means the index has
@@ -259,7 +264,11 @@ impl TypeIndex {
             ranked.push((rank, path.clone()));
         }
         ranked.sort_by(|a, b| a.0.cmp(&b.0));
-        ranked.into_iter().take(FALLBACK_CANDIDATES).map(|(_, p)| p).collect()
+        ranked
+            .into_iter()
+            .take(FALLBACK_CANDIDATES)
+            .map(|(_, p)| p)
+            .collect()
     }
 }
 
@@ -272,11 +281,10 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 fn index_of(paths: Vec<String>) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     for path in paths {
-        let Some(stem) = path
-            .rsplit(['/', '\\'])
-            .next()
-            .and_then(|file| file.strip_suffix(".java").or_else(|| file.strip_suffix(".kt")))
-        else {
+        let Some(stem) = path.rsplit(['/', '\\']).next().and_then(|file| {
+            file.strip_suffix(".java")
+                .or_else(|| file.strip_suffix(".kt"))
+        }) else {
             continue;
         };
         out.entry(stem.to_owned()).or_default().push(path);
@@ -319,7 +327,13 @@ impl DtoIndex {
     /// The first writer of a simple name wins, as before. A second, *different*
     /// type claiming the same simple name marks it ambiguous instead of silently
     /// replacing the first.
-    pub fn insert(&mut self, qualified: &str, simple: &str, params: Vec<String>, fields: Vec<FieldSpec>) {
+    pub fn insert(
+        &mut self,
+        qualified: &str,
+        simple: &str,
+        params: Vec<String>,
+        fields: Vec<FieldSpec>,
+    ) {
         match self.fields.get(simple) {
             Some(existing) => {
                 if *existing != fields {
@@ -341,51 +355,73 @@ impl DtoIndex {
     /// then the simple name. That order is what makes `AController.Request` and
     /// `BController.Request` resolve to their own types.
     pub fn resolve_in(&self, scope: &str, name: &str) -> Option<ResolvedClass> {
+        // JLS 6.4.1 orders a simple type name: member types of the enclosing
+        // types, then a single-type import, then types declared in the same
+        // package. Each step is tried in that order, because they genuinely
+        // disagree: a controller that imports `com.alpha.Payload` while
+        // `com/web/Payload.java` exists means the imported one, and resolving by
+        // package first picked the wrong type and overwrote a correct document.
+        let class_itself = |qualified: &str, fields: Vec<FieldSpec>| ResolvedClass {
+            params: self
+                .scope_params
+                .get(qualified)
+                .cloned()
+                .unwrap_or_default(),
+            fields,
+            qualified: qualified.to_owned(),
+        };
+
+        // 1. Member types: the declaring class and its enclosing types, innermost
+        //    first, stopping before the package. `AController.Request.Detail` beats
+        //    any import of `Detail`, but a type merely *in the same package* does
+        //    not: walking one level further used to land on `com.web::Payload` and
+        //    return before the import was consulted.
         let mut prefix = scope;
         loop {
             let key = format!("{prefix}::{name}");
             if let Some(fields) = self.scopes.get(&key) {
-                return Some(ResolvedClass {
-                    params: self.scope_params.get(&key).cloned().unwrap_or_default(),
-                    fields: fields.clone(),
-                    qualified: key,
-                });
+                return Some(class_itself(&key, fields.clone()));
             }
             match prefix.rsplit_once("::") {
-                Some((outer, _)) => prefix = outer,
-                None => break,
+                // The last segment is the type itself; one level above it is the
+                // package, and that step belongs after the import.
+                Some((outer, _)) if outer.contains("::") => prefix = outer,
+                _ => break,
             }
         }
-        // The endpoint file's own import settles a bare name before the global
-        // fallback: `import com.alpha.Payload` is the project saying which type it
-        // means, and two controllers can import different ones.
+
+        // 2. The file's own single-type import. `import com.alpha.Payload` is the
+        //    source saying which type it means, and it outranks a same-package one.
         if let Some(qualified) = self.aliases.get(&(scope.to_owned(), name.to_owned()))
             && let Some(fields) = self.scopes.get(qualified)
         {
-            return Some(ResolvedClass {
-                params: self.scope_params.get(qualified).cloned().unwrap_or_default(),
-                fields: fields.clone(),
-                qualified: qualified.clone(),
-            });
+            return Some(class_itself(qualified, fields.clone()));
         }
-        // A bare name is only an answer when it means one thing.
+
+        // 3. A type declared in the endpoint's own package.
+        if let Some((package, _)) = scope.rsplit_once("::")
+            && let Some(fields) = self.scopes.get(&format!("{package}::{name}"))
+        {
+            return Some(class_itself(&format!("{package}::{name}"), fields.clone()));
+        }
+
+        // 4. One type in the whole project answers to the name. A name with several
+        //    meanings was refused above, so any single entry is the answer; the
+        //    bare name is used when no qualified entry exists at all.
         if self.ambiguous.contains(name) {
             return None;
         }
         let fields = self.fields.get(name)?;
-        // A unique single-name entry answers for one type only, so its qualified
-        // key (when the type has one) is the identity its fields resolve against.
         let qualified = self
             .scopes
             .keys()
-            .find(|key| key.rsplit_once("::").is_some_and(|(_, simple)| simple == name))
+            .find(|key| {
+                key.rsplit_once("::")
+                    .is_some_and(|(_, simple)| simple == name)
+            })
             .cloned()
             .unwrap_or_else(|| name.to_owned());
-        Some(ResolvedClass {
-            params: self.params.get(name).cloned().unwrap_or_default(),
-            fields: fields.clone(),
-            qualified,
-        })
+        Some(class_itself(&qualified.clone(), fields.clone()))
     }
 
     /// Records that files of `scope` mean `qualified` when they write `name`.
@@ -400,9 +436,9 @@ impl DtoIndex {
     }
 
     /// Marks `name` as meaning more than one type.
-fn mark_ambiguous(&mut self, name: String) {
-self.ambiguous.insert(name);
-}
+    fn mark_ambiguous(&mut self, name: String) {
+        self.ambiguous.insert(name);
+    }
 
     /// Whether `name` means more than one type in this project.
     pub fn is_ambiguous(&self, name: &str) -> bool {
@@ -473,7 +509,9 @@ impl ScanResult {
 /// path as an option rather than reaching back into the plugin module.
 fn under(path: &str, target: &str) -> bool {
     let target = target.trim_end_matches(['/', '\\']);
-    path == target || path.starts_with(&format!("{target}/")) || path.starts_with(&format!("{target}\\"))
+    path == target
+        || path.starts_with(&format!("{target}/"))
+        || path.starts_with(&format!("{target}\\"))
 }
 
 /// Scans the project for controller routes.
@@ -523,7 +561,11 @@ pub fn scan_with_progress(
         // A narrowed scan only reads the controllers under the chosen path, so
         // both the parse and — above all — the DTO closure that follows from
         // these endpoints stay proportional to what was asked for.
-        if !options.only_path.as_deref().is_none_or(|path| under(&m.location.path, path)) {
+        if !options
+            .only_path
+            .as_deref()
+            .is_none_or(|path| under(&m.location.path, path))
+        {
             continue;
         }
         if seen.insert(m.location.path.clone()) {
@@ -586,9 +628,17 @@ pub fn scan_with_progress(
         let model = spring::parse(&src);
         let file_hints = hints.entry(path.clone()).or_default();
         for import in &model.imports {
-            let Some((package, simple)) = import.rsplit_once('.') else { continue };
-            if simple.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-                file_hints.entry(simple.to_owned()).or_insert_with(|| package.to_owned());
+            let Some((package, simple)) = import.rsplit_once('.') else {
+                continue;
+            };
+            if simple
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
+            {
+                file_hints
+                    .entry(simple.to_owned())
+                    .or_insert_with(|| package.to_owned());
             }
         }
         constants.absorb(&model);
@@ -727,7 +777,11 @@ pub fn scan_with_progress(
 /// deliberately never picked: neither YApi nor the upstream plugin exports
 /// cookie parameters, so they stop here.
 fn pick(params: &[(ParamSpec, ParamKind)], kind: ParamKind) -> Vec<ParamSpec> {
-    params.iter().filter(|(_, k)| *k == kind).map(|(p, _)| p.clone()).collect()
+    params
+        .iter()
+        .filter(|(_, k)| *k == kind)
+        .map(|(p, _)| p.clone())
+        .collect()
 }
 
 /// Static string constants that route annotations can name instead of writing
@@ -800,7 +854,13 @@ impl Consts {
     }
 
     /// Substitutes constants in every mapping annotation of `model`.
-    fn resolve_in(&mut self, project: &Project, options: &Options, index: &mut TypeIndex, model: &mut spring::FileModel) {
+    fn resolve_in(
+        &mut self,
+        project: &Project,
+        options: &Options,
+        index: &mut TypeIndex,
+        model: &mut spring::FileModel,
+    ) {
         let imports = model.imports.clone();
         let package = model.package.clone();
         for class in &mut model.classes {
@@ -811,9 +871,25 @@ impl Consts {
             } else {
                 format!("{package}.{}", class.name)
             };
-            resolve_anns(self, project, options, index, &imports, &mut class.anns, Some(&owner));
+            resolve_anns(
+                self,
+                project,
+                options,
+                index,
+                &imports,
+                &mut class.anns,
+                Some(&owner),
+            );
             for method in &mut class.methods {
-                resolve_anns(self, project, options, index, &imports, &mut method.anns, Some(&owner));
+                resolve_anns(
+                    self,
+                    project,
+                    options,
+                    index,
+                    &imports,
+                    &mut method.anns,
+                    Some(&owner),
+                );
             }
         }
     }
@@ -846,14 +922,19 @@ impl Consts {
             return Some(value.clone());
         }
         for owner in static_import_owners(imports, name) {
-            if let Some(value) = self.qualified_class(project, options, index, &owner, name, imports, None) {
+            if let Some(value) =
+                self.qualified_class(project, options, index, &owner, name, imports, None)
+            {
                 return Some(value);
             }
         }
         if self.ambiguous.contains(name) {
             return None;
         }
-        self.unique.get(name).and_then(|key| self.values.get(key)).cloned()
+        self.unique
+            .get(name)
+            .and_then(|key| self.values.get(key))
+            .cloned()
     }
 
     /// Resolves a class name as it appears in an annotation (`Routes`,
@@ -885,7 +966,12 @@ impl Consts {
     /// The fully qualified classes a written qualifier may name, most likely
     /// first. `Routes` becomes `com.a.Routes` when the file imports
     /// `com.a.Routes`; an already qualified `com.b.Routes` names itself.
-    fn class_candidates(&self, qualifier: &str, imports: &[String], owner: Option<&str>) -> Vec<String> {
+    fn class_candidates(
+        &self,
+        qualifier: &str,
+        imports: &[String],
+        owner: Option<&str>,
+    ) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut push = |candidate: String| {
             if !candidate.is_empty() && !out.contains(&candidate) {
@@ -974,7 +1060,10 @@ impl Consts {
         for candidate in [simple, outer] {
             // `com.a.Routes` must not be read out of `com/b/Routes.java`: the
             // package decides which file is meant.
-            let Some(model) = load_source_for(project, options, index, candidate, class, imports) else { continue };
+            let Some(model) = load_source_for(project, options, index, candidate, class, imports)
+            else {
+                continue;
+            };
             self.absorb(&model);
             if let Some(value) = self.values.get(&key) {
                 return Some(value.clone());
@@ -999,8 +1088,12 @@ fn static_import_owners(imports: &[String], name: &str) -> Vec<String> {
         }
     };
     for import in imports {
-        let Some(rest) = import.strip_suffix(name) else { continue };
-        let Some(rest) = rest.strip_suffix('.') else { continue };
+        let Some(rest) = import.strip_suffix(name) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_suffix('.') else {
+            continue;
+        };
         push(rest);
     }
     for import in imports {
@@ -1027,7 +1120,8 @@ fn resolve_anns(
             if !arg.strings.is_empty() || arg.idents.is_empty() {
                 continue;
             }
-            if let Some(value) = consts.lookup(project, options, index, &arg.idents, imports, class) {
+            if let Some(value) = consts.lookup(project, options, index, &arg.idents, imports, class)
+            {
                 arg.strings.push(value);
             }
         }
@@ -1059,8 +1153,16 @@ fn load_source_for(
     // The class' directory is the part before the simple name:
     // `com.a.Routes` → `com/a`, `Outer.Inner` → nothing to match on.
     let segments: Vec<&str> = class.split('.').collect();
-    let package: &[&str] = if segments.len() > 1 { &segments[..segments.len() - 1] } else { &[] };
-    let wanted = if package.is_empty() { None } else { Some(package.join("/")) };
+    let package: &[&str] = if segments.len() > 1 {
+        &segments[..segments.len() - 1]
+    } else {
+        &[]
+    };
+    let wanted = if package.is_empty() {
+        None
+    } else {
+        Some(package.join("/"))
+    };
     // The import that names this class decides, then the package directory.
     let imported_tail = imports
         .iter()
@@ -1068,7 +1170,9 @@ fn load_source_for(
         .map(|import| format!("/{}.java", import.replace('.', "/")));
     let rank = |path: &str| {
         let normalized = path.replace('\\', "/");
-        let by_import = imported_tail.as_ref().is_none_or(|tail| normalized.ends_with(tail));
+        let by_import = imported_tail
+            .as_ref()
+            .is_none_or(|tail| normalized.ends_with(tail));
         let by_package = wanted
             .as_ref()
             .is_none_or(|dir| normalized.contains(&format!("/{dir}/{name}.")));
@@ -1078,7 +1182,9 @@ fn load_source_for(
     };
     candidates.sort_by_key(|path| rank(path));
     for path in candidates {
-        let Ok(src) = read_file(project, &path) else { continue };
+        let Ok(src) = read_file(project, &path) else {
+            continue;
+        };
         let model = spring::parse(&src);
         // The file has to declare the class under the package the qualifier
         // named; a same-named class in another package is a different type.
@@ -1168,25 +1274,35 @@ fn resolve_dtos(
         // De-duplicated by the qualified identity: two endpoints naming their own
         // `Request` are two different types and both must be resolved.
         // Identity is settled by, in order: the endpoint's own scope, the package
-// its imports name for this type, then a unique candidate anywhere. When
-// none of them settles it, the name is ambiguous and export refuses rather
-// than save a document built from the wrong type.
-// This endpoint's file says which package a bare name comes from; that is
-// the only thing that tells two same-named top-level types apart.
-let imported_package = imports_of.get(&scope).and_then(|t| t.get(&name)).cloned();
-let scoped = scoped_lookup(classes, &scope, &name)
-.or_else(|| imported_lookup(classes, imports_of.get(&scope), &name));
-let identity = match &scoped {
-Some((qualified, _)) => qualified.clone(),
-// With no table entry the import decides the type's identity, so two files
-// importing different same-named types are resolved separately. Without an
-// import the bare name is used, so one type reached from several endpoints
-// is resolved once and the budget goes to distinct types.
-None => match &imported_package {
-Some(package) => format!("{package}::{name}"),
-None => name.clone(),
-},
-};
+        // its imports name for this type, then a unique candidate anywhere. When
+        // none of them settles it, the name is ambiguous and export refuses rather
+        // than save a document built from the wrong type.
+        // This endpoint's file says which package a bare name comes from; that is
+        // the only thing that tells two same-named top-level types apart.
+        let imported_package = imports_of.get(&scope).and_then(|t| t.get(&name)).cloned();
+        // JLS 6.4.1, in the same order `DtoIndex::resolve_in` uses so the scan and
+        // the schema agree: member types, then the file's single-type import, then a
+        // type in the same package. A controller that imports `com.alpha.Payload`
+        // while `com/web/Payload.java` exists means the imported one, so the package
+        // step comes after the import.
+        let same_package = scope
+            .rsplit_once("::")
+            .and_then(|(package, _)| classes.get_key_value(&format!("{package}::{name}")))
+            .map(|(key, hit)| (key.clone(), hit.clone()));
+        let scoped = scoped_lookup(classes, &scope, &name)
+            .or_else(|| imported_lookup(classes, imports_of.get(&scope), &name))
+            .or(same_package);
+        let identity = match &scoped {
+            Some((qualified, _)) => qualified.clone(),
+            // With no table entry the import decides the type's identity, so two files
+            // importing different same-named types are resolved separately. Without an
+            // import the bare name is used, so one type reached from several endpoints
+            // is resolved once and the budget goes to distinct types.
+            None => match &imported_package {
+                Some(package) => format!("{package}::{name}"),
+                None => name.clone(),
+            },
+        };
         if !tried.insert(identity) {
             continue;
         }
@@ -1216,7 +1332,9 @@ None => name.clone(),
                     })
             }
         };
-        let Some((qualified, (params, fields), file_imports)) = found else { continue };
+        let Some((qualified, (params, fields), file_imports)) = found else {
+            continue;
+        };
         // The type's own file imports are what its fields resolve against, so they
         // are registered under the type's identity — the scope the queue carries to
         // the next level. Without this, a DTO that lives in its own file lost its
@@ -1247,7 +1365,10 @@ None => name.clone(),
         // Every endpoint file that imports this name from the package it resolved
         // in gets an alias, which is what the schema pass later reads.
         for (endpoint_scope, table) in &imports_of {
-            if table.get(&name).is_some_and(|p| format!("{p}::{name}") == qualified) {
+            if table
+                .get(&name)
+                .is_some_and(|p| format!("{p}::{name}") == qualified)
+            {
                 dto.add_alias(endpoint_scope, &name, &qualified);
             }
         }
@@ -1269,7 +1390,11 @@ None => name.clone(),
             None => progress(done.min(peak_total), peak_total.max(1)),
             Some(base) => {
                 let half = base / 2;
-                let into = if peak_total == 0 { 0 } else { done.min(peak_total) * half / peak_total };
+                let into = if peak_total == 0 {
+                    0
+                } else {
+                    done.min(peak_total) * half / peak_total
+                };
                 progress(half + into, base);
             }
         }
@@ -1287,20 +1412,28 @@ fn keep_field(field: &spring::Field) -> bool {
     }
     // Constants such as `MAX_SIZE` are not part of the payload either.
     if field.name.len() > 1
-        && field.name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && field
+            .name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
     {
         return false;
     }
-    !field
-        .anns
-        .iter()
-        .any(|a| matches!(a.name.as_str(), "JsonIgnore" | "JsonBackReference" | "JsonIgnoreProperties"))
+    !field.anns.iter().any(|a| {
+        matches!(
+            a.name.as_str(),
+            "JsonIgnore" | "JsonBackReference" | "JsonIgnoreProperties"
+        )
+    })
 }
 
 /// The name the field has in JSON, which a Jackson/Gson annotation may change.
 fn wire_name(field: &spring::Field) -> String {
     for ann in &field.anns {
-        if !matches!(ann.name.as_str(), "JsonProperty" | "SerializedName" | "JSONField") {
+        if !matches!(
+            ann.name.as_str(),
+            "JsonProperty" | "SerializedName" | "JSONField"
+        ) {
             continue;
         }
         for key in ["value", "name"] {
@@ -1334,25 +1467,44 @@ fn imported_lookup(
     name: &str,
 ) -> Option<(String, ClassEntry)> {
     let package = hints?.get(name)?;
-let key = format!("{package}::{name}");
-classes.get_key_value(&key).map(|(key, hit)| (key.clone(), hit.clone()))
+    let key = format!("{package}::{name}");
+    classes
+        .get_key_value(&key)
+        .map(|(key, hit)| (key.clone(), hit.clone()))
 }
 
 /// The class `name` means inside `scope`, walking the scope outward.
 ///
 /// `com.acme::AController` then `com.acme` then the bare name: a nested type in
 /// the controller wins, then one in its package, then a unique one anywhere.
-fn scoped_lookup(classes: &HashMap<String, ClassEntry>, scope: &str, name: &str) -> Option<(String, ClassEntry)> {
+fn scoped_lookup(
+    classes: &HashMap<String, ClassEntry>,
+    scope: &str,
+    name: &str,
+) -> Option<(String, ClassEntry)> {
+    // Member types only: the declaring class and its enclosing types. The package
+    // is NOT walked here — a single-type import outranks a type declared in the
+    // same package (JLS 6.4.1), so imported_lookup has to run before the
+    // package step, and walking into the package here would pre-empt it.
     let mut prefix = scope;
+    let mut first = true;
     loop {
         let key = format!("{prefix}::{name}");
         if let Some(hit) = classes.get_key_value(&key) {
             return Some((key, hit.1.clone()));
         }
         match prefix.rsplit_once("::") {
-            Some((outer, _)) => prefix = outer,
+            Some((outer, _)) => {
+                // Stop before the package: one :: level above the class body is
+                // the package, and that step belongs after the import.
+                if !first && !outer.contains("::") {
+                    break;
+                }
+                prefix = outer;
+            }
             None => break,
         }
+        first = false;
     }
     None
 }
@@ -1363,7 +1515,12 @@ type ClassEntry = (Vec<String>, Vec<spring::Field>);
 /// A class loaded from its source file: the file it came from, its declared type
 /// parameters, its fields, and the imports that file declares (which its own fields
 /// resolve against).
-type LoadedClass = (String, Vec<String>, Vec<spring::Field>, HashMap<String, String>);
+type LoadedClass = (
+    String,
+    Vec<String>,
+    Vec<spring::Field>,
+    HashMap<String, String>,
+);
 
 /// Every class `name` could mean, as `(qualified key, entry)`.
 ///
@@ -1371,29 +1528,32 @@ type LoadedClass = (String, Vec<String>, Vec<spring::Field>, HashMap<String, Str
 /// packages or controllers, and which one an endpoint means is not decidable from
 /// the name alone when none of them is in the endpoint's own scope — that is the
 /// case an export must refuse instead of guessing.
-fn class_candidates(classes: &HashMap<String, ClassEntry>, name: &str) -> Vec<(String, ClassEntry)> {
-if let Some(hit) = classes.get_key_value(name) {
-return vec![(name.to_owned(), hit.1.clone())];
-}
-let suffix = format!("::{name}");
-let mut found: Vec<(String, ClassEntry)> = classes
-.iter()
-.filter(|(key, _)| key.ends_with(&suffix))
-.map(|(key, hit)| (key.clone(), hit.clone()))
-.collect();
-// HashMap order is arbitrary; sorting keeps the chosen type and the refusal
-// message stable between runs.
-found.sort_by(|a, b| a.0.cmp(&b.0));
-found
+fn class_candidates(
+    classes: &HashMap<String, ClassEntry>,
+    name: &str,
+) -> Vec<(String, ClassEntry)> {
+    if let Some(hit) = classes.get_key_value(name) {
+        return vec![(name.to_owned(), hit.1.clone())];
+    }
+    let suffix = format!("::{name}");
+    let mut found: Vec<(String, ClassEntry)> = classes
+        .iter()
+        .filter(|(key, _)| key.ends_with(&suffix))
+        .map(|(key, hit)| (key.clone(), hit.clone()))
+        .collect();
+    // HashMap order is arbitrary; sorting keeps the chosen type and the refusal
+    // message stable between runs.
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
 }
 
 /// The one class `name` means, or `None` when it is missing or ambiguous.
 fn class_lookup(classes: &HashMap<String, ClassEntry>, name: &str) -> Option<(String, ClassEntry)> {
-let mut candidates = class_candidates(classes, name);
-if candidates.len() == 1 {
-return candidates.pop();
-}
-None
+    let mut candidates = class_candidates(classes, name);
+    if candidates.len() == 1 {
+        return candidates.pop();
+    }
+    None
 }
 
 /// The qualified name of the class `name` declared in `path`.
@@ -1416,9 +1576,7 @@ fn package_of_path(path: &str, name: &str) -> String {
         Some(at) => segments[at + 1..]
             .iter()
             .copied()
-            .filter(|s| {
-                !s.is_empty() && !s.ends_with(".java") && !s.ends_with(".kt")
-            })
+            .filter(|s| !s.is_empty() && !s.ends_with(".java") && !s.ends_with(".kt"))
             .collect(),
         None => Vec::new(),
     };
@@ -1434,12 +1592,12 @@ fn package_of_path(path: &str, name: &str) -> String {
 /// endpoint names without a qualifier is the one in its own package when there is
 /// one; a same-named file elsewhere is a different type.
 fn path_in_scope(path: &str, scope: &str) -> bool {
-let Some((package, _)) = scope.rsplit_once("::") else {
-return false;
-};
-let dir = package.replace('.', "/");
-let normalised = path.replace('\\', "/");
-normalised.contains(&format!("/{dir}/")) || normalised.contains(&format!("/{dir}::"))
+    let Some((package, _)) = scope.rsplit_once("::") else {
+        return false;
+    };
+    let dir = package.replace('.', "/");
+    let normalised = path.replace('\\', "/");
+    normalised.contains(&format!("/{dir}/")) || normalised.contains(&format!("/{dir}::"))
 }
 
 /// The identity of a class: its package, the type that declares it, and its name.
@@ -1596,8 +1754,14 @@ fn load_class(
             // other pass has parsed this file.
             let mut file_imports: HashMap<String, String> = HashMap::new();
             for import in &model.imports {
-                let Some((package, simple)) = import.rsplit_once('.') else { continue };
-                if simple.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                let Some((package, simple)) = import.rsplit_once('.') else {
+                    continue;
+                };
+                if simple
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())
+                {
                     file_imports
                         .entry(simple.to_owned())
                         .or_insert_with(|| package.to_owned());
