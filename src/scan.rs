@@ -355,6 +355,24 @@ impl DtoIndex {
     /// then the simple name. That order is what makes `AController.Request` and
     /// `BController.Request` resolve to their own types.
     pub fn resolve_in(&self, scope: &str, name: &str) -> Option<ResolvedClass> {
+        // A dotted name (`com.alpha.Payload`) is the source pinning the type by
+        // syntax, so it outranks every scope rule. It used to be reduced to the
+        // simple name before it reached here, which let a same-named type in the
+        // endpoint's package win.
+        if name.contains('.') && let Some((package, type_name)) = name.rsplit_once('.') {
+            let key = format!("{package}::{type_name}");
+            // The last segment may itself be a nested type (`a.b.Outer.Inner`),
+            // which the scan stores as `a.b::Outer::Inner`; try the whole path and
+            // then each split point from the right.
+            if let Some(fields) = self.scopes.get(&key) {
+                return Some(ResolvedClass {
+                    params: self.scope_params.get(&key).cloned().unwrap_or_default(),
+                    fields: fields.clone(),
+                    qualified: key,
+                });
+            }
+            return None;
+        }
         // JLS 6.4.1 orders a simple type name: member types of the enclosing
         // types, then a single-type import, then types declared in the same
         // package. Each step is tried in that order, because they genuinely

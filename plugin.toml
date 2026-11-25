@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.9"
+version = "0.3.10"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.9 — 修全限定类型名被作用域覆盖。字段或参数直接写 com.alpha.Payload 时，本该就是那个类型（全限定名由语法指定，与作用域规则无关），但解析时先把名字压成简单名 Payload、限定信息丢失，随后按作用域解析命中了同包的 com.web.Payload。@RequestBody 参数同样受影响。这类代码合法且无歧义，错的 schema 会覆盖服务器上正确的文档。现在队列携带显式限定名，解析时优先按它取类；通配符 import（import com.alpha.*）不享有这个优先级——按 Java 规范它排在同包类型之后。新增 5 个用例覆盖字段/参数/泛型实参的全限定写法与通配符 import，155 个用例全绿，yudao 实测 3603 接口 / 1663 DTO 无回归。"
+change-notes = "0.3.10 — 修 Schema 阶段丢弃全限定名。上一版让扫描队列保留 com.alpha.Payload，但生成 Schema 时第一行就把点号后面的部分截掉、只剩 Payload，交给 resolver 时限定信息已丢失，于是按作用域规则选中了同包的 com.web.Payload。这个问题只在两个同名 DTO 都可达时暴露：只导出其中一个时恰好是唯一候选，看起来正常。现在 Schema 阶段保留原始写法，简单名只用于判断内建类型；resolver 收到带点的名字时直接按精确身份解析（包名保留点号，只有最后一段转成 ::）。新增 3 个用例覆盖请求/响应全限定、经字段持有、泛型实参三种路径；158 个用例全绿，yudao 实测 3603 接口 / 1663 DTO 无回归。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

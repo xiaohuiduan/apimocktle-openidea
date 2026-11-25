@@ -209,8 +209,12 @@ pub fn type_schema(ty: &str, depth: u32, resolve: &Resolver<'_>, scope: &str) ->
         let inner = ty.trim_end_matches("[]");
         return json!({ "type": "array", "items": type_schema(inner, depth, resolve, scope) });
     }
-    let (base, args) = split_type(ty);
-    let base = base.rsplit('.').next().unwrap_or(&base).to_owned();
+    let (written, args) = split_type(ty);
+    // `simple` answers "is this a built-in / a known wrapper?" — those are always
+    // written unqualified. Lookups use `written` so a dotted reference keeps its
+    // exact identity instead of being resolved by scope.
+    let simple = written.rsplit('.').next().unwrap_or(&written).to_owned();
+    let base = simple.clone();
     if is_object_like(&base) {
         let value = args.get(1).map(|v| type_schema(v, depth, resolve, scope)).unwrap_or_else(|| json!({ "type": "string" }));
         let key = args.first().map(|k| map_key_name(k)).unwrap_or_else(|| "string".to_owned());
@@ -232,7 +236,7 @@ pub fn type_schema(ty: &str, depth: u32, resolve: &Resolver<'_>, scope: &str) ->
         // `depth > 0` guard keeps a self-referential wrapper from recursing
         // forever once the depth budget is spent.
         if depth > 0
-            && let Some(resolved) = resolve(&base, depth, scope).filter(|rc| !rc.fields.is_empty())
+            && let Some(resolved) = resolve(&written, depth, scope).filter(|rc| !rc.fields.is_empty())
         {
             let mapped = substitute(&resolved.fields, &resolved.params, &args);
             return object_schema_in(&mapped, depth, resolve, &resolved.qualified);
@@ -249,7 +253,7 @@ pub fn type_schema(ty: &str, depth: u32, resolve: &Resolver<'_>, scope: &str) ->
     // A generic class that is not a known wrapper (`Wrapper<T>`, `Envelope<T>`)
     // still describes itself, but its parameters must be substituted or every
     // `T` field collapses into a plain object.
-    match resolve(&base, depth, scope) {
+    match resolve(&written, depth, scope) {
         Some(resolved) if !resolved.fields.is_empty() => {
             let mapped = substitute(&resolved.fields, &resolved.params, &args);
             object_schema_in(&mapped, depth, resolve, &resolved.qualified)
