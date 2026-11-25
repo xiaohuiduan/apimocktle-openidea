@@ -162,3 +162,38 @@ fn a_member_type_still_beats_an_import() {
         "the member type outranks the import: {req}"
     );
 }
+
+#[test]
+fn an_import_beats_a_same_package_type_declared_in_another_controller_file() {
+    // The same-package `Payload` is declared at the bottom of `BController.java`
+    // (a package-private top-level class). It is therefore in the controller class
+    // table, which is what let `scoped_lookup` reach it before the import.
+    let files = [
+        (
+            "src/com/web/AController.java",
+            "package com.web;\n\nimport com.alpha.Payload;\n\n@RestController\npublic class AController {\n    @PostMapping(\"/a\")\n    public Payload save(@RequestBody Payload form) { return null; }\n}\n",
+        ),
+        (
+            "src/com/web/BController.java",
+            "package com.web;\n\n@RestController\npublic class BController {\n    @PostMapping(\"/b\")\n    public Payload save(@RequestBody Payload form) { return null; }\n}\n\nclass Payload {\n    private String beta;\n}\n",
+        ),
+        (
+            "src/com/alpha/Payload.java",
+            "package com.alpha;\n\npublic class Payload {\n    private String alpha;\n}\n",
+        ),
+    ];
+    let scanned = scan(&files);
+    let a_req = schema(&scanned, "/a", "req_body_other");
+    let a_res = schema(&scanned, "/a", "res_body");
+    let b_req = schema(&scanned, "/b", "req_body_other");
+    println!("/a req -> {a_req}");
+    println!("/a res -> {a_res}");
+    println!("/b req -> {b_req}");
+
+    assert!(a_req.contains("alpha"), "AController imports com.alpha.Payload: {a_req}");
+    assert!(!a_req.contains("beta"), "/a must not use the same-package class: {a_req}");
+    assert!(a_res.contains("alpha"), "/a response follows the import: {a_res}");
+    assert!(!a_res.contains("beta"), "/a response must not use the same-package class: {a_res}");
+    assert!(b_req.contains("beta"), "BController means com.web.Payload: {b_req}");
+    assert!(!b_req.contains("alpha"), "/b must not borrow A's import: {b_req}");
+}

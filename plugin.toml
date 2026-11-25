@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.7"
+version = "0.3.8"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.7 — 修显式 import 被同包同名类型抢先的问题。com.web.AController 写了 import com.alpha.Payload，同包又存在 com/web/Payload.java；按 Java 语言规范（JLS 6.4.1），单类型 import 优先于同包其他文件的同名顶层类型，所以 A 用的是 com.alpha 那个。之前的解析先沿作用域向外走到包，命中 com.web::Payload 就返回，import 来不及生效：A 的请求和响应 schema 变成了 beta，导出会覆盖服务器上正确的 alpha 文档。现在解析顺序按规范来——成员类型（不含包）→ 文件的单类型 import → 同包 → 全项目唯一，扫描侧与 Schema 侧使用同一顺序。验证：该四文件场景下 /a 保留 alpha、/b 保留 beta，控制器内嵌类型仍优先于 import；149 个用例全绿，yudao 实测 3603 接口 / 1663 DTO 无回归。"
+change-notes = "0.3.8 — 补完 import 优先级的另一半：同包类型与控制器在同一个文件里时仍会被抢先。上一版把解析顺序改成「成员类型 → 单类型 import → 同包」，但扫描侧的 scoped_lookup 用 first 标志做边界，第一次向外时 first 还是 true，守卫不生效，于是走到了包、命中同包类型；另外 scoped 落空后还有个全局 class_lookup 会再命中一次。两处都只在独立 DTO 文件时侥幸通过，同文件声明就会暴露。现在 scoped_lookup 与 resolve_in 用完全相同的边界（到包为止），且当该文件明确 import 了这个名字时，同包回退和全局查找都跳过，只按 import 的包解析。验证：三文件场景下 AController 用 com.alpha.Payload（alpha）、BController 用同文件的 com.web.Payload（beta），请求与响应都正确；150 个用例全绿，yudao 实测 3603 接口 / 1663 DTO 无回归；两个修复各自反向验证，去掉任一个对应用例立刻失败。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

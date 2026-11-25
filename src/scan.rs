@@ -1285,10 +1285,18 @@ fn resolve_dtos(
         // type in the same package. A controller that imports `com.alpha.Payload`
         // while `com/web/Payload.java` exists means the imported one, so the package
         // step comes after the import.
-        let same_package = scope
-            .rsplit_once("::")
-            .and_then(|(package, _)| classes.get_key_value(&format!("{package}::{name}")))
-            .map(|(key, hit)| (key.clone(), hit.clone()));
+        // A same-package type only answers when this file does not import the
+        // name: `import com.alpha.Payload` outranks `com/web/Payload.java`
+        // (JLS 6.4.1), and `imported_lookup` searches the controller table only,
+        // so a type declared in its own file misses there and must then be loaded
+        // from the imported package instead of falling back to the local one.
+        let same_package = match &imported_package {
+            Some(_) => None,
+            None => scope
+                .rsplit_once("::")
+                .and_then(|(package, _)| classes.get_key_value(&format!("{package}::{name}")))
+                .map(|(key, hit)| (key.clone(), hit.clone())),
+        };
         let scoped = scoped_lookup(classes, &scope, &name)
             .or_else(|| imported_lookup(classes, imports_of.get(&scope), &name))
             .or(same_package);
@@ -1313,7 +1321,11 @@ fn resolve_dtos(
         budget -= 1;
         // The endpoint's scope decides which declaration a bare name means, so the
         // scoped key is tried before the global one.
-        let found = match scoped.or_else(|| class_lookup(classes, &name)) {
+        let global = match &imported_package {
+            Some(_) => None,
+            None => class_lookup(classes, &name),
+        };
+        let found = match scoped.or(global) {
             // A controller from the class table: its file's imports were recorded
             // in the controller pass.
             Some((qualified, hit)) => Some((qualified, hit, HashMap::new())),
@@ -1482,29 +1494,23 @@ fn scoped_lookup(
     scope: &str,
     name: &str,
 ) -> Option<(String, ClassEntry)> {
-    // Member types only: the declaring class and its enclosing types. The package
-    // is NOT walked here — a single-type import outranks a type declared in the
-    // same package (JLS 6.4.1), so imported_lookup has to run before the
-    // package step, and walking into the package here would pre-empt it.
+    // Member types only: the declaring class and its enclosing types, stopping
+    // before the package. A single-type import outranks a type declared in the
+    // same package (JLS 6.4.1), so `imported_lookup` has to run before the
+    // package step — and a type declared in another controller's file IS in the
+    // class table, so walking into the package here pre-empted the import.
+    // This boundary matches `DtoIndex::resolve_in` exactly.
     let mut prefix = scope;
-    let mut first = true;
     loop {
         let key = format!("{prefix}::{name}");
         if let Some(hit) = classes.get_key_value(&key) {
             return Some((key, hit.1.clone()));
         }
         match prefix.rsplit_once("::") {
-            Some((outer, _)) => {
-                // Stop before the package: one :: level above the class body is
-                // the package, and that step belongs after the import.
-                if !first && !outer.contains("::") {
-                    break;
-                }
-                prefix = outer;
-            }
-            None => break,
+            // One level above the type is the package; stop there, always.
+            Some((outer, _)) if outer.contains("::") => prefix = outer,
+            _ => break,
         }
-        first = false;
     }
     None
 }
