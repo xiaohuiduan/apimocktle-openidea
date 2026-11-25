@@ -374,14 +374,29 @@ impl DtoIndex {
         // simple name before it reached here, which let a same-named type in the
         // endpoint's package win.
         if name.contains('.') {
-            // `a.b.C` is `a.b::C`; `a.b.Outer.Inner` is `a.b::Outer::Inner`. The
-            // package keeps its dots, so try every point where the package ends:
-            // the scan stores exactly one of these keys.
+            // Three shapes are written with dots and they mean different things:
+            //
+            //   `AController.Request`          a member type of a class in this file
+            //   `Outer.Inner`                  a member type, same
+            //   `com.acme.Payload`             a fully qualified top-level type
+            //   `com.acme.Outer.Inner`         a fully qualified member type
+            //
+            // The package keeps its dots and only the class boundary becomes `::`,
+            // so every split point is a candidate; the current scope's package is
+            // tried as well, because a relative member name carries no package.
+            let mut candidates: Vec<String> = Vec::new();
+            if let Some((package, _)) = scope.rsplit_once("::") {
+                candidates.push(format!("{package}::{}", name.replace('.', "::")));
+            }
             let segments: Vec<&str> = name.split('.').collect();
             for at in (1..segments.len()).rev() {
-                let package = segments[..at].join(".");
-                let rest = segments[at..].join("::");
-                let key = format!("{package}::{rest}");
+                candidates.push(format!(
+                    "{}::{}",
+                    segments[..at].join("."),
+                    segments[at..].join("::")
+                ));
+            }
+            for key in candidates {
                 if let Some(fields) = self.scopes.get(&key) {
                     return Some(ResolvedClass {
                         params: self.scope_params.get(&key).cloned().unwrap_or_default(),

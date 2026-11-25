@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.11"
+version = "0.3.12"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.11 — 修全限定嵌套类解析。com.acme.Outer.Inner 这种写法（真实工程常见，如 MidjourneyApi.Notify 做 @RequestBody）之前解析成空 schema：一是按简单名 Inner 查不到文件（它声明在 Outer.java 里），二是身份算成了 com.acme::Inner 而非 com.acme::Outer::Inner。现在从限定名取出外部类名定位文件，并保留外部类身份拼出正确限定名；resolve_in 的带点分支也改成尝试每个包边界，多层嵌套才对得上。验证：yudao 的 DTO 类型从 1663 增加到 1694（+31），接口数 3603 不变；160 个用例全绿。"
+change-notes = "0.3.12 — 修成员类型被导出成空对象。字段或参数写成 AController.Request（成员类型的相对写法）或 com.acme.AController.Request（全限定写法）时，Schema 变成空的 {"type":"object"}，导出会清空服务器上已有的字段——这是 0.3.10 引入的回归，0.3.8 上这两种写法正常。原因是带点名字的解析把所有情况都按「最后一个点前面是包名」处理，而成员类型的限定词是外部类、不是包。现在区分三种形状：相对成员名拼上当前作用域的包，全限定顶层名按最后一个点拆，全限定成员名按包边界拆。新增 3 个用例（相对成员名、全限定成员名、裸名），163 个用例全绿。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"
