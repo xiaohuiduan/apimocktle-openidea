@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.4"
+version = "0.3.5"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.4 — 诊断版：给扫描加宿主调用计量。每次扫描结束会在 IDE 日志输出一行，含 read_file 与 search_text 的次数和总耗时，用来定位大项目上卡住的具体阶段（例如 DTO 阶段是索引没命中而在逐个搜索，还是单纯类型太多）。同时修：仪表盘与导出共用同一个后台任务标题，跑导出时进度条在 DTO 阶段分母会扩张，看起来停在某个百分比不动——现在分开报，控制器阶段与 DTO 阶段各自有上限。"
+change-notes = "0.3.5 — 修大项目导出失败。定位依据是上一版加的计量日志：yudao 上一次扫描 read_file 1030 次只用 0.3 秒，search_text 126 次却花了 49 秒，单次 390 毫秒——瓶颈不是读文件，而是全项目正则搜索。原因是类型索引只建到 5000 个文件，而该项目有 8140 个 Java 文件，被截掉的三千多个文件里的类全部查不到，于是每个都退回一次全项目搜索。现在索引按源码总量建（上限 20 万），一次扫描只需 1 次搜索而不是 126 次。另外给兜底搜索加了次数上限，防止生成式工程把预算耗在搜索上。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

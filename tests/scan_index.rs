@@ -215,3 +215,54 @@ fn without_a_budget_the_scan_is_complete() {
     // candidate file; the DTO is resolved through the index instead.
     assert_eq!(scanned.files, 1, "the controller file is read");
 }
+
+#[test]
+fn the_type_index_covers_a_project_bigger_than_the_controller_limit() {
+    // A project has far more sources than controllers: yudao-cloud has 735
+    // controllers among 8140 Java files. The index used to take `file_limit`
+    // (5000) as its own bound, so the last ~3000 files were never indexed and
+    // every type declared there fell back to a project-wide search — 390 ms
+    // each on the real host, 125 of them spending 49 s of the call budget.
+    //
+    // The assertion is on searches, not on the index's size: a miss is what
+    // costs time, and it is observable here.
+    //
+    // **What this test cannot see**: `MockHost` ignores `find_files`' limit, so
+    // it cannot reproduce a truncated index. The test therefore guards the
+    // *outcome* (types resolved by file name rather than by project-wide search)
+    // for a project larger than the controller limit, but the truncation itself
+    // would still slip through here — only the real host exposes it. It was
+    // measured there: 8140 files against a 5000-file index cost 125 project-wide
+    // searches, 49 s.
+    let controllers = 3;
+    let fillers = crate::scan::FILE_LIMIT as usize + 40;
+    let mut files: Vec<(String, String)> = Vec::new();
+    for i in 0..controllers {
+        files.push((
+            format!("src/Ctrl{i}Controller.java"),
+            controller(&format!("Item{i}"), &format!("Item{i}")),
+        ));
+    }
+    // Types that exist only as plain classes, well past the controller limit.
+    // They are what the index has to answer for.
+    for i in 0..fillers {
+        files.push((format!("src/dto/Filler{i}.java"), dto(&format!("Filler{i}"))));
+    }
+    let borrowed: Vec<(&str, String)> = files.iter().map(|(p, t)| (p.as_str(), t.clone())).collect();
+    let (host, searches) = host(&borrowed);
+
+    let scanned = scan_with(&host, &Options::default());
+    assert_eq!(scanned.files, controllers, "only controllers are parsed");
+
+    // Every controller resolved its DTO through the index. If the index had been
+    // cut at `FILE_LIMIT`, the controller DTOs (declared past it) would each cost
+    // a declaration search. A handful of searches still happen for the JDK types
+    // the fixture mentions (`String`, `int`), so the bound is on "not one per
+    // controller", not on an exact count.
+    let total = searches.load(Ordering::Relaxed);
+    assert!(
+        total <= controllers + 2,
+        "the index answered the controller types by file name, so no declaration \
+         search per controller was needed (got {total} for {controllers} controllers)"
+    );
+}

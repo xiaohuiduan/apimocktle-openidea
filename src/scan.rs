@@ -17,7 +17,31 @@ use crate::spring::{self, ParamKind};
 /// (`examples/scan_bench.rs`).
 pub const MARKERS: &str = "@(RestController|Controller|RequestMapping|GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|FeignClient|Path)";
 /// Candidate files handed to the text search.
+///
+/// Bounds the *controllers* a scan parses. A project with more controllers than
+/// this gets a partial route list — which is visible in the result
+/// (`truncated`), so it is a stated limit rather than a silent one.
 pub const FILE_LIMIT: u32 = 5_000;
+/// Source files the type index may hold.
+///
+/// Deliberately far above `FILE_LIMIT`: the index answers "which file declares
+/// this class", and a project has many more sources than controllers. When the
+/// index came up short, every type it could not answer fell back to a
+/// project-wide regex search — measured at ~390 ms each on a 8000-file project,
+/// so 125 misses spent 49 s. Missing entries are therefore expensive, not just
+/// incomplete: the index is sized so a real project fits in it.
+pub const INDEX_FILE_LIMIT: u32 = 200_000;
+/// Project-wide declaration searches one scan may run.
+///
+/// Each costs a full-project regex scan (~390 ms on an 8000-file project), so
+/// they are expensive — but the count alone is not a good budget: a legitimate
+/// project can need many (a DTO whose file is named otherwise, or classes that
+/// share a simple name across modules). The real fix is the index covering every
+/// source (`INDEX_FILE_LIMIT`), after which a miss means the class is genuinely
+/// absent. This limit exists only to stop a pathological model — a generated
+/// build with thousands of unresolvable names — from spending the whole call
+/// budget on searches, so it sits far above what a real project needs.
+pub const FALLBACK_LIMIT: usize = 500;
 /// Text matches asked for; one controller file yields several.
 pub const MATCH_LIMIT: u32 = 40_000;
 /// DTO types resolved per scan, so a cyclic or huge model cannot run away.
@@ -106,18 +130,24 @@ struct TypeIndex {
     /// otherwise is never in it — yet it exists, and caching "already searched"
     /// would make only the first controller that mentions it work.
     searched: HashMap<String, Vec<String>>,
+    /// How many project-wide declaration searches this index has run; bounded
+    /// by `FALLBACK_LIMIT`.
+    searches: usize,
 }
 
 impl TypeIndex {
     fn build(project: &Project, options: &Options) -> TypeIndex {
-        let limit = options.file_limit.max(1);
+        // Index every source, not just `file_limit` of them: a miss here is not
+        // merely an absent answer, it costs a project-wide search (see
+        // `INDEX_FILE_LIMIT`).
+        let limit = INDEX_FILE_LIMIT.max(options.file_limit);
         let java = index_of(project.find_files("**/*.java", limit).unwrap_or_default());
         let kotlin = if options.include_kotlin {
             index_of(project.find_files("**/*.kt", limit).unwrap_or_default())
         } else {
             HashMap::new()
         };
-        TypeIndex { java, kotlin, searched: HashMap::new() }
+        TypeIndex { java, kotlin, searched: HashMap::new(), searches: 0 }
     }
 
     /// The candidate files for `name`, Java first. Empty means the index has
@@ -130,10 +160,22 @@ impl TypeIndex {
     }
 
     /// The declaration search, run at most once per name and cached by result.
+    ///
+    /// Each search scans the whole project (`search_text` with no scope), which
+    /// costs ~390 ms on an 8000-file project. The index is sized so a real
+    /// project answers almost every name (`INDEX_FILE_LIMIT`), so a search here
+    /// means the class is genuinely absent — and a project with many such names
+    /// (a DTO whose supertype is generated, say) would spend the whole call
+    /// budget on them. `FALLBACK_LIMIT` bounds that: past it the name is
+    /// reported as absent, which is what it almost always is.
     fn fallback(&mut self, project: &Project, options: &Options, name: &str) -> Vec<String> {
         if let Some(hit) = self.searched.get(name) {
             return hit.clone();
         }
+        if self.searches >= FALLBACK_LIMIT {
+            return Vec::new();
+        }
+        self.searches += 1;
         let found = declaration_candidates(project, options, name);
         self.searched.insert(name.to_owned(), found.clone());
         found
