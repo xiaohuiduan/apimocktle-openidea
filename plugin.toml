@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.4.2"
+version = "0.4.3"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.4.2 — 导出不再每批只发 200 个。之前一次调用只发 200 个接口、剩下的靠每分钟自动续传，大项目要等十几分钟。原因是发送循环仍在 5 秒命令预算内（按 200 个 × 7.7 毫秒算刚好超），而扫描早已用后台任务把预算放宽到 50 秒，发送这段没有跟上。现在发送也开后台任务并逐个上报续期，一批上限提到 2 万，实测速度下 3598 个接口约 28 秒一次发完，不再需要点「立即继续」。"
+change-notes = "0.4.3 — 修嵌套类解析。之前只收集顶层类，类里面再声明的类（常见写法：控制器内嵌请求/响应 DTO，或 DTO 内嵌子结构）完全拿不到，导致这些接口导出的字段是空的——而且扫描不会报错，所以很难发现。现在解析器把嵌套类也当成独立的类收集，并按层次展开，控制器内嵌的 Request、DTO 里内嵌的 Inner、以及字段写成 Outer.Inner 的限定形式都能解析到。新增 4 个用例覆盖这三种写法。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

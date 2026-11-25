@@ -127,6 +127,13 @@ pub struct Class {
     pub methods: Vec<Method>,
     pub fields: Vec<Field>,
     pub doc: String,
+    /// Types declared inside this one (`class Outer { static class Inner {} }`).
+    ///
+    /// A nested type is a type in its own right: `@RequestBody Inner` needs it
+    /// resolved exactly like a top-level one, and it lives in its declaring
+    /// class's file, so the file-name index cannot find it by name. Collected
+    /// here and surfaced into `FileModel::classes` by the caller.
+    pub nested: Vec<Class>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -274,7 +281,15 @@ pub fn parse(src: &str) -> FileModel {
                                 ..Class::default()
                             };
                             parse_body(src, &lexed, k + 1, end, &mut class);
+                            // Nested types are types too: the index finds files
+                            // by name, so `Request` inside `Ctrl.java` is not
+                            // reachable unless it is a class of its own here.
+                            // Depth-first so an inner type is registered before
+                            // the type that declares it (harmless, and it keeps
+                            // the order stable).
+                            let nested = std::mem::take(&mut class.nested);
                             model.classes.push(class);
+                            push_nested(&mut model.classes, nested);
                         } else {
                             pending.clear();
                         }
@@ -369,6 +384,15 @@ fn param_name<'a>(src: &'a str, lexed: &Lexed, from: usize, to: usize) -> Option
     last
 }
 
+/// Adds `nested` and everything declared inside it to `out`.
+fn push_nested(out: &mut Vec<Class>, nested: Vec<Class>) {
+    for mut class in nested {
+        let deeper = std::mem::take(&mut class.nested);
+        out.push(class);
+        push_nested(out, deeper);
+    }
+}
+
 fn parse_body(src: &str, lexed: &Lexed, from: usize, to: usize, class: &mut Class) {
     // Javadoc search stops here: a member without its own doc must not inherit
     // the class comment (that is how every route of a controller ended up
@@ -452,6 +476,21 @@ fn parse_body(src: &str, lexed: &Lexed, from: usize, to: usize, class: &mut Clas
         }
         if is(src, lexed, i, '{') {
             let close = matching(src, lexed, i, '{', '}').unwrap_or(to);
+            // A nested type (`class Request {}` inside a controller or another
+            // DTO) has its own body. Skipping the block is right for a method or
+            // an initializer, but it used to drop the nested type entirely: a
+            // controller whose request body was an inner class published an
+            // endpoint with an empty schema. `seg` still holds the declaration
+            // head at this point (`public static class Request`), which is what
+            // names it.
+            if let Some(mut inner) = nested_class(src, lexed, &seg, &anns) {
+                parse_body(src, lexed, i + 1, close, &mut inner);
+                class.nested.push(inner);
+                anns.clear();
+                seg.clear();
+                i = close + 1;
+                continue;
+            }
             i = close + 1;
             anns.clear();
             seg.clear();
@@ -488,6 +527,54 @@ fn parse_body(src: &str, lexed: &Lexed, from: usize, to: usize, class: &mut Clas
     if let Some(field) = parse_field(src, lexed, &seg, &anns, floor) {
         class.fields.push(field);
     }
+}
+
+/// A type declared inside a body: `public static class Request {}`.
+///
+/// `head` holds the tokens of the declaration up to (not including) its `{`:
+/// modifiers, the `class`/`interface`/`record` keyword, the name and any type
+/// parameters. Returns `None` for any other block — a method body, an
+/// initializer, a lambda — which the caller then skips as before.
+fn nested_class(src: &str, lexed: &Lexed, head: &[usize], anns: &[Ann]) -> Option<Class> {
+    let mut name: Option<String> = None;
+    let mut type_params: Vec<String> = Vec::new();
+    let mut saw_keyword = false;
+    let mut k = 0usize;
+    while k < head.len() {
+        let t = head[k];
+        if let Some(word) = ident(src, lexed, t) {
+            if matches!(word, "class" | "interface" | "record") {
+                saw_keyword = true;
+                // The name follows the keyword; a type parameter list may come
+                // after it (`class Box<T>`).
+                if let Some(next) = head.get(k + 1).and_then(|&n| ident(src, lexed, n)) {
+                    name = Some(next.to_owned());
+                }
+            }
+            k += 1;
+            continue;
+        }
+        if saw_keyword && is(src, lexed, t, '<') {
+            let close = matching(src, lexed, t, '<', '>').unwrap_or(head.len() - 1);
+            for &inner in head.iter().filter(|&&h| h > t && h < close) {
+                if let Some(word) = ident(src, lexed, inner)
+                    && word.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                {
+                    type_params.push(word.to_owned());
+                }
+            }
+            k = head.iter().position(|&h| h > close).unwrap_or(head.len());
+            continue;
+        }
+        k += 1;
+    }
+    let name = name?;
+    Some(Class {
+        name,
+        type_params,
+        anns: anns.to_vec(),
+        ..Class::default()
+    })
 }
 
 fn parse_field(src: &str, lexed: &Lexed, seg: &[usize], anns: &[Ann], floor: usize) -> Option<Field> {
