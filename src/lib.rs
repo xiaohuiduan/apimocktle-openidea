@@ -66,6 +66,9 @@ pub struct ApiMocktle {
     /// point that sets it carries `#[doc(hidden)]` and the shipped wasm build
     /// never calls it.
     scan_budget_override: Option<Duration>,
+    /// Overrides `scan::TYPE_BUDGET`, for the same reason: the test that pins
+    /// the cap's refusal has to reach the cap without a 5 000-type project.
+    type_budget_override: Option<usize>,
 }
 
 struct Config {
@@ -94,6 +97,15 @@ const SCAN_BUDGET: Duration = Duration::from_millis(4_200);
 /// The endpoints provider only gets 2 s, and a SoftTimeout reaps the instance
 /// just the same, so its scan stops earlier still.
 const ROUTE_BUDGET: Duration = Duration::from_millis(1_500);
+/// The budget a scan gets while a `host::begin_task` is open: the host raises
+/// the call's wall clock from 5 s to 60 s for as long as the task is open and
+/// keeps renewing it on every `report` (`plugins/README.md`, `tasks.begin`).
+///
+/// 50 s leaves 10 s of the 60 to build the export queue and send its first
+/// batch inside the same call. Without this, a project whose DTO closure needs
+/// more than 4.2 s could never be exported at all — retrying reproduced the
+/// same refusal every time, because the scan always started from zero.
+const TASK_SCAN_BUDGET: Duration = Duration::from_millis(50_000);
 
 fn scan_options() -> scan::Options {
     scan::Options {
@@ -108,13 +120,17 @@ fn scan_options() -> scan::Options {
     }
 }
 
-/// `scan_options`, with the scan deadline replaced.
+/// `scan_options`, narrowed to one file or folder and given `budget`.
 ///
-/// Production always uses `SCAN_BUDGET`; the tests that pin the DTO-deadline
-/// refusal need to place the expiry inside the closure, which they can only do
-/// by moving the deadline.
-fn scan_options_with_budget(budget: Duration) -> scan::Options {
-    scan::Options { budget: Some(budget), ..scan_options() }
+/// Narrowing here rather than filtering endpoints afterwards is what makes the
+/// refusal's advice ("export the current file or folder") true: the parse and
+/// the DTO closure then only cover the controllers that were asked for.
+fn scan_options_narrowed(only_path: Option<&str>, budget: Duration) -> scan::Options {
+    scan::Options {
+        only_path: only_path.map(str::to_owned),
+        budget: Some(budget),
+        ..scan_options()
+    }
 }
 
 /// Routes only: no DTO resolution, fewer candidate files.
@@ -249,21 +265,47 @@ fn target_path(ctx: &Invocation, arg: Option<&str>) -> Option<String> {
 }
 
 impl ApiMocktle {
-    /// The scan deadline in force: `SCAN_BUDGET`, unless a test overrode it.
-    fn scan_budget(&self) -> Duration {
-        self.scan_budget_override.unwrap_or(SCAN_BUDGET)
-    }
-
-    fn scan(&mut self, project: &Project) -> Result<Rc<ScanResult>, Error> {
+    /// The full scan, for an export that already holds a task.
+    ///
+    /// `narrow` restricts the parse and the DTO closure to one file or folder,
+    /// which is what makes "export the current file or folder" a way past a
+    /// deadline. The task is what supplies the 60-second call budget; a scan
+    /// without one would be cut off at the host's 5 s.
+    ///
+    /// A narrowed result is never cached: it describes one corner of the
+    /// project, and handing it back as a full scan would silently drop every
+    /// endpoint outside it. It also does not reuse a cached full scan, since the
+    /// point of narrowing is to look at less.
+    fn scan_export(
+        &mut self,
+        project: &Project,
+        narrow: Option<&str>,
+    ) -> Result<Rc<ScanResult>, Error> {
         let root = project.root()?;
-        if let Some(hit) = self.cache.get(&root) {
+        if narrow.is_none()
+            && let Some(hit) = self.cache.get(&root)
+        {
             return Ok(hit.clone());
         }
-        // A route-only scan may already be cached (the dashboard ran first).
-        // Its endpoints are already correct, but its `dto` is empty, and export
-        // needs the graph — so it cannot be reused as the full result.
-        let budget = self.scan_budget();
-        let result = Rc::new(scan::scan(project, &scan_options_with_budget(budget))?);
+        // `scan_budget_override` is a test hook: production always takes the
+        // task's 60-second allowance.
+        let budget = self.scan_budget_override.unwrap_or(TASK_SCAN_BUDGET);
+        let options = scan::Options {
+            type_budget: self.type_budget_override,
+            ..scan_options_narrowed(narrow, budget)
+        };
+
+        // The task is what raises this call's wall clock from 5 s to 60 s, and
+        // only `report`/`is_cancelled` keep renewing it. `None` when the host
+        // refuses one: the scan then runs on the 4.2 s budget as before.
+        let task = host::begin_task(i18n::SCAN_TASK_TITLE.get(i18n::lang()), true);
+        task.report(0, None, Some(i18n::SCAN_TASK_ROUTES.get(i18n::lang())));
+
+        let result = Rc::new(scan::scan_with_progress(project, &options, |done, total| {
+            task.report(done as u32, Some(total as u32), None);
+        })?);
+        drop(task);
+
         host::log(
             LogLevel::Info,
             &format!(
@@ -278,19 +320,26 @@ impl ApiMocktle {
         // handed to every later export in this session. The route list stays
         // correct, so it is kept for display, and the next call retries the
         // closure from scratch.
-        if result.dto_complete {
-            self.cache.insert(root.clone(), result.clone());
-            // The route-only entry is now redundant: `scan()` prefers `cache`.
-            self.routes.remove(&root);
-        } else {
+        if result.dto_stop.is_some() {
             host::log(
                 LogLevel::Warn,
                 &format!(
-                    "ApiMocktle: DTO 解析未完成（{} 个类型），本次结果不写入缓存，导出会重新扫描",
-                    result.dto.fields.len()
+                    "ApiMocktle: DTO 解析未完成（{} 个类型，原因 {}），本次结果不写入缓存",
+                    result.dto.fields.len(),
+                    match result.dto_stop {
+                        Some(scan::DtoStop::Deadline) => "超时",
+                        Some(scan::DtoStop::TypeBudget) => "类型数上限",
+                        None => "无",
+                    }
                 ),
             );
-            self.routes.insert(root, result.clone());
+            if narrow.is_none() {
+                self.routes.insert(root, result.clone());
+            }
+        } else if narrow.is_none() {
+            self.cache.insert(root.clone(), result.clone());
+            // The route-only entry is now redundant: `scan()` prefers `cache`.
+            self.routes.remove(&root);
         }
         Ok(result)
     }
@@ -344,20 +393,30 @@ impl ApiMocktle {
     fn scan_for_export(
         &mut self,
         ctx: &Invocation,
+        narrow: Option<&str>,
     ) -> Result<(std::rc::Rc<ScanResult>, Project), Error> {
         let project =
             ctx.project().ok_or_else(|| Error::Failed(i18n::OPEN_A_PROJECT.get(i18n::lang()).into()))?;
-        let scanned = self.scan(&project)?;
-        if !scanned.dto_complete {
+        let scanned = self.scan_export(&project, narrow)?;
+        if let Some(stop) = scanned.dto_stop {
+            let lang = i18n::lang();
             host::log(
                 LogLevel::Warn,
                 &format!(
-                    "ApiMocktle: 拒绝导出：DTO 解析未完成（已解析 {} 个类型，路由 {} 个）",
+                    "ApiMocktle: 拒绝导出：DTO 解析未完成（已解析 {} 个类型，路由 {} 个，原因 {:?}）",
                     scanned.dto.fields.len(),
-                    scanned.endpoints.len()
+                    scanned.endpoints.len(),
+                    stop
                 ),
             );
-            return Err(Error::Failed(i18n::DTO_INCOMPLETE.get(i18n::lang()).into()));
+            // The two reasons get different words because they need different
+            // actions: a deadline is worth retrying (and narrowing helps), while
+            // the type cap stops at the same type every time.
+            let text = match stop {
+                scan::DtoStop::Deadline => i18n::DTO_INCOMPLETE.get(lang),
+                scan::DtoStop::TypeBudget => i18n::DTO_TYPE_LIMIT.get(lang),
+            };
+            return Err(Error::Failed(text.into()));
         }
         Ok((scanned, project))
     }
@@ -373,7 +432,9 @@ impl ApiMocktle {
         // `Failed` rather than `Invalid`: these strings are shown to the user as
         // written (`Display`), while `Invalid` would prefix them with "invalid: ".
         let cfg = config()?;
-        let (scanned, _project) = self.scan_for_export(ctx)?;
+        // The scope reaches the scan, so narrowing really narrows: the parse and
+        // the DTO closure only cover the chosen file or folder.
+        let (scanned, _project) = self.scan_for_export(ctx, only_path.as_deref())?;
         let picked: Vec<&Endpoint> = scanned
             .endpoints
             .iter()
@@ -637,6 +698,16 @@ impl ApiMocktle {
         self.run_command(id, ctx, None)?.ok_or_else(|| Error::Failed("no text".into()))
     }
 
+    /// Overrides `scan::TYPE_BUDGET` for the tests that pin the cap's refusal.
+    ///
+    /// The cap is deliberately far above any real project, so reaching it with a
+    /// fixture would mean generating thousands of types. The override lets those
+    /// tests drive the same code path with three.
+    #[doc(hidden)]
+    pub fn set_type_budget_for_tests(&mut self, budget: Option<usize>) {
+        self.type_budget_override = budget;
+    }
+
     /// Delivers one dashboard message with a chosen scan deadline.
     ///
     /// The dashboard's own entry point (`ViewEvent::Message`) reports through a
@@ -887,7 +958,7 @@ impl ApiMocktle {
         // The dashboard's per-endpoint sync writes the same documents
         // `export-project` does, so it needs the same refusal: a partial graph
         // here would overwrite one correct document with a poorer one.
-        let (scanned, _project) = self.scan_for_export(ctx)?;
+        let (scanned, _project) = self.scan_for_export(ctx, None)?;
         let endpoint = scanned
             .endpoints
             .get(index)
@@ -1610,7 +1681,7 @@ public class UploadController {
         assert!(display.dto.fields.is_empty(), "the dashboard does not resolve DTOs");
 
         // What export does next: it must not be handed the route-only result.
-        let full = plugin.scan(&project).expect("a full scan");
+        let full = plugin.scan_export(&project, None).expect("a full scan");
         assert!(
             !full.dto.fields.is_empty(),
             "export needs the DTO graph even when the dashboard scanned first"

@@ -106,17 +106,37 @@ pub const SYNC_LEFT_TOOLTIP: Text = Text::new(
 pub const BACKGROUND_DONE: Text =
     Text::new("Background sync finished; every endpoint is synced.", "后台续传完成，接口已全部同步。");
 
-/// Export refused because the DTO graph never finished.
+/// Export refused because the DTO graph ran out of time.
 ///
-/// OpenIDEA limits one call to five seconds and the scan has to cut the DTO
-/// closure short to stay inside it. The routes are still good, but schemas
-/// built from a partial graph lose fields — and a document that has been saved
-/// without them replaces the correct one on the server. Refusing is the only
-/// outcome that does not silently damage the project's API documents.
+/// An export runs inside a `host::begin_task`, so the scan gets 50 s rather than
+/// the 5 s a plain command would. Reaching this means the project really is
+/// larger than that, and the routes are still good — but schemas built from a
+/// partial graph lose fields, and a document saved without them replaces the
+/// correct one on the server. Refusing is the only outcome that does not
+/// silently damage the project's API documents.
+///
+/// "Export the current file or folder" is a real way out because the scope now
+/// reaches the scan (`Options::only_path`), and the closure then only covers the
+/// types those controllers reach.
 pub const DTO_INCOMPLETE: Text = Text::new(
-    "The DTO types were not fully resolved within the 5-second limit, so nothing was exported; the server's documents are unchanged. Retry, or raise the timeout by scanning a smaller scope (export the current file or folder).",
-    "未能在 5 秒限时内解析完 DTO 类型，因此没有导出，服务器上的接口文档保持不变。可以重试，或用「导出当前文件/目录」缩小范围后再导出。",
+    "The DTO types were not fully resolved within the time limit, so nothing was exported; the server's documents are unchanged. Retry, or export a smaller scope (the current file or folder), which resolves only the types it reaches.",
+    "未能在限时内解析完 DTO 类型，因此没有导出，服务器上的接口文档保持不变。可以重试，或用「导出当前文件/目录」只解析这部分接口用到的类型。",
 );
+
+/// Export refused because the project has more DTO types than one scan resolves.
+///
+/// Not a timeout: no clock was involved, so retrying stops at exactly the same
+/// type every time and would be pointless advice. It is a fixed cap that keeps a
+/// cyclic or generated model from running away, and the way out is to narrow the
+/// scope.
+pub const DTO_TYPE_LIMIT: Text = Text::new(
+    "This project reaches more DTO types than a single scan resolves, so nothing was exported and the server's documents are unchanged. Export the current file or folder to resolve just the types it reaches.",
+    "这个项目用到的 DTO 类型超过了单次扫描的上限，因此没有导出，服务器上的接口文档保持不变。请用「导出当前文件/目录」只解析这部分接口用到的类型。",
+);
+
+/// The background task an export opens to get a 60-second call budget.
+pub const SCAN_TASK_TITLE: Text = Text::new("ApiMocktle: resolving request and response types", "ApiMocktle: 解析请求响应类型");
+pub const SCAN_TASK_ROUTES: Text = Text::new("reading controllers", "读取控制器");
 
 /// The token the queue was built with differs from the one in the settings.
 pub fn queue_other_token() -> String {

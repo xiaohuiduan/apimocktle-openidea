@@ -21,7 +21,14 @@ pub const FILE_LIMIT: u32 = 5_000;
 /// Text matches asked for; one controller file yields several.
 pub const MATCH_LIMIT: u32 = 40_000;
 /// DTO types resolved per scan, so a cyclic or huge model cannot run away.
-pub const TYPE_BUDGET: usize = 400;
+///
+/// Reaching this is **not** a timeout: it used to share the deadline's "give up"
+/// path and the same message, which made a project with more types than this
+/// report "not resolved within the 5-second limit" while no clock had been read.
+/// Export runs inside a `host::begin_task`, so it has 60 s rather than 5; the
+/// cap now only bounds the pathological case (a cyclic or generated model),
+/// which is why it sits far above the largest real project measured.
+pub const TYPE_BUDGET: usize = 5_000;
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -35,6 +42,21 @@ pub struct Options {
     pub file_limit: u32,
     /// Read dependency jars for types the project does not contain.
     pub deps: crate::deps::Config,
+    /// Restrict the scan to the controller files under this path (a file or a
+    /// folder), which is what "export the current file / folder" means.
+    ///
+    /// Without it the narrow export read every controller in the project and
+    /// only filtered the endpoints afterwards, so the expensive half — parsing
+    /// each controller and walking the DTO closure they all reach — was done at
+    /// full project size. The advice the refusal gives ("narrow the scope") only
+    /// ever helps if it reaches the scan.
+    pub only_path: Option<String>,
+    /// DTO types this scan may resolve; `TYPE_BUDGET` when `None`.
+    ///
+    /// Not a plugin setting: production does not lower it, and the tests that
+    /// pin the cap's own refusal need to reach the cap without building a
+    /// project of 5 000 types.
+    pub type_budget: Option<usize>,
     /// Stop collecting and return what was found once this much wall clock has
     /// passed.
     ///
@@ -54,6 +76,8 @@ impl Default for Options {
             resolve_dto: true,
             file_limit: FILE_LIMIT,
             deps: crate::deps::Config::default(),
+            only_path: None,
+            type_budget: None,
             budget: None,
         }
     }
@@ -140,6 +164,20 @@ pub struct DtoIndex {
     pub params: HashMap<String, Vec<String>>,
 }
 
+/// Why a DTO closure stopped before every reachable type was resolved.
+///
+/// The two reasons need different words because they need different actions: a
+/// deadline is worth retrying (the next call may be faster, or the export may be
+/// narrowed), while the type cap is a fixed property of the project and will
+/// stop at exactly the same type every time, however often it is retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DtoStop {
+    /// The wall clock ran out (`Options::budget`).
+    Deadline,
+    /// `TYPE_BUDGET` types were resolved while more were still queued.
+    TypeBudget,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ScanResult {
     pub endpoints: Vec<Endpoint>,
@@ -148,18 +186,52 @@ pub struct ScanResult {
     pub files: usize,
     /// The text search stopped at its limit, so some routes may be missing.
     pub truncated: bool,
-    /// The DTO closure finished, so `dto` describes every reachable type.
+    /// Why the DTO closure stopped, or `None` when it finished.
     ///
-    /// `false` means the closure stopped on its deadline or its type budget and
-    /// the graph is partial: schemas built from it would silently lose fields.
-    /// `truncated` covers routes only, and a partial route list is still useful
-    /// for display — a partial DTO graph is not, because it is written to the
-    /// server as if it were the whole document. Export must refuse it.
-    pub dto_complete: bool,
+    /// A partial graph must not be exported: schemas built from it silently
+    /// lose fields, and `dto` is written to the server as if it were the whole
+    /// document. `truncated` covers routes only, and a partial route list is
+    /// still useful for display — a partial DTO graph is not. Export refuses it,
+    /// and the reason decides what the refusal tells the user to do.
+    pub dto_stop: Option<DtoStop>,
+}
+
+impl ScanResult {
+    /// The closure finished, so `dto` describes every reachable type.
+    ///
+    /// A route-only scan (`resolve_dto: false`) produces no graph at all and is
+    /// complete for its purpose; export never uses those options, and the
+    /// dashboard must not report them as damage.
+    pub fn dto_complete(&self) -> bool {
+        self.dto_stop.is_none()
+    }
+}
+
+/// `path` is `target` or inside it, whichever separator the host used.
+///
+/// The same test `lib::under` makes, repeated here because the scan takes the
+/// path as an option rather than reaching back into the plugin module.
+fn under(path: &str, target: &str) -> bool {
+    let target = target.trim_end_matches(['/', '\\']);
+    path == target || path.starts_with(&format!("{target}/")) || path.starts_with(&format!("{target}\\"))
 }
 
 /// Scans the project for controller routes.
 pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
+    scan_with_progress(project, options, |_, _| {})
+}
+
+/// `scan`, reporting DTO progress as `(resolved, reached)`.
+///
+/// Kept beside `scan` rather than folded into `Options` because a callback would
+/// cost the option struct its `Clone` and `Debug`, which the plugin uses for its
+/// shared configuration. Export passes `host::task_report`, so the call keeps
+/// renewing the 60-second budget a `host::begin_task` grants.
+pub fn scan_with_progress(
+    project: &Project,
+    options: &Options,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<ScanResult, Error> {
     let started = std::time::Instant::now();
     // One wall-clock deadline for the whole scan. `Options::default()` leaves it
     // off; the plugin's entry points set it below the host's own limit. See
@@ -183,6 +255,12 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
     let mut seen: HashSet<String> = HashSet::new();
     let limit = options.file_limit.max(1);
     for m in &found.matches {
+        // A narrowed scan only reads the controllers under the chosen path, so
+        // both the parse and — above all — the DTO closure that follows from
+        // these endpoints stay proportional to what was asked for.
+        if !options.only_path.as_deref().is_none_or(|path| under(&m.location.path, path)) {
+            continue;
+        }
         if seen.insert(m.location.path.clone()) {
             paths.push(m.location.path.clone());
         }
@@ -293,19 +371,30 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
 
     // `resolve_dto: false` is a route-only scan by construction: it produces no
     // DTO graph at all, so there is no partial graph to warn about. Export never
-    // uses those options, and `dto_complete` stays true so the dashboard's
+    // uses those options, and `dto_stop` stays `None` so the dashboard's
     // route-only results are not mistaken for damage.
-    let (dto, dto_complete) = if options.resolve_dto && !out_of_time() {
+    let (dto, dto_stop) = if options.resolve_dto && !out_of_time() {
         let mut deps = crate::deps::Deps::new(options.deps.clone());
-        resolve_dtos(project, options, &mut types, &endpoints, &classes, &sources, &mut deps, &hints, deadline)
+        resolve_dtos(
+            project,
+            options,
+            &mut types,
+            &endpoints,
+            &classes,
+            &sources,
+            &mut deps,
+            &hints,
+            deadline,
+            &mut progress,
+        )
     } else if options.resolve_dto {
         // No time left for the DTO closure: report the routes found so far
         // rather than losing the whole scan to the host's trap. The graph is
         // empty, which is the most partial it can be.
         stopped_early = true;
-        (DtoIndex::default(), false)
+        (DtoIndex::default(), Some(DtoStop::Deadline))
     } else {
-        (DtoIndex::default(), true)
+        (DtoIndex::default(), None)
     };
 
     Ok(ScanResult {
@@ -313,7 +402,7 @@ pub fn scan(project: &Project, options: &Options) -> Result<ScanResult, Error> {
         dto,
         files,
         truncated: found.limit_hit || paths.len() as u32 >= limit || stopped_early,
-        dto_complete,
+        dto_stop,
     })
 }
 
@@ -689,11 +778,16 @@ fn load_source_for(
     None
 }
 
-/// Resolves the DTO closure and reports whether it finished.
+/// Resolves the DTO closure and reports why it stopped, if it did.
 ///
-/// The `bool` is `false` when the loop stopped on the deadline or ran out of
-/// `TYPE_BUDGET` while types were still queued: the returned graph is then
-/// partial and must not be exported as a complete document.
+/// `Some(DtoStop::Deadline)` and `Some(DtoStop::TypeBudget)` both mean the
+/// returned graph is partial and must not be exported as a complete document,
+/// but they are kept apart because only the first is worth retrying.
+///
+/// `progress` is called once per resolved type with how many are done and how
+/// many were reached so far. Export passes `host::task_report` here: a task that
+/// keeps reporting keeps its 60-second call budget, so a long closure is not cut
+/// off at the first deadline while a task that goes quiet still is.
 #[allow(clippy::too_many_arguments)]
 fn resolve_dtos(
     project: &Project,
@@ -705,7 +799,8 @@ fn resolve_dtos(
     deps: &mut crate::deps::Deps,
     hints: &HashMap<String, String>,
     deadline: Option<std::time::Instant>,
-) -> (DtoIndex, bool) {
+    mut progress: impl FnMut(usize, usize),
+) -> (DtoIndex, Option<DtoStop>) {
     let mut queue: Vec<String> = Vec::new();
     for endpoint in endpoints {
         if let Some(ty) = &endpoint.body_type {
@@ -716,22 +811,22 @@ fn resolve_dtos(
 
     let mut dto = DtoIndex::default();
     let mut tried: HashSet<String> = HashSet::new();
-    let mut budget = TYPE_BUDGET;
-    let mut complete = true;
+    let mut budget = options.type_budget.unwrap_or(TYPE_BUDGET);
+    let mut stop = None;
     while let Some(name) = queue.pop() {
         // The closure is the most expensive stage; stopping here keeps the
         // routes that were already found instead of losing the whole call. The
         // caller must still know the graph is partial, so this is reported back
         // instead of being swallowed.
         if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
-            complete = false;
+            stop = Some(DtoStop::Deadline);
             break;
         }
         if !tried.insert(name.clone()) {
             continue;
         }
         if budget == 0 {
-            complete = false;
+            stop = Some(DtoStop::TypeBudget);
             break;
         }
         budget -= 1;
@@ -756,8 +851,11 @@ fn resolve_dtos(
             .collect();
         dto.params.insert(name.clone(), params);
         dto.fields.insert(name, specs);
+        // `queue` shrinks as types are resolved, so the total is what has been
+        // finished plus what is still waiting.
+        progress(dto.fields.len(), dto.fields.len() + queue.len());
     }
-    (dto, complete)
+    (dto, stop)
 }
 
 /// Fields that never reach the wire format.
@@ -865,7 +963,7 @@ pub fn to_json(result: &ScanResult) -> Value {
         "count": result.endpoints.len(),
         "files": result.files,
         "truncated": result.truncated,
-        "dtoComplete": result.dto_complete,
+        "dtoComplete": result.dto_complete(),
         "items": result.endpoints.iter().map(|e| serde_json::json!({
             "method": e.method.clone().unwrap_or_else(|| "ANY".into()),
             "path": e.path,

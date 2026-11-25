@@ -320,17 +320,25 @@ Rebuild and re-grant afterwards. This is the host's capability model, not a choi
 - **Map renders with an example key**: `Map<K, V>` exports as
   `{ "type": "object", "properties": { "<example name for K>": V } }` rather than `additionalProperties` — the
   latter shows as an empty object in ApiMocktle / YApi field tables.
-- **5-second command budget**: scanning and exporting are both designed around it. Exporting sends in batches;
-  scanning stops itself at 4.2 s (1.5 s for the endpoints provider) and returns what it found with a "results may be
-  incomplete" note, instead of being killed by the host. Very large projects also hit the text-search limit.
+- **Command budget: 4.2 s for the dashboard, 50 s for an export**: the host limits a plugin call to 5 s, but
+  `host::begin_task` raises that call's wall clock to 60 s and every `report` renews it. An export therefore opens a
+  background task and scans with a 50 s budget, at the cost of a "ApiMocktle: resolving request and response types"
+  entry with progress in the IDE's background-task area. The dashboard does not: it only needs routes, returns within
+  1.5 s, and opens no task. Both paths return what they found with a "results may be incomplete" note rather than
+  being killed by the host. Very large projects also hit the text-search limit.
 - **No export when the DTO closure did not finish**: an incomplete route list is a display problem — a few endpoints
   are simply missing. An incomplete DTO graph is different: schemas built from it lose fields, and export updates an
   existing interface by `method + path`, so sending one would replace the server's correct document with a poorer
-  copy and still report "all endpoints synced". When the closure misses the 4.2 s budget
-  (`ScanResult::dto_complete` is false), export therefore refuses before a single request goes out and says why. The
-  partial result is also not cached as a complete scan, so a retry scans again instead of replaying the damaged
-  graph. The dashboard only reads routes and is unaffected. To get past it, narrow the scope (export the current
-  file or folder) or retry.
+  copy and still report "all endpoints synced". When the closure does not finish, export refuses before a single
+  request goes out and says why. The partial result is also not cached as a complete scan, so a retry scans again
+  instead of replaying the damaged graph. The dashboard only reads routes and is unaffected.
+- **The two ways a closure stops are reported apart**: `ScanResult::dto_stop` distinguishes `Deadline` (the clock ran
+  out — worth retrying, or narrowing) from `TypeBudget` (the per-scan type cap was reached). The cap has nothing to do
+  with time, so retrying stops at exactly the same type; its message asks for a narrower scope instead. The cap is
+  5 000, far above the largest real project measured, and only exists to bound a cyclic or generated model.
+- **"Export the current file or folder" really narrows the scan**: `Options::only_path` reaches the scan, so only the
+  chosen controllers are parsed and only the DTO types they reach are walked — instead of scanning the whole project
+  and filtering the endpoint list afterwards. A narrowed result is never cached as a full scan.
 - **Diagnostic-level positions**: an endpoint's position is the annotation's line and column (0-based line, UTF-16
   column), used for navigation only — there is no syntax highlighting.
 - **No mock runtime**: no JVM agent; the alignment is at the source level only.

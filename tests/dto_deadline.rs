@@ -205,7 +205,7 @@ fn a_dto_closure_that_misses_its_deadline_is_reported_as_incomplete() {
     assert_eq!(scanned.endpoints.len(), 1, "the route is found");
     // ... but the DTO graph is not, and the result now says so.
     assert!(
-        !scanned.dto_complete,
+        !scanned.dto_complete(),
         "the closure stopped early, so `dto_complete` must be false (resolved {:?})",
         scanned.dto.fields.keys().collect::<Vec<_>>()
     );
@@ -219,7 +219,7 @@ fn a_finished_dto_closure_is_reported_as_complete() {
     let project = host.invocation().project().expect("a project");
     let scanned = scan::scan(&project, &scan::Options::default()).expect("a scan");
 
-    assert!(scanned.dto_complete, "nothing was truncated");
+    assert!(scanned.dto_complete(), "nothing was truncated");
     assert!(scanned.dto.fields.contains_key("Root"), "Root resolved: {:?}", scanned.dto.fields.keys().collect::<Vec<_>>());
     assert!(scanned.dto.fields.contains_key("Detail"), "Detail resolved through Root");
     let root = &scanned.dto.fields["Root"];
@@ -235,7 +235,7 @@ fn a_route_only_scan_is_complete_without_a_dto_graph() {
     let options = scan::Options { resolve_dto: false, ..scan::Options::default() };
     let scanned = scan::scan(&project, &options).expect("a scan");
 
-    assert!(scanned.dto_complete, "a route-only scan is complete for its purpose");
+    assert!(scanned.dto_complete(), "a route-only scan is complete for its purpose");
     assert!(scanned.dto.fields.is_empty(), "no DTO work was done");
 }
 

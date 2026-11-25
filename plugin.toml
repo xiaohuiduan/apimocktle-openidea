@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.1"
+version = "0.3.2"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.1 — 扫描链路提速，并升到插件 API 1.14（需要 OpenIDEA 0.1.50 及以上）。扫描超时的成因不是计算量而是宿主往返次数：大项目上每解析一个 DTO 都要做两次全项目文件查找，1500 多次往来把 5 秒预算吃光，宿主掐掉调用还会连带清空内存缓存，于是打开仪表盘就一直超时。现在整项目只建一次类型索引，实测往返减少 53%。仪表盘只在列表里显示路由，不再为它解析 DTO 字段，这一档又省掉一半。另外加了扫描时间预算：4.2 秒内没收完就返回已找到的部分并提示结果可能不全，而不是被宿主回收。依赖坐标改为优先读 IDE 已解析好的 Maven 依赖图（build.read，需在权限里勾选），版本与冲突消解由 IDE 给出；没有该授权时仍按原方式读 POM。另修：DTO 闭包因 4.2 秒预算没跑完时，不再把残缺的图当作完整结果——导出会在发出任何请求前拒绝，服务器上的接口文档不会被缺字段的 Schema 覆盖，这份结果也不写入完整扫描缓存（重试会重新扫描）；仪表盘的「同步这一个」按钮走的是另一条导出路径，同样加了这道检查。"
+change-notes = "0.3.2 — 修 0.3.1 里导出会「永远失败」的两个问题。一是单次插件调用的 5 秒限时：导出现在开一个后台任务（IDE 后台任务区会显示进度），把这次调用放宽到 50 秒，足够扫完比实测最大项目还大的工程；仪表盘不变，仍然只看路由、1.5 秒返回、不跳任务。二是 DTO 类型上限 400 与「超时」混在一起报：项目用到的类型超过 400 时，即使一点时间都没花，也会报「未能在 5 秒限时内解析完 DTO 类型」，而重试会停在同一处。现在两种原因分开报——超时提示可重试或用更小范围，达到类型上限则提示缩小范围（上限同时提高到 5000，只用于兜住环状或生成的模型）。另修：「导出当前文件/目录」原本是扫完整个项目之后再过滤接口，所以提示里给的这条出路其实不起作用；现在范围下推到扫描阶段，只解析选中的控制器和它们用到的类型。实测 900 个 DTO 的工程从「永远导出失败」变为一次扫完并全部同步。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"
