@@ -240,6 +240,11 @@ pub fn scan_with_progress(
     mut progress: impl FnMut(usize, usize),
 ) -> Result<ScanResult, Error> {
     let started = std::time::Instant::now();
+    // Fresh tally for this scan: the plugin's calls are single-threaded, so a
+    // thread-local is enough and no signature has to carry it. The counts are
+    // what transfer from `MockHost` to the real host — durations are meaningless
+    // on a hash map.
+    io_meter::reset();
     // One wall-clock deadline for the whole scan. `Options::default()` leaves it
     // off; the plugin's entry points set it below the host's own limit. See
     // `Options::budget` for why overrunning is worse than returning less.
@@ -256,7 +261,7 @@ pub fn scan_with_progress(
         include,
         ..TextQuery::default()
     };
-    let found = project.search_text(&query, MATCH_LIMIT)?;
+    let found = search_text(project, &query, MATCH_LIMIT)?;
 
     let mut paths: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -310,9 +315,14 @@ pub fn scan_with_progress(
             break;
         }
         // Every controller, because one slow file must not starve the rest of
-        // the budget of its renewal.
-        progress(index, controller_total);
-        let src = match project.read_file(path) {
+        // the budget of its renewal. The controller pass is reported across the
+        // first half of the bar; the DTO closure takes the second half. Two
+        // phases reporting their own `done/total` into one bar makes it jump
+        // backwards — the controller pass reaching ~100% and the closure then
+        // starting again from 0 is what a stalled bar looked like.
+        let half = controller_total.max(1);
+        progress(index.min(half), half * 2);
+        let src = match read_file(project, path) {
             Ok(s) => s,
             Err(_) => continue,
         };
@@ -333,6 +343,10 @@ pub fn scan_with_progress(
         sources.insert(path.clone(), src.clone());
         parsed.push((path.clone(), src, model));
     }
+    // The controller pass owns the first half of the bar; mark it finished so a
+    // route-only scan (no closure to follow) does not appear stuck at 50%. The
+    // half is `controller_total * 2`, so reaching it means "controllers done".
+    progress(controller_total, controller_total * 2);
 
     for (path, src, mut model) in parsed {
         if out_of_time() {
@@ -394,6 +408,9 @@ pub fn scan_with_progress(
     // route-only results are not mistaken for damage.
     let (dto, dto_stop) = if options.resolve_dto && !out_of_time() {
         let mut deps = crate::deps::Deps::new(options.deps.clone());
+        // The controller pass took the first half of the bar, so the closure
+        // continues from there instead of restarting at zero.
+        let base = controller_total * 2;
         resolve_dtos(
             project,
             options,
@@ -404,6 +421,7 @@ pub fn scan_with_progress(
             &mut deps,
             &hints,
             deadline,
+            Some(base),
             &mut progress,
         )
     } else if options.resolve_dto {
@@ -415,6 +433,27 @@ pub fn scan_with_progress(
     } else {
         (DtoIndex::default(), None)
     };
+
+    // Say what the host cost, in counts and in time. On the real host this is
+    // the line that explains a stalled progress bar: a DTO phase that made
+    // hundreds of `search_text` calls is a different problem (missing index
+    // entries) from one that made hundreds of `read_file` calls (a big closure),
+    // and they need different fixes.
+    let counts = io_meter::counts();
+    if counts.read_file > 0 || counts.search_text > 0 {
+        crate::host::log(
+            openidea_plugin::LogLevel::Info,
+            &counts.summary(&format!(
+                "扫描 {} 个接口 / {} 个 DTO（{}）",
+                endpoints.len(),
+                dto.fields.len(),
+                match dto_stop {
+                    None => "已完成".to_owned(),
+                    Some(stop) => format!("{stop:?} 停止"),
+                }
+            )),
+        );
+    }
 
     Ok(ScanResult {
         endpoints,
@@ -781,7 +820,7 @@ fn load_source_for(
     };
     candidates.sort_by_key(|path| rank(path));
     for path in candidates {
-        let Ok(src) = project.read_file(&path) else { continue };
+        let Ok(src) = read_file(project, &path) else { continue };
         let model = spring::parse(&src);
         // The file has to declare the class under the package the qualifier
         // named; a same-named class in another package is a different type.
@@ -819,8 +858,16 @@ fn resolve_dtos(
     deps: &mut crate::deps::Deps,
     hints: &HashMap<String, String>,
     deadline: Option<std::time::Instant>,
+    // Where this phase starts on a shared progress bar, if it shares one.
+    base: Option<usize>,
     mut progress: impl FnMut(usize, usize),
 ) -> (DtoIndex, Option<DtoStop>) {
+    // `push_names` appends every name a type mentions, and the same name is
+    // mentioned by many fields, so the raw queue is far longer than the set of
+    // types it stands for — yudao's reaches ten thousand entries for a thousand
+    // distinct types. Deduplicating here is what makes the queue length a usable
+    // progress denominator; `tried` below already prevented duplicate *work*,
+    // but a queue of duplicates made the bar's total meaningless.
     let mut queue: Vec<String> = Vec::new();
     for endpoint in endpoints {
         if let Some(ty) = &endpoint.body_type {
@@ -832,6 +879,12 @@ fn resolve_dtos(
     let mut dto = DtoIndex::default();
     let mut tried: HashSet<String> = HashSet::new();
     let mut budget = options.type_budget.unwrap_or(TYPE_BUDGET);
+    // The queue grows as types are resolved (each type adds the types its fields
+    // mention), so `done + queue.len()` is not a fixed denominator: it rises as
+    // the closure widens, which made the bar slide backwards. Tracking the
+    // largest total seen so far and reporting `done / peak` keeps it monotonic —
+    // the bar can stall, but never jump back, which is what "stuck at 80%" was.
+    let mut peak_total = queue.len().max(1);
     let mut stop = None;
     while let Some(name) = queue.pop() {
         // The closure is the most expensive stage; stopping here keeps the
@@ -872,8 +925,27 @@ fn resolve_dtos(
         dto.params.insert(name.clone(), params);
         dto.fields.insert(name, specs);
         // `queue` shrinks as types are resolved, so the total is what has been
-        // finished plus what is still waiting.
-        progress(dto.fields.len(), dto.fields.len() + queue.len());
+        // finished plus what is still waiting. Reported across the second half of
+        // the bar (`base`) so the closure does not restart it from zero after the
+        // controller pass — that backwards jump is what a stalled bar looked
+        // like. The base is `None` for a scan that has no controller pass to
+        // share the bar with (a narrowed or library scan).
+        let done = dto.fields.len();
+        let total = done + queue.len();
+        peak_total = peak_total.max(total);
+        // Each phase owns its own half of the bar, computed independently:
+        // `base`/`base*2` would let the closure's denominator (which grows with
+        // the queue) shrink the controller half's percentage and jump the bar
+        // backwards at the handover. Reporting the closure as
+        // `50% + 50% * done/peak` keeps the two halves separate.
+        match base {
+            None => progress(done.min(peak_total), peak_total.max(1)),
+            Some(base) => {
+                let half = base / 2;
+                let into = if peak_total == 0 { 0 } else { done.min(peak_total) * half / peak_total };
+                progress(half + into, base);
+            }
+        }
     }
     (dto, stop)
 }
@@ -935,7 +1007,7 @@ fn declaration_candidates(project: &Project, options: &Options, name: &str) -> V
         ..TextQuery::default()
     };
     let mut out = Vec::new();
-    if let Ok(found) = project.search_text(&query, 8) {
+    if let Ok(found) = search_text(project, &query, 8) {
         let mut seen = HashSet::new();
         for hit in found.matches {
             if seen.insert(hit.location.path.clone()) {
@@ -946,6 +1018,95 @@ fn declaration_candidates(project: &Project, options: &Options, name: &str) -> V
     out
 }
 
+/// Counts the host calls a scan makes, so a slow one can be explained instead of
+/// guessed at.
+///
+/// The absolute durations mean nothing on `MockHost` (which answers from a hash
+/// map), but the *counts* transfer to the real host: a DTO that costs three
+/// `read_file` calls is three times as expensive there as one that costs one.
+/// A thread-local keeps this out of every function signature; a scan runs on one
+/// thread, and the plugin's calls are single-threaded.
+mod io_meter {
+    use std::cell::RefCell;
+
+    #[derive(Default, Clone, Copy)]
+    pub struct Counts {
+        pub read_file: usize,
+        pub read_file_ns: u128,
+        pub search_text: usize,
+        pub search_text_ns: u128,
+    }
+
+    thread_local! {
+        static COUNTS: RefCell<Counts> = const { RefCell::new(Counts {
+            read_file: 0,
+            read_file_ns: 0,
+            search_text: 0,
+            search_text_ns: 0,
+        }) };
+    }
+
+    /// Starts a fresh tally and returns the one that was there.
+    pub fn reset() -> Counts {
+        COUNTS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+
+    pub fn counts() -> Counts {
+        COUNTS.with(|c| *c.borrow())
+    }
+
+    pub fn add_read_file(ns: u128) {
+        COUNTS.with(|c| {
+            let mut c = c.borrow_mut();
+            c.read_file += 1;
+            c.read_file_ns += ns;
+        });
+    }
+
+    pub fn add_search_text(ns: u128) {
+        COUNTS.with(|c| {
+            let mut c = c.borrow_mut();
+            c.search_text += 1;
+            c.search_text_ns += ns;
+        });
+    }
+
+    impl Counts {
+        /// One line naming what the scan spent on the host.
+        pub fn summary(&self, stage: &str) -> String {
+            format!(
+                "ApiMocktle: {} — read_file {} 次（{:.1} ms），search_text {} 次（{:.1} ms）",
+                stage,
+                self.read_file,
+                self.read_file_ns as f64 / 1e6,
+                self.search_text,
+                self.search_text_ns as f64 / 1e6
+            )
+        }
+    }
+}
+
+/// `project.read_file`, counted for the scan summary.
+fn read_file(project: &Project, path: &str) -> Result<String, Error> {
+    let started = std::time::Instant::now();
+    let out = project.read_file(path);
+    io_meter::add_read_file(started.elapsed().as_nanos());
+    out
+}
+
+/// `project.search_text`, counted for the scan summary.
+fn search_text(
+    project: &Project,
+    query: &TextQuery,
+    limit: u32,
+) -> Result<openidea_plugin::TextSearch, Error> {
+    let started = std::time::Instant::now();
+    let out = project.search_text(query, limit);
+    io_meter::add_search_text(started.elapsed().as_nanos());
+    out
+}
+
+/// The names a type mentions, resolved through the index.
 fn load_class(
     project: &Project,
     options: &Options,
@@ -964,7 +1125,7 @@ fn load_class(
     for path in candidates {
         let src = match sources.get(&path) {
             Some(src) => src.clone(),
-            None => match project.read_file(&path) {
+            None => match read_file(project, &path) {
                 Ok(src) => src,
                 Err(_) => continue,
             },

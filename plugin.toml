@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.3"
+version = "0.3.4"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.3 — 修大项目一打开仪表盘就崩溃（宿主 5 秒超时后重启）。仪表盘现在和导出一致，开一个后台任务把这次调用放宽到 60 秒，并在读取每个控制器时上报进度持续续期——这是关键：之前只有 DTO 阶段才报进度，而仪表盘不解析 DTO，等于整段控制器读取都跑在一条不再续期的预算上。yudao 这种规模（734 个控制器、3600 个接口）需要 737 次文件读取，按真实宿主约 7ms/次算超过 5 秒，于是被宿主掐掉；放宽后一次扫完并显示全部接口。同时把「搜索上限截断」与「时间预算用尽」分开上报，后者会提示结果可能不全而不是伪装成完整列表。另修激活日志里硬编码的 API 版本号。"
+change-notes = "0.3.4 — 诊断版：给扫描加宿主调用计量。每次扫描结束会在 IDE 日志输出一行，含 read_file 与 search_text 的次数和总耗时，用来定位大项目上卡住的具体阶段（例如 DTO 阶段是索引没命中而在逐个搜索，还是单纯类型太多）。同时修：仪表盘与导出共用同一个后台任务标题，跑导出时进度条在 DTO 阶段分母会扩张，看起来停在某个百分比不动——现在分开报，控制器阶段与 DTO 阶段各自有上限。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"
