@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.5"
+version = "0.4.0"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.5 — 修大项目导出失败。定位依据是上一版加的计量日志：yudao 上一次扫描 read_file 1030 次只用 0.3 秒，search_text 126 次却花了 49 秒，单次 390 毫秒——瓶颈不是读文件，而是全项目正则搜索。原因是类型索引只建到 5000 个文件，而该项目有 8140 个 Java 文件，被截掉的三千多个文件里的类全部查不到，于是每个都退回一次全项目搜索。现在索引按源码总量建（上限 20 万），一次扫描只需 1 次搜索而不是 126 次。另外给兜底搜索加了次数上限，防止生成式工程把预算耗在搜索上。"
+change-notes = "0.4.0 — 重构类型查找，解决大项目扫描不全。上一版把索引上限提高反而更糟：实测 0.3.4 一次扫描 search_text 花 49 秒，0.3.5 搜索次数从 126 降到 27，但单次从 390 毫秒涨到 1870 毫秒，结果只扫出 21 个接口。根因是「类名查不到就全项目正则搜索」这个兜底，而全项目搜索是宿主上最贵的操作。现在兜底不再搜索：项目文件列表已经在手上，按包路径和文件名相关性排序后直接读候选文件——读文件只要 0.3 毫秒，是搜索的六千分之一。yudao-cloud 实测 search_text 从 126 次降到 1 次，3598 个接口和 1655 个 DTO 全部扫出。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

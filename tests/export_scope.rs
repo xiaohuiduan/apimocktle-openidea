@@ -288,13 +288,17 @@ fn a_deadline_is_reported_as_a_deadline() {
 
 #[test]
 fn export_refuses_a_deadline_with_the_retry_wording() {
+    // The marker search alone costs `pause`, so a budget below it is already
+    // spent when the closure would start — the same `DtoStop::Deadline` the
+    // slow-search tests used to produce, without depending on the closure
+    // issuing searches (it no longer does: the fallback reads files instead).
     let pause = Duration::from_millis(60);
     let ((host, _), _) = host(3, 4, pause);
     let mut plugin = ApiMocktle::default();
     let result = plugin.run_command_in_tests(
         "export-project",
         &host.invocation(),
-        Some(pause + pause / 2),
+        Some(pause / 2),
     );
     let error = result.expect_err("a partial graph is refused").to_string();
     assert!(

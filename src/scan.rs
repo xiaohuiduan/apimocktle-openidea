@@ -31,17 +31,14 @@ pub const FILE_LIMIT: u32 = 5_000;
 /// so 125 misses spent 49 s. Missing entries are therefore expensive, not just
 /// incomplete: the index is sized so a real project fits in it.
 pub const INDEX_FILE_LIMIT: u32 = 200_000;
-/// Project-wide declaration searches one scan may run.
+/// Files one fallback lookup may read.
 ///
-/// Each costs a full-project regex scan (~390 ms on an 8000-file project), so
-/// they are expensive — but the count alone is not a good budget: a legitimate
-/// project can need many (a DTO whose file is named otherwise, or classes that
-/// share a simple name across modules). The real fix is the index covering every
-/// source (`INDEX_FILE_LIMIT`), after which a miss means the class is genuinely
-/// absent. This limit exists only to stop a pathological model — a generated
-/// build with thousands of unresolvable names — from spending the whole call
-/// budget on searches, so it sits far above what a real project needs.
-pub const FALLBACK_LIMIT: usize = 500;
+/// The fallback answers "where is this class declared" without `search_text`
+/// (see `TypeIndex::fallback`). It narrows to files whose name resembles the
+/// class, then reads them — `read_file` is ~0.31 ms, so a handful is free. The
+/// cap is what keeps an ambiguous name (`Result`, `Config`, or one that appears
+/// in many file names) from reading hundreds of files.
+pub const FALLBACK_CANDIDATES: usize = 8;
 /// Text matches asked for; one controller file yields several.
 pub const MATCH_LIMIT: u32 = 40_000;
 /// DTO types resolved per scan, so a cyclic or huge model cannot run away.
@@ -121,65 +118,155 @@ struct TypeIndex {
     /// File stem → paths, in the order `find_files` returned them.
     java: HashMap<String, Vec<String>>,
     kotlin: HashMap<String, Vec<String>>,
+    /// Every source path, for the fallback below.
+    ///
+    /// The fallback used to call `search_text`, which reads every file and runs
+    /// a regex over it: measured at 390–1870 ms per call on a real 8000-file
+    /// project, against 0.31 ms for `read_file`. A project that reached it a
+    /// couple of dozen times spent the whole call budget there and returned a
+    /// fraction of its endpoints. The paths are already in hand from
+    /// `find_files`, so the fallback walks them in memory and only pays
+    /// `read_file` for candidates.
+    all_paths: Vec<String>,
     /// Names a declaration search ran for, with what it found. An empty list
     /// means the search ran and the name is genuinely absent, so a second
     /// lookup can answer without paying for the search again.
-    ///
-    /// This has to remember the *result*, not merely that a search happened:
-    /// the type index is built from file names, so a class kept in a file named
-    /// otherwise is never in it — yet it exists, and caching "already searched"
-    /// would make only the first controller that mentions it work.
     searched: HashMap<String, Vec<String>>,
-    /// How many project-wide declaration searches this index has run; bounded
-    /// by `FALLBACK_LIMIT`.
-    searches: usize,
 }
 
 impl TypeIndex {
     fn build(project: &Project, options: &Options) -> TypeIndex {
         // Index every source, not just `file_limit` of them: a miss here is not
-        // merely an absent answer, it costs a project-wide search (see
+        // merely an absent answer, it costs a fallback walk (see
         // `INDEX_FILE_LIMIT`).
         let limit = INDEX_FILE_LIMIT.max(options.file_limit);
-        let java = index_of(project.find_files("**/*.java", limit).unwrap_or_default());
+        let java_paths = project.find_files("**/*.java", limit).unwrap_or_default();
+        let java = index_of(java_paths.clone());
+        let mut all_paths = java_paths;
         let kotlin = if options.include_kotlin {
-            index_of(project.find_files("**/*.kt", limit).unwrap_or_default())
+            let kotlin_paths = project.find_files("**/*.kt", limit).unwrap_or_default();
+            all_paths.extend(kotlin_paths.iter().cloned());
+            index_of(kotlin_paths)
         } else {
             HashMap::new()
         };
-        TypeIndex { java, kotlin, searched: HashMap::new(), searches: 0 }
+        TypeIndex { java, kotlin, all_paths, searched: HashMap::new() }
     }
 
     /// The candidate files for `name`, Java first. Empty means the index has
-    /// nothing, and the caller should fall back to searching for the
-    /// declaration (some projects keep a class away from its file name).
+    /// nothing, and the caller should fall back to looking for the declaration
+    /// (some projects keep a class away from its file name).
     fn candidates(&self, name: &str) -> Vec<String> {
         let mut out: Vec<String> = self.java.get(name).cloned().unwrap_or_default();
         out.extend(self.kotlin.get(name).cloned().unwrap_or_default());
         out
     }
 
-    /// The declaration search, run at most once per name and cached by result.
+    /// Where `name` is declared, when the file-name index cannot say.
     ///
-    /// Each search scans the whole project (`search_text` with no scope), which
-    /// costs ~390 ms on an 8000-file project. The index is sized so a real
-    /// project answers almost every name (`INDEX_FILE_LIMIT`), so a search here
-    /// means the class is genuinely absent — and a project with many such names
-    /// (a DTO whose supertype is generated, say) would spend the whole call
-    /// budget on them. `FALLBACK_LIMIT` bounds that: past it the name is
-    /// reported as absent, which is what it almost always is.
-    fn fallback(&mut self, project: &Project, options: &Options, name: &str) -> Vec<String> {
-        if let Some(hit) = self.searched.get(name) {
+    /// **Why this does not call `search_text`**: that reads every file in the
+    /// project and runs a regex over it — the single most expensive host call
+    /// available, measured at 390 ms to 1.9 s on a real project against 0.31 ms
+    /// for `read_file`. Twenty-six of them spent a 50-second budget and left the
+    /// scan with 21 of 3598 endpoints. Since `find_files` has already listed
+    /// every source, the same question can be answered from that list plus cheap
+    /// reads.
+    ///
+    /// `owner` is the qualifier the annotation used (`com.acme.RouteConstants`
+    /// for `@GetMapping(RouteConstants.LIST)`), so the package is known: the
+    /// declaration must live under that package's directory, which narrows 8000
+    /// files to a handful. Without a qualifier the whole list is searched, still
+    /// in memory.
+    fn fallback(
+        &mut self,
+        project: &Project,
+        _options: &Options,
+        name: &str,
+        owner: Option<&str>,
+    ) -> Vec<String> {
+        let key = match owner {
+            Some(owner) => format!("{owner}#{name}"),
+            None => name.to_owned(),
+        };
+        if let Some(hit) = self.searched.get(&key) {
             return hit.clone();
         }
-        if self.searches >= FALLBACK_LIMIT {
-            return Vec::new();
-        }
-        self.searches += 1;
-        let found = declaration_candidates(project, options, name);
-        self.searched.insert(name.to_owned(), found.clone());
+        let found = self.declaration_candidates(project, name, owner);
+        self.searched.insert(key, found.clone());
         found
     }
+
+    /// Files that could declare `name`, best first.
+    ///
+    /// Ordered by how likely each is to hold the declaration, because the caller
+    /// reads them in order and stops at the first hit — and `read_file` is the
+    /// only cost that matters here:
+    ///
+    /// 1. same package, name related (`RouteConstants` in `Routes.java` — the
+    ///    class name is a prefix of the file name or the file name of it);
+    /// 2. same package, any name (the class lives beside its user);
+    /// 3. elsewhere, name matches.
+    ///
+    /// `FALLBACK_CANDIDATES` bounds the reads.
+    fn declaration_candidates(
+        &self,
+        _project: &Project,
+        name: &str,
+        owner: Option<&str>,
+    ) -> Vec<String> {
+        // `com.acme.RouteConstants` → `com/acme`; a nested class
+        // (`com.a.Outer.Inner`) belongs to `com/a` too.
+        let package_dir = owner.and_then(|owner| {
+            let mut parts: Vec<&str> = owner.split('.').collect();
+            parts.pop();
+            (!parts.is_empty()).then(|| parts.join("/"))
+        });
+        let lower = name.to_lowercase();
+        let stem_of = |path: &str| -> String {
+            path.rsplit(['/', '\\'])
+                .next()
+                .and_then(|file| file.rsplit_once('.').map(|(stem, _)| stem))
+                .unwrap_or_default()
+                .to_owned()
+        };
+
+        let mut ranked: Vec<(u8, String)> = Vec::new();
+        for path in &self.all_paths {
+            let normalized = path.replace('\\', "/");
+            let stem = stem_of(path);
+            let stem_lower = stem.to_lowercase();
+            let same_package = package_dir
+                .as_ref()
+                .is_some_and(|dir| normalized.contains(&format!("/{dir}/")));
+            // `RouteConstants` vs `Routes`: neither contains the other, so relate
+            // them by their common prefix instead — that is what a project does
+            // when it keeps constants apart from the class that uses them.
+            let related = stem_lower == lower
+                || stem_lower.contains(&lower)
+                || lower.starts_with(&stem_lower)
+                || common_prefix_len(&stem_lower, &lower) >= 4;
+            let rank = match (same_package, related) {
+                (true, true) => 0,
+                (true, false) => 1,
+                (false, true) => 2,
+                // Without a package to narrow by, a renamed file is only
+                // findable by reading likely ones. Keeping these last (rather
+                // than dropping them) is what lets `Hidden` in
+                // `SomethingElse.java` resolve when no import names it; the
+                // `FALLBACK_CANDIDATES` cap keeps the reads bounded, and the
+                // exact/prefix matches above stay ahead of them.
+                (false, false) => 3,
+            };
+            ranked.push((rank, path.clone()));
+        }
+        ranked.sort_by(|a, b| a.0.cmp(&b.0));
+        ranked.into_iter().take(FALLBACK_CANDIDATES).map(|(_, p)| p).collect()
+    }
+}
+
+/// How many leading characters two lowercase strings share.
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
 /// Groups paths by file stem, skipping the directories a scan never parses.
@@ -838,7 +925,7 @@ fn load_source_for(
         // absent. Remembering it up front would poison the very lookup that
         // populates the candidates, and every controller after the first would
         // lose its constants.
-        candidates = index.fallback(project, options, name);
+        candidates = index.fallback(project, options, name, Some(class));
     }
     // The class' directory is the part before the simple name:
     // `com.a.Routes` → `com/a`, `Outer.Inner` → nothing to match on.
@@ -1036,30 +1123,6 @@ fn push_names(ty: &str, out: &mut Vec<String>) {
     }
 }
 
-/// The declaration search a class away from its file name falls back to.
-fn declaration_candidates(project: &Project, options: &Options, name: &str) -> Vec<String> {
-    let query = TextQuery {
-        pattern: format!(r"(class|interface|record)\s+{name}\b"),
-        regex: true,
-        include: if options.include_kotlin {
-            vec!["**/*.java".to_owned(), "**/*.kt".to_owned()]
-        } else {
-            vec!["**/*.java".to_owned()]
-        },
-        ..TextQuery::default()
-    };
-    let mut out = Vec::new();
-    if let Ok(found) = search_text(project, &query, 8) {
-        let mut seen = HashSet::new();
-        for hit in found.matches {
-            if seen.insert(hit.location.path.clone()) {
-                out.push(hit.location.path);
-            }
-        }
-    }
-    out
-}
-
 /// Counts the host calls a scan makes, so a slow one can be explained instead of
 /// guessed at.
 ///
@@ -1162,7 +1225,7 @@ fn load_class(
         // declaration instead of guessing a path. `fallback` caches the result,
         // so a type that genuinely does not exist costs one search, not one per
         // endpoint that mentions it.
-        candidates = index.fallback(project, options, name);
+        candidates = index.fallback(project, options, name, None);
     }
     for path in candidates {
         let src = match sources.get(&path) {

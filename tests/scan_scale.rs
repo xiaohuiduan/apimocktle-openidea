@@ -250,16 +250,15 @@ fn a_large_project_scans_completely_and_correctly() {
         .collect();
     assert!(collapsed.is_empty(), "routes lost their constants: {collapsed:?}");
 
-    // The point of the fix: the index answers every type in the project, so the
-    // host is asked for a declaration only for names no file declares. Here that
-    // is `String` and `T` — the wrapper's `data` field is typed by the type
-    // parameter, and both are scalars a project never declares. Each costs one
-    // search and is then remembered, so the count is a small constant rather
-    // than a multiple of the type count.
+    // The point of the fix: the index answers every type in the project, and a
+    // name it cannot answer no longer costs a project-wide search either — the
+    // fallback reads candidate files instead. So the count is exactly the one
+    // marker search, regardless of how many types a name mentions or how many
+    // of them are undeclarable scalars like `String`.
     assert_eq!(
         searches.load(Ordering::Relaxed),
-        3,
-        "one marker search plus the two names no file declares (`String`, `T`)"
+        1,
+        "only the marker search; the fallback does not search the project"
     );
 
     // MockHost is in-memory, so this only guards against a pathological

@@ -122,11 +122,13 @@ fn a_dto_is_resolved_without_asking_for_its_file_by_name() {
 
     assert_eq!(scanned.endpoints.len(), 1, "the route is found");
     assert!(scanned.dto.fields.contains_key("Widget"), "the DTO is resolved");
+    // Exactly the marker search: the fallback no longer calls `search_text`
+    // (that cost 0.4-1.9 s per miss on a real project), so even the absent
+    // `Result` costs no search.
     assert_eq!(
         searches.load(Ordering::Relaxed),
-        2,
-        "one marker search, plus one declaration search for `Result` (which no file declares); \
-         `Widget` itself cost nothing extra"
+        1,
+        "one marker search; the index answered Widget, and the fallback does not search"
     );
 }
 
@@ -141,10 +143,13 @@ fn a_class_named_differently_from_its_file_falls_back_to_a_declaration_search() 
     ]);
     let scanned = scan_with(&host, &Options::default());
 
+    // Still resolved — but without a project-wide search: the fallback ranks the
+    // files `find_files` already listed and reads the plausible ones.
     assert!(scanned.dto.fields.contains_key("Hidden"), "the fallback resolves a renamed file");
-    assert!(
-        searches.load(Ordering::Relaxed) > 1,
-        "a declaration search was issued for the missing name"
+    assert_eq!(
+        searches.load(Ordering::Relaxed),
+        1,
+        "the fallback reads files, it does not search the project"
     );
 }
 
@@ -171,11 +176,11 @@ public class DupController {
 
     assert_eq!(scanned.endpoints.len(), 2, "both routes are still published");
     assert!(!scanned.dto.fields.contains_key("Missing"), "an absent type stays unresolved");
-    // One marker search plus one declaration search for `Missing`.
+    // Only the marker search: an absent type costs no project-wide search.
     assert_eq!(
         searches.load(Ordering::Relaxed),
-        2,
-        "the miss is cached: two endpoints mentioning `Missing` cost one search"
+        1,
+        "the fallback reads candidate files instead of searching the project"
     );
 }
 

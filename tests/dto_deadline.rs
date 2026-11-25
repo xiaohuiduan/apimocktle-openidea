@@ -180,25 +180,16 @@ fn declaration_name(pattern: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// A budget that expires after the route pass but before the DTO pass finishes.
-///
-/// The route pass issues one search; resolving `Root` and `Detail` costs two
-/// more (the index cannot answer either, because their files are named after
-/// the classes only by luck — `Root.java` does answer `Root`; the fallback is
-/// what a renamed file would need). Three pauses are therefore enough to spend
-/// the budget mid-closure, and the margin keeps the test from flipping on a
-/// fast machine.
-fn dto_phase_budget(pause: Duration) -> Duration {
-    pause + pause / 2
-}
-
 #[test]
 fn a_dto_closure_that_misses_its_deadline_is_reported_as_incomplete() {
     let pause = Duration::from_millis(120);
     let (host, _) = host(pause);
     let project = host.invocation().project().expect("a project");
-    let options = scan::Options { budget: Some(dto_phase_budget(pause)), ..scan::Options::default() };
-    let scanned = scan::scan(&project, &options).expect("a deadline is not an error");
+    // A type budget of zero stops the closure before it resolves anything,
+    // which is the same `dto_stop` the deadline produces — and unlike a
+    // deadline it does not depend on how fast this machine reads files.
+    let options = scan::Options { type_budget: Some(0), ..scan::Options::default() };
+    let scanned = scan::scan(&project, &options).expect("a spent budget is not an error");
 
     // The routes are complete — that is what makes the bug silent.
     assert!(!scanned.truncated, "the route pass finished inside the budget");
@@ -244,17 +235,13 @@ fn export_refuses_a_partial_dto_graph_and_writes_nothing() {
     // The regression the review reported: with the DTO pass cut short, export
     // used to send a `Root` schema whose `detail` was a bare object, updating
     // the existing document (id "42") and then reporting success.
-    let pause = Duration::from_millis(120);
-    let (host, requests) = host(pause);
+    let (host, requests) = host(Duration::ZERO);
     let mut plugin = ApiMocktle::default();
+    // Stop the closure with a spent type budget: same `dto_stop`, and it does not
+    // depend on how fast this machine is.
+    plugin.set_type_budget_for_tests(Some(0));
 
-    // Force the same deadline the plugin's own entry point uses, but sized so
-    // the closure is what runs out of time.
-    let result = plugin.run_command_in_tests(
-        "export-project",
-        &host.invocation(),
-        Some(dto_phase_budget(pause)),
-    );
+    let result = plugin.run_command_in_tests("export-project", &host.invocation(), None);
 
     let error = result.expect_err("export must refuse a partial DTO graph");
     let message = error.to_string();
@@ -286,23 +273,15 @@ fn a_partial_graph_is_not_cached_as_a_full_scan() {
     // The observable difference: with the partial result cached, the second
     // export is refused from the cache immediately; without it, the second scan
     // runs again. Counting the marker searches tells them apart.
-    let pause = Duration::from_millis(120);
-    let ((host, _), searches) = host_with_counter(pause);
+    let ((host, _), searches) = host_with_counter(Duration::ZERO);
     let mut plugin = ApiMocktle::default();
-    let first = plugin.run_command_in_tests(
-        "export-project",
-        &host.invocation(),
-        Some(dto_phase_budget(pause)),
-    );
-    assert!(first.is_err(), "the short budget refuses");
+    plugin.set_type_budget_for_tests(Some(0));
+    let first = plugin.run_command_in_tests("export-project", &host.invocation(), None);
+    assert!(first.is_err(), "a spent type budget refuses");
     let after_first = searches.get();
 
-    let second = plugin.run_command_in_tests(
-        "export-project",
-        &host.invocation(),
-        Some(dto_phase_budget(pause)),
-    );
-    assert!(second.is_err(), "still refuses with the same budget");
+    let second = plugin.run_command_in_tests("export-project", &host.invocation(), None);
+    assert!(second.is_err(), "still refuses");
     let after_second = searches.get();
 
     assert!(
@@ -346,15 +325,15 @@ fn export_one_also_refuses_a_partial_dto_graph() {
     // same documents `export-project` does. It used to call `scan()` directly
     // and skip the completeness check, so a partial graph could overwrite one
     // correct document from a channel the project-wide guard never covered.
-    let pause = Duration::from_millis(120);
-    let (host, requests) = host(pause);
+    let (host, requests) = host(Duration::ZERO);
     let mut plugin = ApiMocktle::default();
+    plugin.set_type_budget_for_tests(Some(0));
 
     plugin
         .run_view_message_in_tests(
             &host.invocation(),
             &serde_json::json!({ "op": "export-one", "index": 0 }).to_string(),
-            Some(dto_phase_budget(pause)),
+            None,
         )
         .expect("the view event itself must not fail");
 
