@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.4.0"
+version = "0.4.1"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.4.0 — 重构类型查找，解决大项目扫描不全。上一版把索引上限提高反而更糟：实测 0.3.4 一次扫描 search_text 花 49 秒，0.3.5 搜索次数从 126 降到 27，但单次从 390 毫秒涨到 1870 毫秒，结果只扫出 21 个接口。根因是「类名查不到就全项目正则搜索」这个兜底，而全项目搜索是宿主上最贵的操作。现在兜底不再搜索：项目文件列表已经在手上，按包路径和文件名相关性排序后直接读候选文件——读文件只要 0.3 毫秒，是搜索的六千分之一。yudao-cloud 实测 search_text 从 126 次降到 1 次，3598 个接口和 1655 个 DTO 全部扫出。"
+change-notes = "0.4.1 — 修打开 IDE 就报「Plugin ApiMocktle crashed: timed out after 2s」。这个 2 秒是编辑器向插件索取接口列表（状态栏与搜索用）的硬限时，getcontext 无法延长；而大项目上光是一次全项目文本搜索就要 3.7 秒，所以那条路径永远不可能扫完，必然被杀、实例被回收。现在那条路径不再扫描：仪表盘和导出已经用后台任务扫完，把结果写进插件存储（上限 64MB，几千条接口只占几百 KB），索取接口列表时直接读取。首次打开前若还没有缓存，状态栏就是空的，打开一次仪表盘即可填上。yudao-cloud 实测扫描 3598 个接口 / 1655 个 DTO 用时约 5 秒（其中全项目搜索 3.7 秒是唯一的一次，之前是 126 次）。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

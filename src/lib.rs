@@ -45,6 +45,76 @@ const QUEUE_KEY: &str = "export:queue";
 /// Category ids per server and project, kept across batches. The base URL is
 /// part of the key so a `catid` from one server is never used on another.
 const CATS_KEY: &str = "cats:";
+/// Routes of the last completed scan, keyed by project root.
+///
+/// The endpoints provider gets a hard **2 s** call budget
+/// (`ide-host/src/plugins/endpoints.rs:99`, `rt.endpoints(ctx, 2s)`), and a
+/// project-wide `search_text` alone costs 3.7 s on a large one — so a scan
+/// started from inside that provider can never finish; it is killed, the
+/// instance is reaped, and the IDE shows "Plugin ApiMocktle crashed". A
+/// `begin_task` does not help: the provider's deadline is a hard bound that no
+/// plugin-side call can move.
+///
+/// So the provider does not scan. The dashboard and export already scan on a
+/// task's budget; they publish the route list here, and the provider answers
+/// from it. A miss returns an empty list (the status bar simply shows no
+/// endpoints) and the next dashboard open fills it. Storage allows 64 MiB; a
+/// few thousand routes are a few hundred KiB.
+const ROUTES_KEY: &str = "routes:";
+
+/// The routes of the last completed scan for `root`, as the endpoints provider
+/// needs them.
+fn routes_cache_key(root: &str) -> String {
+    format!("{ROUTES_KEY}{root}")
+}
+
+/// Publishes `scanned`'s routes for the endpoints provider.
+///
+/// Only the fields a `Route` uses are stored: the provider renders method, path,
+/// framework, handler and location, and nothing else, so the DTO graph and the
+/// rest are left out — this is what keeps the value small enough to be a cheap
+/// `storage` write on every scan.
+fn publish_routes(root: &str, scanned: &scan::ScanResult) {
+    let items: Vec<Value> = scanned
+        .endpoints
+        .iter()
+        .map(|endpoint| {
+            serde_json::json!({
+                "method": endpoint.method,
+                "path": endpoint.path,
+                "framework": endpoint.framework,
+                "handler": endpoint.handler(),
+                "file": endpoint.file,
+                "line": endpoint.line,
+                "col": endpoint.col,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({ "items": items });
+    if let Err(e) = host::storage::set(&routes_cache_key(root), &payload.to_string()) {
+        host::log(
+            LogLevel::Warn,
+            &format!("ApiMocktle: 路由缓存写入失败：{e}"),
+        );
+    }
+}
+
+/// The routes published by the last scan, or an empty list.
+///
+/// Never scans: the endpoints provider has 2 s and a scan cannot fit.
+fn cached_routes(root: &str) -> Vec<Value> {
+    let Ok(Some(raw)) = host::storage::get(&routes_cache_key(root)) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    value
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
 
 /// The description every category this plugin creates carries.
 fn category_desc() -> &'static str {
@@ -94,9 +164,6 @@ fn config() -> Result<Config, Error> {
 /// call starts from zero and overruns again. 4.2 s leaves 800 ms to finish and
 /// return, the same margin the export batch uses.
 const SCAN_BUDGET: Duration = Duration::from_millis(4_200);
-/// The endpoints provider only gets 2 s, and a SoftTimeout reaps the instance
-/// just the same, so its scan stops earlier still.
-const ROUTE_BUDGET: Duration = Duration::from_millis(1_500);
 /// The budget a scan gets while a `host::begin_task` is open: the host raises
 /// the call's wall clock from 5 s to 60 s for as long as the task is open and
 /// keeps renewing it on every `report` (`plugins/README.md`, `tasks.begin`).
@@ -129,16 +196,6 @@ fn scan_options_narrowed(only_path: Option<&str>, budget: Duration) -> scan::Opt
     scan::Options {
         only_path: only_path.map(str::to_owned),
         budget: Some(budget),
-        ..scan_options()
-    }
-}
-
-/// Routes only: no DTO resolution, fewer candidate files.
-fn route_options() -> scan::Options {
-    scan::Options {
-        resolve_dto: false,
-        file_limit: 400,
-        budget: Some(ROUTE_BUDGET),
         ..scan_options()
     }
 }
@@ -334,27 +391,18 @@ impl ApiMocktle {
                 ),
             );
             if narrow.is_none() {
-                self.routes.insert(root, result.clone());
+                self.routes.insert(root.clone(), result.clone());
+                publish_routes(&root, &result);
             }
         } else if narrow.is_none() {
             self.cache.insert(root.clone(), result.clone());
             // The route-only entry is now redundant: `scan()` prefers `cache`.
             self.routes.remove(&root);
+            // An export scans the whole project, so its routes are good for the
+            // endpoints provider too — and export is the path that runs on the
+            // long task budget.
+            publish_routes(&root, &result);
         }
-        Ok(result)
-    }
-
-    /// The route list the endpoints provider publishes, without DTO work.
-    fn routes(&mut self, project: &Project) -> Result<Rc<ScanResult>, Error> {
-        let root = project.root()?;
-        if let Some(hit) = self.cache.get(&root) {
-            return Ok(hit.clone());
-        }
-        if let Some(hit) = self.routes.get(&root) {
-            return Ok(hit.clone());
-        }
-        let result = Rc::new(scan::scan(project, &route_options())?);
-        self.routes.insert(root, result.clone());
         Ok(result)
     }
 
@@ -399,7 +447,10 @@ impl ApiMocktle {
                 if result.stopped_early { "（预算内未扫完，结果不全）" } else { "" }
             ),
         );
-        self.routes.insert(root, result.clone());
+        self.routes.insert(root.clone(), result.clone());
+        // Hand the routes to the endpoints provider, which cannot scan itself
+        // (2 s budget, and a project-wide search alone costs more than that).
+        publish_routes(&root, &result);
         Ok(result)
     }
 
@@ -810,30 +861,42 @@ impl Plugin for ApiMocktle {
 impl EndpointsProvider for ApiMocktle {
     fn endpoints(&mut self, ctx: &Invocation) -> Result<Vec<Route>, Error> {
         let Some(project) = ctx.project() else { return Ok(Vec::new()) };
-        let scanned = match self.routes(&project) {
-            Ok(result) => result,
-            Err(e) => {
-                host::log(openidea_plugin::LogLevel::Warn, &format!("ApiMocktle: 扫描失败：{e}"));
-                return Ok(Vec::new());
-            }
-        };
-        Ok(scanned
-            .endpoints
+        let Ok(root) = project.root() else { return Ok(Vec::new()) };
+        // Read-only on purpose. This call has 2 s (`endpoints.rs:99`) and a
+        // project-wide `search_text` alone costs 3.7 s on a large project, so any
+        // scan started here is killed and the instance reaped with it — the
+        // "Plugin ApiMocktle crashed: timed out after 2s" the user saw. The
+        // dashboard and export scan on a task budget and publish into this
+        // cache; until that has happened once, the provider simply reports no
+        // endpoints.
+        let cached = cached_routes(&root);
+        if cached.is_empty() {
+            return Ok(Vec::new());
+        }
+        let routes: Vec<Route> = cached
             .iter()
-            .map(|endpoint| Route {
-                method: endpoint.method.clone(),
-                path: endpoint.path.clone(),
-                framework: endpoint.framework.clone(),
-                handler: Some(endpoint.handler()),
-                location: Location {
-                    path: endpoint.file.clone(),
-                    range: Range::new(
-                        Position::new(endpoint.line, endpoint.col),
-                        Position::new(endpoint.line, endpoint.col),
-                    ),
-                },
+            .filter_map(|item| {
+                let path = item.get("path").and_then(Value::as_str)?;
+                let file = item.get("file").and_then(Value::as_str)?;
+                let line = item.get("line").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let col = item.get("col").and_then(Value::as_u64).unwrap_or(0) as u32;
+                Some(Route {
+                    method: item.get("method").and_then(Value::as_str).map(str::to_owned),
+                    path: path.to_owned(),
+                    framework: item
+                        .get("framework")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Spring")
+                        .to_owned(),
+                    handler: item.get("handler").and_then(Value::as_str).map(str::to_owned),
+                    location: Location {
+                        path: file.to_owned(),
+                        range: Range::new(Position::new(line, col), Position::new(line, col)),
+                    },
+                })
             })
-            .collect())
+            .collect();
+        Ok(routes)
     }
 }
 
@@ -1191,8 +1254,16 @@ public class UserController {
     fn endpoints_are_published_for_search() {
         let host = host();
         let mut plugin = ApiMocktle::default();
-        let routes = plugin.endpoints(&host.invocation()).unwrap();
-        assert_eq!(routes.len(), 2);
+        let ctx = host.invocation();
+        let project = ctx.project().expect("a project");
+
+        // The provider never scans (2 s, and a project-wide search alone costs
+        // more): it reads what the dashboard/export published.
+        assert!(plugin.endpoints(&ctx).unwrap().is_empty(), "nothing published yet");
+
+        plugin.routes_for_display(&project).expect("the dashboard scans");
+        let routes = plugin.endpoints(&ctx).unwrap();
+        assert_eq!(routes.len(), 2, "the dashboard published the routes");
         assert_eq!(routes[0].framework, "Spring");
         assert_eq!(routes[0].handler.as_deref(), Some("UserController#create"));
         assert_eq!(routes[0].location.path, "/proj/src/UserController.java");
@@ -1679,10 +1750,10 @@ public class UploadController {
     fn the_route_scan_skips_dto_resolution() {
         let host = host();
         let project = host.invocation().project().expect("a project");
-        let light = scan::scan(&project, &route_options()).unwrap();
+        let light = scan::scan(&project, &route_only_options()).unwrap();
         assert_eq!(light.endpoints.len(), 2);
         assert!(light.dto.fields.is_empty(), "routes do not need the DTO graph");
-        let full = scan::scan(&project, &scan::Options { resolve_dto: true, ..route_options() }).unwrap();
+        let full = scan::scan(&project, &scan::Options { resolve_dto: true, ..route_only_options() }).unwrap();
         assert!(!full.dto.fields.is_empty());
     }
 
@@ -1717,18 +1788,17 @@ public class UploadController {
         assert!(!again.dto.fields.is_empty(), "the full result is reused");
     }
 
-    /// The dashboard must not borrow the endpoints provider's 400-file cap: a
-    /// project with more controllers than that would silently list fewer.
+    /// The dashboard lists every controller, not a capped prefix.
+    ///
+    /// It used to inherit the endpoints provider's 400-file cap, which silently
+    /// listed fewer controllers than the project has. The provider no longer
+    /// scans (it reads the published cache), so the display tier is the only
+    /// routes-only scan left — and it must keep `FILE_LIMIT`.
     #[test]
     fn a_display_scan_keeps_the_full_file_limit() {
         // `route_only_options` reads the host's settings, so a mock must be
         // installed before it is called.
         let _host = host();
-        assert_ne!(
-            route_only_options().file_limit,
-            route_options().file_limit,
-            "the display tier must not inherit the provider's cap"
-        );
         assert_eq!(route_only_options().file_limit, scan::FILE_LIMIT);
         assert!(!route_only_options().resolve_dto);
     }
