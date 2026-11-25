@@ -307,6 +307,10 @@ pub struct DtoIndex {
     scope_params: HashMap<String, Vec<String>>,
     /// Simple names declared by more than one type.
     ambiguous: HashSet<String>,
+    /// `(endpoint scope, simple name)` -> the qualified type that file's own
+    /// `import` names. Consulted before the global simple-name fallback, because
+    /// two controllers in one package can import different same-named types.
+    aliases: HashMap<(String, String), String>,
 }
 
 impl DtoIndex {
@@ -351,11 +355,37 @@ impl DtoIndex {
                 None => break,
             }
         }
+        // The endpoint file's own import settles a bare name before the global
+        // fallback: `import com.alpha.Payload` is the project saying which type it
+        // means, and two controllers can import different ones.
+        if let Some(qualified) = self.aliases.get(&(scope.to_owned(), name.to_owned()))
+            && let Some(fields) = self.scopes.get(qualified)
+        {
+            return Some(ResolvedClass {
+                params: self.scope_params.get(qualified).cloned().unwrap_or_default(),
+                fields: fields.clone(),
+            });
+        }
+        // A bare name is only an answer when it means one thing.
+        if self.ambiguous.contains(name) {
+            return None;
+        }
         let fields = self.fields.get(name)?;
         Some(ResolvedClass {
             params: self.params.get(name).cloned().unwrap_or_default(),
             fields: fields.clone(),
         })
+    }
+
+    /// Records that files of `scope` mean `qualified` when they write `name`.
+    ///
+    /// `api_doc` resolves from the endpoint's scope and cannot read the file's
+    /// imports, so the scan records them here: a bare `Payload` in a controller
+    /// that imported `com.alpha.Payload` then means that type, and one that
+    /// imported `com.beta.Payload` means the other.
+    fn add_alias(&mut self, scope: &str, name: &str, qualified: &str) {
+        self.aliases
+            .insert((scope.to_owned(), name.to_owned()), qualified.to_owned());
     }
 
     /// Marks `name` as meaning more than one type.
@@ -504,7 +534,10 @@ pub fn scan_with_progress(
     let mut sources: HashMap<String, String> = HashMap::new();
     // Simple class name → the package it was imported from. Dependency jars
     // are ranked with it, so the jar that holds `ApiEnvelope` is read first.
-    let mut hints: HashMap<String, String> = HashMap::new();
+    // Imports are a per-file fact. Two controllers in one package can each import
+    // a different `Payload`, and a project-wide table keeps only the first, so the
+    // second endpoint would be built from the other's type.
+    let mut hints: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut files = 0usize;
     // Parsed files are kept so route constants can be resolved across them
     // before any endpoint is built (a second pass over the sources).
@@ -540,10 +573,11 @@ pub fn scan_with_progress(
         };
         files += 1;
         let model = spring::parse(&src);
+        let file_hints = hints.entry(path.clone()).or_default();
         for import in &model.imports {
             let Some((package, simple)) = import.rsplit_once('.') else { continue };
             if simple.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-                hints.entry(simple.to_owned()).or_insert_with(|| package.to_owned());
+                file_hints.entry(simple.to_owned()).or_insert_with(|| package.to_owned());
             }
         }
         constants.absorb(&model);
@@ -1069,7 +1103,7 @@ fn resolve_dtos(
     classes: &HashMap<String, ClassEntry>,
     sources: &HashMap<String, String>,
     deps: &mut crate::deps::Deps,
-    hints: &HashMap<String, String>,
+    hints: &HashMap<String, HashMap<String, String>>,
     deadline: Option<std::time::Instant>,
     // Where this phase starts on a shared progress bar, if it shares one.
     base: Option<usize>,
@@ -1081,6 +1115,15 @@ fn resolve_dtos(
     // distinct types. Deduplicating here is what makes the queue length a usable
     // progress denominator; `tried` below already prevented duplicate *work*,
     // but a queue of duplicates made the bar's total meaningless.
+    // The imports of each endpoint's own file, keyed by the endpoint's scope, so
+    // both the type load below and the schema lookup later resolve a bare name the
+    // way that file wrote it.
+    let mut imports_of: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for endpoint in endpoints {
+        if let Some(table) = hints.get(&endpoint.file) {
+            imports_of.insert(endpoint_scope(endpoint), table.clone());
+        }
+    }
     let mut queue: Vec<(String, String)> = Vec::new();
     for endpoint in endpoints {
         let scope = endpoint_scope(endpoint);
@@ -1117,13 +1160,21 @@ fn resolve_dtos(
 // its imports name for this type, then a unique candidate anywhere. When
 // none of them settles it, the name is ambiguous and export refuses rather
 // than save a document built from the wrong type.
-let scoped = scoped_lookup(classes, &scope, &name).or_else(|| imported_lookup(classes, hints, &name));
+// This endpoint's file says which package a bare name comes from; that is
+// the only thing that tells two same-named top-level types apart.
+let imported_package = imports_of.get(&scope).and_then(|t| t.get(&name)).cloned();
+let scoped = scoped_lookup(classes, &scope, &name)
+.or_else(|| imported_lookup(classes, imports_of.get(&scope), &name));
 let identity = match &scoped {
 Some((qualified, _)) => qualified.clone(),
-// A scoped table entry is a type of its own; with no entry the bare
-// name is used, so one type reached from several endpoints is still
-// resolved once and the budget is spent on distinct types.
+// With no table entry the import decides the type's identity, so two files
+// importing different same-named types are resolved separately. Without an
+// import the bare name is used, so one type reached from several endpoints
+// is resolved once and the budget goes to distinct types.
+None => match &imported_package {
+Some(package) => format!("{package}::{name}"),
 None => name.clone(),
+},
 };
         if !tried.insert(identity) {
             continue;
@@ -1137,12 +1188,18 @@ None => name.clone(),
         // scoped key is tried before the global one.
         let found = match scoped.or_else(|| class_lookup(classes, &name)) {
             Some((qualified, hit)) => Some((qualified, hit)),
-            None => load_class(project, options, types, &name, &scope, sources)
-                .map(|(path, params, fields)| (package_of_path(&path, &name), (params, fields)))
-                .or_else(|| {
-                    deps.fields(project, &name, hints.get(&name).map(String::as_str))
-                        .map(|hit| (name.clone(), hit))
-                }),
+            None => {
+let lookup_scope = match &imported_package {
+Some(package) => format!("{package}::{name}"),
+None => scope.clone(),
+};
+load_class(project, options, types, &name, &lookup_scope, sources)
+.map(|(path, params, fields)| (package_of_path(&path, &name), (params, fields)))
+.or_else(|| {
+deps.fields(project, &name, imported_package.as_deref())
+.map(|hit| (name.clone(), hit))
+})
+}
         };
         let Some((qualified, (params, fields))) = found else { continue };
         for field in &fields {
@@ -1162,6 +1219,13 @@ None => name.clone(),
         // same simple type resolves to its own declaration; the simple name is
         // kept for the types that carry no package.
         dto.insert(&qualified, &name, params, specs);
+        // Every endpoint file that imports this name from the package it resolved
+        // in gets an alias, which is what the schema pass later reads.
+        for (endpoint_scope, table) in &imports_of {
+            if table.get(&name).is_some_and(|p| format!("{p}::{name}") == qualified) {
+                dto.add_alias(endpoint_scope, &name, &qualified);
+            }
+        }
         // `queue` shrinks as types are resolved, so the total is what has been
         // finished plus what is still waiting. Reported across the second half of
         // the bar (`base`) so the closure does not restart it from zero after the
@@ -1240,11 +1304,11 @@ fn endpoint_scope(endpoint: &Endpoint) -> String {
 /// package entirely. The hint is per project rather than per file, so it only
 /// answers when the name was imported exactly once.
 fn imported_lookup(
-classes: &HashMap<String, ClassEntry>,
-hints: &HashMap<String, String>,
-name: &str,
+    classes: &HashMap<String, ClassEntry>,
+    hints: Option<&HashMap<String, String>>,
+    name: &str,
 ) -> Option<(String, ClassEntry)> {
-let package = hints.get(name)?;
+    let package = hints?.get(name)?;
 let key = format!("{package}::{name}");
 classes.get_key_value(&key).map(|(key, hit)| (key.clone(), hit.clone()))
 }
