@@ -176,6 +176,7 @@
     endpoints: [" endpoint(s) · ", " 个接口 · "],
     files: [" file(s)", " 个文件"],
     truncated: [" · search limit reached, results may be incomplete", " · 已达搜索上限，结果可能不全"],
+    stoppedEarly: [" · stopped on the time budget, results may be incomplete", " · 时间预算用尽，结果可能不全"],
     projectList: ["Projects: ", "项目列表："],
     syncOne: ["Syncing ", "同步 "],
   };
@@ -204,7 +205,8 @@
     switch (s.key) {
       case "scanDone":
         return T("scanDone") + s.args[0] + T("endpoints") + s.args[1] + T("files") +
-          (s.args[2] ? T("truncated") : "");
+          (s.args[2] ? T("truncated") : "") +
+          (s.args[3] ? T("stoppedEarly") : "");
       case "projectList":
         return T("projectList") + s.args[0];
       case "syncOne":
@@ -354,7 +356,15 @@
     count.textContent = items.length;
     configured = !!payload.configured;
     $("cfg").textContent = configured ? T("configured") : T("notConfigured");
-    say("scanDone", [items.length, payload.files || 0, !!payload.truncated], payload.truncated ? "warn" : "ok");
+    // `truncated` is a fixed property of the project (search limit); a budget
+    // stop is the host having cut the scan short, which the user may be able to
+    // work around. Both leave the list incomplete, so both are worth saying.
+    const incomplete = !!payload.truncated || !!payload.stoppedEarly;
+    say(
+      "scanDone",
+      [items.length, payload.files || 0, !!payload.truncated, !!payload.stoppedEarly],
+      incomplete ? "warn" : "ok"
+    );
     renderList();
     selected = -1;
     renderDetail(null, -1);

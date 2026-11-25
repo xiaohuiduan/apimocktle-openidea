@@ -305,7 +305,8 @@ fn a_spent_budget_stops_a_large_scan_instead_of_running_on() {
     let scanned = scan::scan(&project, &options).expect("a spent budget is not an error");
     let elapsed = started.elapsed();
 
-    assert!(scanned.truncated, "the result says it is incomplete");
+    assert!(scanned.stopped_early, "the result says the clock stopped it");
+    assert!(!scanned.truncated, "the search limit was not the reason");
     assert!(
         elapsed < Duration::from_secs(5),
         "the guard must return at once, took {elapsed:?}"

@@ -186,6 +186,13 @@ pub struct ScanResult {
     pub files: usize,
     /// The text search stopped at its limit, so some routes may be missing.
     pub truncated: bool,
+    /// The wall-clock budget ran out before every controller was parsed.
+    ///
+    /// Distinct from `truncated`: that one means the *search* hit its limit, so
+    /// files were never offered to the parse. This one means the parse ran out
+    /// of time, which the caller can act on (retry, narrow the scope) while a
+    /// search-limit truncation is a fixed property of the project.
+    pub stopped_early: bool,
     /// Why the DTO closure stopped, or `None` when it finished.
     ///
     /// A partial graph must not be exported: schemas built from it silently
@@ -288,11 +295,23 @@ pub fn scan_with_progress(
     let mut constants = Consts::default();
     let mut stopped_early = false;
 
-    for path in &paths {
+    // The controller pass is the expensive half on a large project — one
+    // `read_file` per controller, and the host charges a few milliseconds each.
+    // Reporting here is what keeps a task's budget alive: the host renews the
+    // allowance on every report, so a scan that only reported during the (much
+    // later, and on the dashboard non-existent) DTO pass would be cut off
+    // exactly where it was slow. The dashboard runs `resolve_dto: false`, so
+    // without this the only report is the opening one and the whole controller
+    // pass runs on a budget that is never renewed.
+    let controller_total = paths.len();
+    for (index, path) in paths.iter().enumerate() {
         if out_of_time() {
             stopped_early = true;
             break;
         }
+        // Every controller, because one slow file must not starve the rest of
+        // the budget of its renewal.
+        progress(index, controller_total);
         let src = match project.read_file(path) {
             Ok(s) => s,
             Err(_) => continue,
@@ -401,7 +420,8 @@ pub fn scan_with_progress(
         endpoints,
         dto,
         files,
-        truncated: found.limit_hit || paths.len() as u32 >= limit || stopped_early,
+        truncated: found.limit_hit || paths.len() as u32 >= limit,
+        stopped_early,
         dto_stop,
     })
 }
@@ -963,6 +983,7 @@ pub fn to_json(result: &ScanResult) -> Value {
         "count": result.endpoints.len(),
         "files": result.files,
         "truncated": result.truncated,
+        "stoppedEarly": result.stopped_early,
         "dtoComplete": result.dto_complete(),
         "items": result.endpoints.iter().map(|e| serde_json::json!({
             "method": e.method.clone().unwrap_or_else(|| "ANY".into()),

@@ -360,6 +360,16 @@ impl ApiMocktle {
 
     /// Route list over every candidate file, for the dashboard and for
     /// "go to source". Skips the DTO closure, which neither of them reads.
+    ///
+    /// A view call gets 5 s of wall clock, which is not enough for a real
+    /// project: a large one needs one `read_file` per controller, and the host
+    /// charges a few milliseconds for each. The dashboard therefore opens a
+    /// task, exactly like export does, and scans on the task's budget — the page
+    /// shows every route instead of a truncated prefix.
+    ///
+    /// The task is closed before the caller builds the payload: once it is gone
+    /// the call is back on its 5 s clock, and serialising a few hundred
+    /// kilobytes is far inside that.
     fn routes_for_display(&mut self, project: &Project) -> Result<Rc<ScanResult>, Error> {
         let root = project.root()?;
         if let Some(hit) = self.cache.get(&root) {
@@ -368,14 +378,25 @@ impl ApiMocktle {
         if let Some(hit) = self.routes.get(&root) {
             return Ok(hit.clone());
         }
-        let result = Rc::new(scan::scan(project, &route_only_options())?);
+        // `scan_budget_override` is the test hook; production takes the task's
+        // allowance, same as export.
+        let budget = self.scan_budget_override.unwrap_or(TASK_SCAN_BUDGET);
+        let task = host::begin_task(i18n::SCAN_TASK_TITLE.get(i18n::lang()), true);
+        task.report(0, None, Some(i18n::SCAN_TASK_ROUTES.get(i18n::lang())));
+        let options = scan::Options { budget: Some(budget), ..route_only_options() };
+        let result = scan::scan_with_progress(project, &options, |done, total| {
+            task.report(done as u32, Some(total as u32), None);
+        });
+        drop(task);
+        let result = Rc::new(result?);
         host::log(
             LogLevel::Info,
             &format!(
-                "ApiMocktle: {} 个控制器文件 → {} 个接口（仅路由，未解析 DTO）{}",
+                "ApiMocktle: {} 个控制器文件 → {} 个接口（仅路由，未解析 DTO）{}{}",
                 result.files,
                 result.endpoints.len(),
-                if result.truncated { "（已达搜索上限）" } else { "" }
+                if result.truncated { "（已达搜索上限）" } else { "" },
+                if result.stopped_early { "（预算内未扫完，结果不全）" } else { "" }
             ),
         );
         self.routes.insert(root, result.clone());
@@ -736,8 +757,9 @@ impl Plugin for ApiMocktle {
         host::log(
             LogLevel::Info,
             &format!(
-                "ApiMocktle {} 已激活（serverUrl={base}，API 1.7，host::locale()={}）",
+                "ApiMocktle {} 已激活（serverUrl={base}，API {}，host::locale()={}）",
                 env!("CARGO_PKG_VERSION"),
+                openidea_plugin::API_VERSION,
                 host::locale()
             ),
         );

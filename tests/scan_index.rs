@@ -182,8 +182,12 @@ public class DupController {
 #[test]
 fn an_exhausted_budget_returns_partial_results_instead_of_failing() {
     // A budget of zero is already spent when the first check runs. The scan must
-    // report what it has and mark itself truncated — returning `Err`, or letting
+    // report what it has and say it is incomplete — returning `Err`, or letting
     // the host kill the call, would lose the cache as well.
+    //
+    // The two "incomplete" reasons are reported separately because the caller
+    // words them differently: `truncated` is the search limit (a fixed property
+    // of the project), `stopped_early` is the clock (a retry may do better).
     let (host, _) = host(&[
         ("src/WidgetController.java", controller("Widget", "Widget")),
         ("src/Widget.java", dto("Widget")),
@@ -191,7 +195,8 @@ fn an_exhausted_budget_returns_partial_results_instead_of_failing() {
     let options = Options { budget: Some(Duration::ZERO), ..Options::default() };
     let scanned = scan_with(&host, &options);
 
-    assert!(scanned.truncated, "a partial scan says so");
+    assert!(scanned.stopped_early, "a budget stop says so");
+    assert!(!scanned.truncated, "the search limit was not the reason");
     assert_eq!(scanned.files, 0, "nothing was read before the deadline");
 }
 
