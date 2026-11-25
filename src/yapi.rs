@@ -314,11 +314,13 @@ pub fn api_doc(endpoint: &Endpoint, dto: &DtoIndex, depth: u32, lang: i18n::Lang
     // type happened to be indexed first, and export updates by `method + path`,
     // so the wrong one would overwrite a correct document on the server.
     let scope = endpoint_scope(endpoint);
-    let resolve = |name: &str, _d: u32| dto.resolve_in(&scope, name);
+    // Recursion passes the scope of the type whose fields are being walked, so a
+    // nested field resolves against its own DTO rather than against the endpoint.
+    let resolve = |name: &str, _d: u32, at: &str| dto.resolve_in(at, name);
     let request_type = endpoint.body_type.clone();
     let req_body_other = request_type
         .as_ref()
-        .map(|ty| body_schema(ty, depth, &resolve))
+        .map(|ty| body_schema(ty, depth, &resolve, &scope))
         .unwrap_or_else(|| json!({ "type": "object", "properties": {} }).to_string());
     // A form interface is described by `req_body_form`; YApi ignores
     // `req_body_other` in that mode, so the empty object stays as it was.
@@ -327,7 +329,7 @@ pub fn api_doc(endpoint: &Endpoint, dto: &DtoIndex, depth: u32, lang: i18n::Lang
     let res_body = if endpoint.return_type.trim().is_empty() {
         json!({ "type": "object", "properties": {} }).to_string()
     } else {
-        body_schema(&endpoint.return_type, depth, &resolve)
+        body_schema(&endpoint.return_type, depth, &resolve, &scope)
     };
 
     json!({

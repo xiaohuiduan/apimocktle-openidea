@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.3"
+version = "0.3.4"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.3 — 修同名 DTO 串到另一个接口。上一版开始把嵌套类当独立类型解析，但全项目仍用简单类名做唯一键：同一个包里两个控制器各自声明 public static class Request 时，两者合成一个，字段输掉的那条接口会用对方的字段生成 Schema；而导出按 method + path 更新，于是把服务器上本来正确的文档覆盖成错的，还报告「全部同步成功」。现在类型身份是「包::外部类::类名」，解析时从接口自己所在的类向外逐层查（然后是包，再是唯一候选），import 也算作用域。验证：同包两个控制器各自的嵌套 Request、跨包同名 Payload 都不再互串；类型数上限、导出分批、扫描性能（3603 接口 / 1663 DTO / 一次全项目搜索）均无回归。已知边界：同名顶层类分处两包、接口既不在其中任一包又没写 import 时，仍会任取其一并在日志记一条歧义。"
+change-notes = "0.3.4 — 修递归解析字段时用错作用域。上一版让类型身份按「包::外部类::类名」解析，但生成 Schema 时只把接口自己的作用域固定传给解析器：解析进入 Request 的字段后，再查 Detail 仍从 AController 开始，找不到 AController.Request.Detail，于是回退到全局简单名，取到 BController 的 Detail。表现是两条接口的 detail 都变成同一个字段（复现时 /a 拿到 beta、alpha 消失），导出会覆盖服务器上正确的那份。现在递归解析携带当前 DTO 的限定身份，字段类型相对声明它的 DTO 解析，所以 AController.Request.detail 是 AController.Request.Detail。验证：同包两控制器各自 Request.Detail 互不干扰、三层嵌套正常；140 个用例全绿，yudao 实测 3603 接口 / 1663 DTO 无回归。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

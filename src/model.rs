@@ -182,29 +182,48 @@ fn scalar_schema(base: &str) -> Option<Value> {
 /// `None` means the class has no source in the project: a single-argument
 /// generic is then unwrapped to its argument (a dependency jar's wrapper), and
 /// anything else is described as a plain object.
-pub type Resolver<'a> = dyn Fn(&str, u32) -> Option<ResolvedClass> + 'a;
+/// The third argument is the scope the name is written in: the qualified
+/// identity of the type whose fields are being walked (`com.acme::A::Request`),
+/// or the endpoint's own scope at the top level. A field mention carries only a
+/// simple name, and the type it means is the one in that scope — without this,
+/// `AController.Request.detail: Detail` would be looked up from `AController`
+/// and could find `BController`'s `Detail` instead.
+pub type Resolver<'a> = dyn Fn(&str, u32, &str) -> Option<ResolvedClass> + 'a;
+
+/// The qualified identity of `name` as declared inside `scope`.
+///
+/// `com.acme::AController` + `Request` is `com.acme::AController::Request`; that is
+/// the scope its own fields resolve in, so `Detail` inside it means
+/// `com.acme::AController::Request::Detail` rather than some other `Detail`.
+fn qualified_in(scope: &str, name: &str) -> String {
+    if scope.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{scope}::{name}")
+    }
+}
 
 /// The JSON Schema for one type, as YApi stores it.
-pub fn type_schema(ty: &str, depth: u32, resolve: &Resolver<'_>) -> Value {
+pub fn type_schema(ty: &str, depth: u32, resolve: &Resolver<'_>, scope: &str) -> Value {
     let ty = ty.trim();
     if ty.is_empty() {
         return json!({ "type": "string" });
     }
     if ty.ends_with("[]") {
         let inner = ty.trim_end_matches("[]");
-        return json!({ "type": "array", "items": type_schema(inner, depth, resolve) });
+        return json!({ "type": "array", "items": type_schema(inner, depth, resolve, scope) });
     }
     let (base, args) = split_type(ty);
     let base = base.rsplit('.').next().unwrap_or(&base).to_owned();
     if is_object_like(&base) {
-        let value = args.get(1).map(|v| type_schema(v, depth, resolve)).unwrap_or_else(|| json!({ "type": "string" }));
+        let value = args.get(1).map(|v| type_schema(v, depth, resolve, scope)).unwrap_or_else(|| json!({ "type": "string" }));
         let key = args.first().map(|k| map_key_name(k)).unwrap_or_else(|| "string".to_owned());
         let mut properties = Map::new();
         properties.insert(key, value);
         return json!({ "type": "object", "description": "Map", "properties": properties });
     }
     if is_array_like(&base) {
-        let item = args.first().map(|v| type_schema(v, depth, resolve)).unwrap_or_else(|| json!({ "type": "string" }));
+        let item = args.first().map(|v| type_schema(v, depth, resolve, scope)).unwrap_or_else(|| json!({ "type": "string" }));
         return json!({ "type": "array", "items": item });
     }
     if let Some(scalar) = scalar_schema(&base) {
@@ -217,15 +236,15 @@ pub fn type_schema(ty: &str, depth: u32, resolve: &Resolver<'_>) -> Value {
         // `depth > 0` guard keeps a self-referential wrapper from recursing
         // forever once the depth budget is spent.
         if depth > 0
-            && let Some(resolved) = resolve(&base, depth).filter(|rc| !rc.fields.is_empty())
+            && let Some(resolved) = resolve(&base, depth, scope).filter(|rc| !rc.fields.is_empty())
         {
             let mapped = substitute(&resolved.fields, &resolved.params, &args);
-            return object_schema(&mapped, depth, resolve);
+            return object_schema_in(&mapped, depth, resolve, &qualified_in(scope, &base));
         }
         // A wrapper that lives in a dependency (`ResponseEntity`, `Optional`)
         // cannot be resolved, so it is unwrapped exactly as before.
         if let Some(first) = args.first() {
-            return type_schema(first, depth, resolve);
+            return type_schema(first, depth, resolve, scope);
         }
     }
     if depth == 0 {
@@ -234,17 +253,17 @@ pub fn type_schema(ty: &str, depth: u32, resolve: &Resolver<'_>) -> Value {
     // A generic class that is not a known wrapper (`Wrapper<T>`, `Envelope<T>`)
     // still describes itself, but its parameters must be substituted or every
     // `T` field collapses into a plain object.
-    match resolve(&base, depth) {
+    match resolve(&base, depth, scope) {
         Some(resolved) if !resolved.fields.is_empty() => {
             let mapped = substitute(&resolved.fields, &resolved.params, &args);
-            object_schema(&mapped, depth, resolve)
+            object_schema_in(&mapped, depth, resolve, &qualified_in(scope, &base))
         }
         // A wrapper declared in a dependency jar (`ApiEnvelope<T>`,
         // `PageResult<T>`, …) has no source here, so its own fields cannot be
         // read. The only thing left to describe is the type argument: unwrap
         // it exactly like `ResponseEntity`, instead of degrading the whole
         // body to a bare `{"type": "object"}` with no fields at all.
-        _ if args.len() == 1 => type_schema(&args[0], depth, resolve),
+        _ if args.len() == 1 => type_schema(&args[0], depth, resolve, scope),
         _ => json!({ "type": "object" }),
     }
 }
@@ -295,13 +314,14 @@ fn mapped_word<'a>(word: &'a str, params: &[String], args: &'a [String]) -> &'a 
         .map_or(word, String::as_str)
 }
 
-fn object_schema(fields: &[FieldSpec], depth: u32, resolve: &Resolver<'_>) -> Value {
+/// `object_schema` for fields declared in `scope`.
+fn object_schema_in(fields: &[FieldSpec], depth: u32, resolve: &Resolver<'_>, scope: &str) -> Value {
     let mut properties = Map::new();
     for field in fields {
         let mut schema = if field.children.is_empty() {
-            type_schema(&field.ty, depth.saturating_sub(1), resolve)
+            type_schema(&field.ty, depth.saturating_sub(1), resolve, scope)
         } else {
-            object_schema(&field.children, depth.saturating_sub(1), resolve)
+            object_schema_in(&field.children, depth.saturating_sub(1), resolve, scope)
         };
         if !field.description.is_empty()
             && let Some(obj) = schema.as_object_mut()
@@ -314,8 +334,8 @@ fn object_schema(fields: &[FieldSpec], depth: u32, resolve: &Resolver<'_>) -> Va
 }
 
 /// The `res_body` / `req_body_other` JSON Schema of an endpoint.
-pub fn body_schema(ty: &str, depth: u32, resolve: &Resolver<'_>) -> String {
-    type_schema(ty, depth, resolve).to_string()
+pub fn body_schema(ty: &str, depth: u32, resolve: &Resolver<'_>, scope: &str) -> String {
+    type_schema(ty, depth, resolve, scope).to_string()
 }
 
 #[cfg(test)]
@@ -344,7 +364,7 @@ mod tests {
         }
     }
 
-    fn only_dtos(name: &str, _depth: u32) -> Option<ResolvedClass> {
+    fn only_dtos(name: &str, _depth: u32, _scope: &str) -> Option<ResolvedClass> {
         match name {
             "UserDto" => Some(user_dto()),
             _ => None,
@@ -363,7 +383,7 @@ mod tests {
     #[test]
     fn schema_unwraps_result_and_lists() {
         let resolve: &Resolver = &only_dtos;
-        let schema: Value = serde_json::from_str(&body_schema("Result<List<UserDto>>", 2, resolve)).unwrap();
+        let schema: Value = serde_json::from_str(&body_schema("Result<List<UserDto>>", 2, resolve, "")).unwrap();
         assert_eq!(schema["type"], "array");
         assert_eq!(schema["items"]["type"], "object");
         assert_eq!(schema["items"]["properties"]["name"]["type"], "string");
@@ -373,12 +393,12 @@ mod tests {
 
     #[test]
     fn keeps_a_resolved_wrapper_and_substitutes_a_list_argument() {
-        let resolve: &Resolver = &|name: &str, _depth: u32| match name {
+        let resolve: &Resolver = &|name: &str, _depth: u32, _scope: &str| match name {
             "Result" => Some(wrapper()),
             "UserDto" => Some(user_dto()),
             _ => None,
         };
-        let schema: Value = serde_json::from_str(&body_schema("Result<List<UserDto>>", 2, resolve)).unwrap();
+        let schema: Value = serde_json::from_str(&body_schema("Result<List<UserDto>>", 2, resolve, "")).unwrap();
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["code"]["type"], "number");
         assert_eq!(schema["properties"]["msg"]["type"], "string");
@@ -391,12 +411,12 @@ mod tests {
 
     #[test]
     fn keeps_a_resolved_wrapper_and_substitutes_a_single_argument() {
-        let resolve: &Resolver = &|name: &str, _depth: u32| match name {
+        let resolve: &Resolver = &|name: &str, _depth: u32, _scope: &str| match name {
             "Result" => Some(wrapper()),
             "UserDto" => Some(user_dto()),
             _ => None,
         };
-        let schema: Value = serde_json::from_str(&body_schema("Result<UserDto>", 2, resolve)).unwrap();
+        let schema: Value = serde_json::from_str(&body_schema("Result<UserDto>", 2, resolve, "")).unwrap();
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["data"]["type"], "object");
         assert_eq!(schema["properties"]["data"]["properties"]["name"]["type"], "string");
@@ -408,27 +428,27 @@ mod tests {
         // `Result` lives in a dependency here, exactly like `ResponseEntity`:
         // the old unwrapping has to stay in place.
         let resolve: &Resolver = &only_dtos;
-        let schema: Value = serde_json::from_str(&body_schema("Result<List<UserDto>>", 2, resolve)).unwrap();
+        let schema: Value = serde_json::from_str(&body_schema("Result<List<UserDto>>", 2, resolve, "")).unwrap();
         assert_eq!(schema["type"], "array");
         assert_eq!(schema["items"]["type"], "object");
 
         // A wrapper with no fields carries nothing the field table could show.
-        let empty: &Resolver = &|name: &str, _depth: u32| match name {
+        let empty: &Resolver = &|name: &str, _depth: u32, _scope: &str| match name {
             "Result" => Some(ResolvedClass::default()),
             "UserDto" => Some(user_dto()),
             _ => None,
         };
-        let schema: Value = serde_json::from_str(&body_schema("Result<List<UserDto>>", 2, empty)).unwrap();
+        let schema: Value = serde_json::from_str(&body_schema("Result<List<UserDto>>", 2, empty, "")).unwrap();
         assert_eq!(schema["type"], "array");
 
         // `ResponseEntity` is a dependency type too, so it is still unwrapped.
         let response: Value =
-            serde_json::from_str(&body_schema("ResponseEntity<List<UserDto>>", 2, resolve)).unwrap();
+            serde_json::from_str(&body_schema("ResponseEntity<List<UserDto>>", 2, resolve, "")).unwrap();
         assert_eq!(response["type"], "array");
         assert_eq!(response["items"]["type"], "object");
 
         // `Optional` is named in the README as unwrapped as well.
-        let optional: Value = serde_json::from_str(&body_schema("Optional<UserDto>", 2, resolve)).unwrap();
+        let optional: Value = serde_json::from_str(&body_schema("Optional<UserDto>", 2, resolve, "")).unwrap();
         assert_eq!(optional["type"], "object");
         assert_eq!(optional["properties"]["name"]["type"], "string");
     }
@@ -440,7 +460,7 @@ mod tests {
         // of reach and its single type argument is what still can be described.
         let resolve: &Resolver = &only_dtos;
         let schema: Value =
-            serde_json::from_str(&body_schema("ApiEnvelope<Map<String, List<UserDto>>>", 2, resolve)).unwrap();
+            serde_json::from_str(&body_schema("ApiEnvelope<Map<String, List<UserDto>>>", 2, resolve, "")).unwrap();
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["description"], "Map");
         assert_eq!(schema["properties"]["string"]["type"], "array");
@@ -448,17 +468,17 @@ mod tests {
 
         // Two arguments stay opaque: `Pair<A, B>` has no single payload to
         // stand in for the unknown class.
-        let pair: Value = serde_json::from_str(&body_schema("Pair<UserDto, String>", 2, resolve)).unwrap();
+        let pair: Value = serde_json::from_str(&body_schema("Pair<UserDto, String>", 2, resolve, "")).unwrap();
         assert_eq!(pair["type"], "object");
         assert!(pair["properties"].is_null(), "{pair}");
 
         // A wrapper the project declares itself keeps its own shape, as before.
-        let known: &Resolver = &|name: &str, _depth: u32| match name {
+        let known: &Resolver = &|name: &str, _depth: u32, _scope: &str| match name {
             "ApiEnvelope" => Some(wrapper()),
             "UserDto" => Some(user_dto()),
             _ => None,
         };
-        let kept: Value = serde_json::from_str(&body_schema("ApiEnvelope<UserDto>", 2, known)).unwrap();
+        let kept: Value = serde_json::from_str(&body_schema("ApiEnvelope<UserDto>", 2, known, "")).unwrap();
         assert_eq!(kept["properties"]["data"]["properties"]["name"]["type"], "string");
     }
 
@@ -467,7 +487,7 @@ mod tests {
         // At depth 0 the wrapper is unwrapped byte for byte as it was before
         // wrappers were kept; the guard is also what stops a self-referential
         // wrapper from re-entering `object_schema` until the stack runs out.
-        let resolve: &Resolver = &|name: &str, _depth: u32| match name {
+        let resolve: &Resolver = &|name: &str, _depth: u32, _scope: &str| match name {
             "Result" => Some(ResolvedClass {
                 params: vec!["T".into()],
                 // A field that refers back to the wrapper: without the guard
@@ -485,7 +505,7 @@ mod tests {
             "UserDto" => Some(user_dto()),
             _ => None,
         };
-        let schema: Value = serde_json::from_str(&body_schema("Result<List<UserDto>>", 0, resolve)).unwrap();
+        let schema: Value = serde_json::from_str(&body_schema("Result<List<UserDto>>", 0, resolve, "")).unwrap();
         assert_eq!(schema["type"], "array");
         assert_eq!(schema["items"]["type"], "object");
     }
@@ -494,7 +514,7 @@ mod tests {
     fn a_custom_generic_class_substitutes_its_argument() {
         // `Envelope` is not in WRAPPERS, so it takes the plain-class path; its
         // parameter still has to be substituted or `value` loses its shape.
-        let resolve: &Resolver = &|name: &str, _depth: u32| match name {
+        let resolve: &Resolver = &|name: &str, _depth: u32, _scope: &str| match name {
             "Envelope" => Some(ResolvedClass {
                 params: vec!["T".into()],
                 fields: vec![FieldSpec { name: "value".into(), ty: "T".into(), description: String::new(), children: vec![] }],
@@ -502,7 +522,7 @@ mod tests {
             "UserDto" => Some(user_dto()),
             _ => None,
         };
-        let schema: Value = serde_json::from_str(&body_schema("Envelope<UserDto>", 2, resolve)).unwrap();
+        let schema: Value = serde_json::from_str(&body_schema("Envelope<UserDto>", 2, resolve, "")).unwrap();
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["value"]["type"], "object");
         assert_eq!(schema["properties"]["value"]["properties"]["name"]["type"], "string");
@@ -546,20 +566,20 @@ mod tests {
 
     #[test]
     fn schema_handles_maps_and_arrays() {
-        let resolve: &Resolver = &|_: &str, _depth: u32| None;
+        let resolve: &Resolver = &|_: &str, _depth: u32, _scope: &str| None;
         // ApiMocktle only renders `properties` (a map written as
         // `additionalProperties` shows as `{}`), so a Map is described under
         // one sample key named after K.
-        let map: Value = serde_json::from_str(&body_schema("Map<String, Long>", 2, resolve)).unwrap();
+        let map: Value = serde_json::from_str(&body_schema("Map<String, Long>", 2, resolve, "")).unwrap();
         assert_eq!(map["type"], "object");
         assert_eq!(map["description"], "Map");
         assert_eq!(map["properties"]["string"]["type"], "number");
         assert!(map.get("additionalProperties").is_none());
 
-        let numeric: Value = serde_json::from_str(&body_schema("Map<Long, List<UserDto>>", 2, resolve)).unwrap();
+        let numeric: Value = serde_json::from_str(&body_schema("Map<Long, List<UserDto>>", 2, resolve, "")).unwrap();
         assert_eq!(numeric["properties"]["0"]["type"], "array");
 
-        let arr: Value = serde_json::from_str(&body_schema("String[]", 2, resolve)).unwrap();
+        let arr: Value = serde_json::from_str(&body_schema("String[]", 2, resolve, "")).unwrap();
         assert_eq!(arr["items"]["type"], "string");
     }
 }
