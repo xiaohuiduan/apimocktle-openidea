@@ -112,3 +112,26 @@ fn a_bare_member_type_still_resolves() {
     println!("/a req (bare) -> {req}");
     assert!(req.contains("alpha"), "the bare name keeps working: {req}");
 }
+
+/// The qualifier itself is an imported type: `import com.alpha.Outer` then
+/// `Outer.Request` means `com.alpha::Outer::Request`.
+#[test]
+fn an_imported_qualifier_resolves() {
+    let files = vec![
+        (
+            "src/com/web/AController.java",
+            "package com.web;\n\nimport com.alpha.Outer;\n\n@RestController\npublic class AController {\n    @PostMapping(\"/a\")\n    public Outer.Request save(@RequestBody Outer.Request form) { return null; }\n}\n".to_owned(),
+        ),
+        (
+            "src/com/alpha/Outer.java",
+            "package com.alpha;\n\npublic class Outer {\n    public static class Request {\n        private String alpha;\n    }\n}\n".to_owned(),
+        ),
+    ];
+    let scanned = scan(files);
+    let req = schema(&scanned, "/a", "req_body_other");
+    let res = schema(&scanned, "/a", "res_body");
+    println!("/a req (imported) -> {req}");
+    println!("/a res (imported) -> {res}");
+    assert!(req.contains("alpha"), "Outer.Request is com.alpha.Outer.Request: {req}");
+    assert!(res.contains("alpha"), "the response too: {res}");
+}

@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.12"
+version = "0.3.13"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.12 — 修成员类型被导出成空对象。字段或参数写成 AController.Request（成员类型的相对写法）或 com.acme.AController.Request（全限定写法）时，Schema 变成空对象，导出会清空服务器上已有的字段——这是 0.3.10 引入的回归，0.3.8 上这两种写法正常。原因是带点名字的解析把所有情况都按「最后一个点前面是包名」处理，而成员类型的限定词是外部类、不是包。现在区分三种形状：相对成员名拼上当前作用域的包，全限定顶层名按最后一个点拆，全限定成员名按包边界拆。新增 3 个用例（相对成员名、全限定成员名、裸名），163 个用例全绿。"
+change-notes = "0.3.13 — 修跨包 import 外层类后的成员类型解析。控制器写 import com.alpha.Outer 再用 Outer.Request 时，schema 变成空对象、导出会清空服务器上已有字段。原因是解析带点名字时只按当前包和裸包边界拼候选，没考虑限定词本身可能是 file import 进来的类型。现在先按当前文件的 import 解析限定词，再沿成员路径拼接；同时把每个文件的全部 import 都登记为别名，不再依赖该类型是否曾被当作请求体解析过。新增 1 个跨包 import 用例，164 个用例全绿。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

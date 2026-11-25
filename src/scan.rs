@@ -388,6 +388,15 @@ impl DtoIndex {
             if let Some((package, _)) = scope.rsplit_once("::") {
                 candidates.push(format!("{package}::{}", name.replace('.', "::")));
             }
+            // The qualifier may itself be a type this file imported:
+            // `import com.alpha.Outer` + `Outer.Request` is `com.alpha::Outer::Request`.
+            // The import is recorded as an alias for the bare name, so resolving the
+            // first segment through it gives the package to prepend.
+            if let Some((qualifier, rest)) = name.split_once('.')
+                && let Some(imported) = self.aliases.get(&(scope.to_owned(), qualifier.to_owned()))
+            {
+                candidates.push(format!("{imported}::{rest}"));
+            }
             let segments: Vec<&str> = name.split('.').collect();
             for at in (1..segments.len()).rev() {
                 candidates.push(format!(
@@ -1305,6 +1314,15 @@ fn resolve_dtos(
     }
 
     let mut dto = DtoIndex::default();
+    // Every import is an alias for the schema pass, whether or not the type is ever
+    // reached as a body: `import com.alpha.Outer` plus a field written
+    // `Outer.Request` needs `Outer` -> `com.alpha::Outer` before `Request` can be
+    // appended to it. Registering only resolved types left the table empty here.
+    for (scope_of_file, table) in &imports_of {
+        for (simple, package) in table {
+            dto.add_alias(scope_of_file, simple, &format!("{package}::{simple}"));
+        }
+    }
     let mut tried: HashSet<String> = HashSet::new();
     // Bare names more than one type answers to; the export refuses on any.
     let ambiguous: HashSet<String> = HashSet::new();
