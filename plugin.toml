@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.15"
+version = "0.3.16"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.15 — 修两处全限定类型定位问题。一是不同包里各有一个 Outer.java 时，B 的全限定类型被更新成空对象：文件查找要求文件名全项目唯一，遇到同名直接放弃，而全限定名其实已经指明包名，现在按包路径匹配文件。二是直接 import 嵌套类型（import com.alpha.AlphaOuter.Request）后用裸名时全变空：别名登记成 com.alpha.AlphaOuter::Request，实际身份是 com.alpha::AlphaOuter::Request，两边不一致永远命中不了，现在统一规范化成包名保留点、类边界转双冒号的形式。新增 2 个两个同名类型都可达的用例，172 个用例全绿。"
+change-notes = "0.3.16 — 修多级嵌套类型（Outer.Middle.Request）。之前只处理最末一个边界，导致两类错误：import 两级嵌套后用裸名时，后一个控制器拿到了前一个的字段（写错文档比清空更糟）；全限定写法则变成空对象。现在统一按「包 + 最外层类 + 完整成员路径」处理：以第一个首字母大写的段落为包边界，别名规范化与文件定位共用同一套规则，文件按最外层类名而非最后一段命名。新增 3 个场景（直接 import、全限定、两个同名 Outer.java），两个同名 DTO 都可达且请求响应都校验，175 个用例全绿。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

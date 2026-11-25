@@ -1421,10 +1421,12 @@ fn resolve_dtos(
             // nested one. The scan's identity keeps the package's dots and turns
             // class boundaries into `::`, so a two-segment class path becomes
             // `a.b::C::D` rather than `a.b.C::D`.
-            let qualified = match self::split_import(package) {
-                Some((owner, class)) => format!("{owner}::{class}::{simple}"),
-                None => format!("{package}::{simple}"),
-            };
+            // The import names the type in full, so normalising the whole thing is
+            // enough: `a.b.Outer.Middle.Request` becomes `a.b::Outer::Middle::Request`,
+            // which is exactly how the scan stores it.
+            let qualified = self::split_qualified(&format!("{package}.{simple}"))
+                .map(|(pkg, path)| format!("{pkg}::{path}"))
+                .unwrap_or_else(|| format!("{package}::{simple}"));
             dto.add_alias(scope_of_file, simple, &qualified);
         }
     }
@@ -1768,13 +1770,17 @@ fn class_lookup(classes: &HashMap<String, ClassEntry>, name: &str) -> Option<(St
 /// match.
 /// Splits an import's owner prefix into `(owner, class)` when it names a nested
 /// type: `a.b.C` has owner `a.b`; `a.b.C.D` has owner `a.b.C`.
-fn split_import(prefix: &str) -> Option<(&str, &str)> {
-    let last = prefix.rsplit('.').next()?;
-    if !last.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-        return None;
-    }
-    let at = prefix.rfind('.')?;
-    Some((&prefix[..at], last))
+/// Splits a dotted type name into `(package, class path)`.
+///
+/// `com.alpha.AlphaOuter.Middle.Request` is package `com.alpha` and class path
+/// `AlphaOuter::Middle::Request`. The boundary is the first segment that starts
+/// uppercase, so a deeper member path needs no special case.
+fn split_qualified(name: &str) -> Option<(String, String)> {
+    let segments: Vec<&str> = name.split('.').collect();
+    let at = segments
+        .iter()
+        .position(|s| s.chars().next().is_some_and(|c| c.is_ascii_uppercase()))?;
+    Some((segments[..at].join("."), segments[at..].join("::")))
 }
 
 fn package_of_path(path: &str, name: &str, outer: &str) -> String {
@@ -1963,16 +1969,18 @@ fn load_class(
         && !owner.is_empty()
         && !rest.is_empty()
     {
-        // `owner` is `pkg.Outer` (or `pkg.Outer.Middle`): the file is named after
-        // the outermost class and lives in the package. Two packages may each have
-        // their own `Outer.java`, so the package picks the right one; only when it
-        // says nothing is a unique stem used.
-        let segments: Vec<&str> = owner.split('.').collect();
-        let outer = *segments.last().unwrap_or(&owner);
-        let package = segments[..segments.len().saturating_sub(1)].join(".");
-        let by_package = index.file_named_in(outer, &package);
-        if let Some(path) = by_package.or_else(|| index.file_named(outer)) {
-            candidates.push(path);
+        // `owner` is `pkg.Outer` or `pkg.Outer.Middle`. The file is named after the
+        // OUTERMOST class and lives in the package, so the boundary is where the
+        // package ends — not the last segment, which for a multi-level path would
+        // look for `Middle.java` and never find it.
+        if let Some((package, classes)) = self::split_qualified(&format!("{owner}.{name}")) {
+            let file = classes.split("::").next().unwrap_or(&classes);
+            if let Some(path) = index
+                .file_named_in(file, &package)
+                .or_else(|| index.file_named(file))
+            {
+                candidates.push(path);
+            }
         }
     }
     candidates.extend(index.candidates(name));
