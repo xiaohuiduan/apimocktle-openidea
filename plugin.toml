@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.5"
+version = "0.3.6"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.5 — 按每个源文件自己的 import 解析同名 DTO。前两版修好了「同包两个控制器各自声明嵌套 DTO」和「递归解析字段用错作用域」，但导入表仍是全项目一张：com.web.AController import com.alpha.Payload、com.web.BController import com.beta.Payload 时，第二个 import 被丢掉，B 接口拿到 A 的类型，导出会覆盖服务器上正确的文档。现在导入按文件保存，类型解析和后续 Schema 生成都沿用该文件的导入（DtoIndex 记录「接口作用域 + 简单名 → 限定类型」的别名）。验证：四个源文件、两个独立顶层同名 DTO 各走自己的 import；三轮 review 的 6 个回归用例全过，141 个用例全绿，yudao 实测 3603 接口 / 1663 DTO 无回归。"
+change-notes = "0.3.6 — 修递归进入独立 DTO 文件后丢失该文件的 import。上一版按文件保留了导入表，但只对接口所在的文件建立：com.alpha.AlphaRequest import com.detailalpha.Detail、com.beta.BetaRequest import com.detailbeta.Detail 时，递归进 AlphaRequest 后查 Detail 拿不到它自己的 import，两个 Detail 混用，导出把 /b 的 detail.beta 覆盖成 alpha。根因有两层：一是加载类型时没有带回该文件的 import（主扫描只读控制器），二是 Schema 递归用「父作用域 + 字段里写的简单名」拼下一层作用域，而真实类型身份来自 import 解析，两者对不上。现在 ResolvedClass 携带解析到的真实限定身份，递归沿它继续；load_class 同时返回被加载文件的 import 并登记。验证：六文件场景下 /a 的请求与响应都是 detail.alpha、/b 都是 detail.beta；四轮 review 的 9 个回归用例全过，144 个用例全绿，yudao 实测 3603 接口 / 1663 DTO 无回归。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"

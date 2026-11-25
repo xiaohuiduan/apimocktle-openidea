@@ -348,6 +348,7 @@ impl DtoIndex {
                 return Some(ResolvedClass {
                     params: self.scope_params.get(&key).cloned().unwrap_or_default(),
                     fields: fields.clone(),
+                    qualified: key,
                 });
             }
             match prefix.rsplit_once("::") {
@@ -364,6 +365,7 @@ impl DtoIndex {
             return Some(ResolvedClass {
                 params: self.scope_params.get(qualified).cloned().unwrap_or_default(),
                 fields: fields.clone(),
+                qualified: qualified.clone(),
             });
         }
         // A bare name is only an answer when it means one thing.
@@ -371,9 +373,18 @@ impl DtoIndex {
             return None;
         }
         let fields = self.fields.get(name)?;
+        // A unique single-name entry answers for one type only, so its qualified
+        // key (when the type has one) is the identity its fields resolve against.
+        let qualified = self
+            .scopes
+            .keys()
+            .find(|key| key.rsplit_once("::").is_some_and(|(_, simple)| simple == name))
+            .cloned()
+            .unwrap_or_else(|| name.to_owned());
         Some(ResolvedClass {
             params: self.params.get(name).cloned().unwrap_or_default(),
             fields: fields.clone(),
+            qualified,
         })
     }
 
@@ -1187,21 +1198,35 @@ None => name.clone(),
         // The endpoint's scope decides which declaration a bare name means, so the
         // scoped key is tried before the global one.
         let found = match scoped.or_else(|| class_lookup(classes, &name)) {
-            Some((qualified, hit)) => Some((qualified, hit)),
+            // A controller from the class table: its file's imports were recorded
+            // in the controller pass.
+            Some((qualified, hit)) => Some((qualified, hit, HashMap::new())),
             None => {
-let lookup_scope = match &imported_package {
-Some(package) => format!("{package}::{name}"),
-None => scope.clone(),
-};
-load_class(project, options, types, &name, &lookup_scope, sources)
-.map(|(path, params, fields)| (package_of_path(&path, &name), (params, fields)))
-.or_else(|| {
-deps.fields(project, &name, imported_package.as_deref())
-.map(|hit| (name.clone(), hit))
-})
-}
+                let lookup_scope = match &imported_package {
+                    Some(package) => format!("{package}::{name}"),
+                    None => scope.clone(),
+                };
+                load_class(project, options, types, &name, &lookup_scope, sources)
+                    .map(|(path, params, fields, imports)| {
+                        (package_of_path(&path, &name), (params, fields), imports)
+                    })
+                    .or_else(|| {
+                        deps.fields(project, &name, imported_package.as_deref())
+                            .map(|hit| (name.clone(), hit, HashMap::new()))
+                    })
+            }
         };
-        let Some((qualified, (params, fields))) = found else { continue };
+        let Some((qualified, (params, fields), file_imports)) = found else { continue };
+        // The type's own file imports are what its fields resolve against, so they
+        // are registered under the type's identity — the scope the queue carries to
+        // the next level. Without this, a DTO that lives in its own file lost its
+        // imports and its fields fell back to a global simple name, which is how
+        // `AlphaRequest.detail` and `BetaRequest.detail` became the same type.
+        if !file_imports.is_empty() {
+            imports_of
+                .entry(qualified.clone())
+                .or_insert_with(|| file_imports.clone());
+        }
         for field in &fields {
             push_names(&field.ty, &mut queue, &qualified);
         }
@@ -1334,6 +1359,11 @@ fn scoped_lookup(classes: &HashMap<String, ClassEntry>, scope: &str, name: &str)
 
 /// A parsed class: its declared type parameters and its fields.
 type ClassEntry = (Vec<String>, Vec<spring::Field>);
+
+/// A class loaded from its source file: the file it came from, its declared type
+/// parameters, its fields, and the imports that file declares (which its own fields
+/// resolve against).
+type LoadedClass = (String, Vec<String>, Vec<spring::Field>, HashMap<String, String>);
 
 /// Every class `name` could mean, as `(qualified key, entry)`.
 ///
@@ -1539,7 +1569,7 @@ fn load_class(
     name: &str,
     scope: &str,
     sources: &HashMap<String, String>,
-) -> Option<(String, Vec<String>, Vec<spring::Field>)> {
+) -> Option<LoadedClass> {
     let mut candidates = index.candidates(name);
     // A same-named file in the endpoint's own package is the type it means; without
     // this, two `Payload.java` in different packages resolved to whichever the index
@@ -1562,7 +1592,23 @@ fn load_class(
         };
         let model = spring::parse(&src);
         if let Some(class) = model.classes.iter().find(|c| c.name == name) {
-            return Some((path.clone(), class.type_params.clone(), class.fields.clone()));
+            // This file's imports: its own fields resolve against them, and no
+            // other pass has parsed this file.
+            let mut file_imports: HashMap<String, String> = HashMap::new();
+            for import in &model.imports {
+                let Some((package, simple)) = import.rsplit_once('.') else { continue };
+                if simple.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                    file_imports
+                        .entry(simple.to_owned())
+                        .or_insert_with(|| package.to_owned());
+                }
+            }
+            return Some((
+                path.clone(),
+                class.type_params.clone(),
+                class.fields.clone(),
+                file_imports,
+            ));
         }
     }
     None

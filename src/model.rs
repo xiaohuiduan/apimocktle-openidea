@@ -27,6 +27,14 @@ pub struct FieldSpec {
 pub struct ResolvedClass {
     pub params: Vec<String>,
     pub fields: Vec<FieldSpec>,
+    /// The type's real identity (`package::Outer::Name`), which is what its own
+    /// fields resolve against.
+    ///
+    /// A field mention carries only a simple name, and that name may be an import:
+    /// `Detail` inside `com.alpha.AlphaRequest` can mean `com.detailalpha.Detail`.
+    /// Carrying the resolved identity lets the walk continue from the type that was
+    /// actually found instead of from `scope + name`.
+    pub qualified: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -190,18 +198,6 @@ fn scalar_schema(base: &str) -> Option<Value> {
 /// and could find `BController`'s `Detail` instead.
 pub type Resolver<'a> = dyn Fn(&str, u32, &str) -> Option<ResolvedClass> + 'a;
 
-/// The qualified identity of `name` as declared inside `scope`.
-///
-/// `com.acme::AController` + `Request` is `com.acme::AController::Request`; that is
-/// the scope its own fields resolve in, so `Detail` inside it means
-/// `com.acme::AController::Request::Detail` rather than some other `Detail`.
-fn qualified_in(scope: &str, name: &str) -> String {
-    if scope.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{scope}::{name}")
-    }
-}
 
 /// The JSON Schema for one type, as YApi stores it.
 pub fn type_schema(ty: &str, depth: u32, resolve: &Resolver<'_>, scope: &str) -> Value {
@@ -239,7 +235,7 @@ pub fn type_schema(ty: &str, depth: u32, resolve: &Resolver<'_>, scope: &str) ->
             && let Some(resolved) = resolve(&base, depth, scope).filter(|rc| !rc.fields.is_empty())
         {
             let mapped = substitute(&resolved.fields, &resolved.params, &args);
-            return object_schema_in(&mapped, depth, resolve, &qualified_in(scope, &base));
+            return object_schema_in(&mapped, depth, resolve, &resolved.qualified);
         }
         // A wrapper that lives in a dependency (`ResponseEntity`, `Optional`)
         // cannot be resolved, so it is unwrapped exactly as before.
@@ -256,7 +252,7 @@ pub fn type_schema(ty: &str, depth: u32, resolve: &Resolver<'_>, scope: &str) ->
     match resolve(&base, depth, scope) {
         Some(resolved) if !resolved.fields.is_empty() => {
             let mapped = substitute(&resolved.fields, &resolved.params, &args);
-            object_schema_in(&mapped, depth, resolve, &qualified_in(scope, &base))
+            object_schema_in(&mapped, depth, resolve, &resolved.qualified)
         }
         // A wrapper declared in a dependency jar (`ApiEnvelope<T>`,
         // `PageResult<T>`, …) has no source here, so its own fields cannot be
@@ -344,6 +340,7 @@ mod tests {
 
     fn user_dto() -> ResolvedClass {
         ResolvedClass {
+            qualified: String::new(),
             params: Vec::new(),
             fields: vec![
                 FieldSpec { name: "name".into(), ty: "String".into(), description: "名字".into(), children: vec![] },
@@ -355,6 +352,7 @@ mod tests {
 
     fn wrapper() -> ResolvedClass {
         ResolvedClass {
+            qualified: String::new(),
             params: vec!["T".into()],
             fields: vec![
                 FieldSpec { name: "code".into(), ty: "int".into(), description: String::new(), children: vec![] },
@@ -489,6 +487,7 @@ mod tests {
         // wrapper from re-entering `object_schema` until the stack runs out.
         let resolve: &Resolver = &|name: &str, _depth: u32, _scope: &str| match name {
             "Result" => Some(ResolvedClass {
+                qualified: "Result".to_owned(),
                 params: vec!["T".into()],
                 // A field that refers back to the wrapper: without the guard
                 // this is where the recursion would never end.
@@ -516,6 +515,7 @@ mod tests {
         // parameter still has to be substituted or `value` loses its shape.
         let resolve: &Resolver = &|name: &str, _depth: u32, _scope: &str| match name {
             "Envelope" => Some(ResolvedClass {
+                qualified: "Envelope".to_owned(),
                 params: vec!["T".into()],
                 fields: vec![FieldSpec { name: "value".into(), ty: "T".into(), description: String::new(), children: vec![] }],
             }),
