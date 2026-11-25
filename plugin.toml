@@ -1,6 +1,6 @@
 id = "apimocktle.openidea"
 name = "ApiMocktle"
-version = "0.3.2"
+version = "0.3.3"
 # The overview is the one text the host renders verbatim: `description` is not in
 # the host's translatable keys (`pluginText.ts`), and the details page draws it as
 # a single `<p>` with no `pre-wrap`, so HTML collapses any newline into a space —
@@ -11,7 +11,7 @@ description = "Extract HTTP endpoints from Java/Kotlin sources (Spring MVC, JAX-
 authors = ["ApiMocktle"]
 license = "Apache-2.0"
 homepage = "https://github.com/xiaohuiduan/apimocktle-openidea"
-change-notes = "0.3.2 — 让大项目能用起来。上一版在 yudao-cloud（8140 个 Java 文件 / 735 个控制器）上会崩：先是打开仪表盘就触发宿主 5 秒限时、插件被杀重启，修掉以后又变成导出只能发出 200 个、状态栏那条路径 2 秒超时。逐层查下来是三处「用了昂贵操作做廉价事」：一是每个类型查不到就去全项目正则搜索，单次 390～1870 毫秒，一次扫描能触发上百次；二是类型索引只建到 5000 个文件，而该项目有 8140 个，被截掉的那些类全都落到上面的搜索里；三是「列出接口」那次调用只有 2 秒硬限时，而一次全项目搜索就要 3.7 秒，从那里发起的扫描永远不可能完成。现在：索引覆盖全部源码；查不到时不再搜索，改成按包路径和文件名相关度排序后直接读候选文件（读文件 0.3 毫秒，是搜索的六千分之一）；「列出接口」只读仪表盘与导出扫完写进插件存储的缓存，不再自己扫描。实测该工程扫描 3603 个接口 / 1663 个 DTO，搜索次数从 126 降到 1。另外：导出发送也开后台任务，一批上限 50 秒，三千多个接口约 30 秒一次发完，不再需要每分钟点「继续」；嵌套类（控制器内嵌 DTO、DTO 内嵌子结构、Outer.Inner 限定引用）现在按独立类型解析——之前会静默丢字段；两种「DTO 没解析完」的原因（超时 / 类型数上限）分开提示，上限提到 5000；每次扫描在日志里输出 read_file 与 search_text 的次数和耗时，便于定位。"
+change-notes = "0.3.3 — 修同名 DTO 串到另一个接口。上一版开始把嵌套类当独立类型解析，但全项目仍用简单类名做唯一键：同一个包里两个控制器各自声明 public static class Request 时，两者合成一个，字段输掉的那条接口会用对方的字段生成 Schema；而导出按 method + path 更新，于是把服务器上本来正确的文档覆盖成错的，还报告「全部同步成功」。现在类型身份是「包::外部类::类名」，解析时从接口自己所在的类向外逐层查（然后是包，再是唯一候选），import 也算作用域。验证：同包两个控制器各自的嵌套 Request、跨包同名 Payload 都不再互串；类型数上限、导出分批、扫描性能（3603 接口 / 1663 DTO / 一次全项目搜索）均无回归。已知边界：同名顶层类分处两包、接口既不在其中任一包又没写 import 时，仍会任取其一并在日志记一条歧义。"
 categories = ["frameworks", "tools"]
 icon = "icons/apimocktle.svg"
 engines.openidea = "^1.14"
