@@ -184,10 +184,9 @@ impl TypeIndex {
         name: &str,
         owner: Option<&str>,
     ) -> Vec<String> {
-        let key = match owner {
-            Some(owner) => format!("{owner}#{name}"),
-            None => name.to_owned(),
-        };
+        // One namespace for both: a bare `name` would collide with an
+        // `owner#name` key if a class were ever called `a.B`.
+        let key = format!("{}#{name}", owner.unwrap_or(""));
         if let Some(hit) = self.searched.get(&key) {
             return hit.clone();
         }

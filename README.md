@@ -257,11 +257,12 @@ is no switch for a single shared category.
    **ApiMocktle: Export Endpoints in Current File** (`Alt+Shift+E`).
 4. `Ctrl/Cmd+Shift+A` → search endpoints, or complete URLs directly in a `.http` file.
 
-One click is enough to export. The host gives a plugin call a 5-second wall-clock budget and `host::fetch` is
-synchronous, so a batch has a ceiling; on a local server a round trip is a few milliseconds, and 56 endpoints finish
-in under a second. Batching actually triggers on a slow server: the loop stops at 4.2 seconds, the rest is queued,
-and the plugin advances one batch per minute through `on-schedule:60` while the status bar shows
-"Syncing · N left"; a notification appears when everything is done.
+One click is enough to export. Sending opens its own background task (the IDE's task area shows
+"ApiMocktle: syncing endpoints" with progress), which raises the call from the host's 5 s to 60 s and renews it once
+per interface sent — so a batch is bounded by **50 seconds**, not by a number of interfaces: at the measured ~7.7 ms
+per interface, three thousand of them go out in about 30 seconds and a whole project finishes in one click. Only a
+server slow enough to exceed 50 s leaves a remainder, and that is queued and advanced one batch per minute through
+`on-schedule:60` while the status bar shows "Syncing · N left"; a notification appears when everything is done.
 
 To push the next batch immediately, click **Continue now** in the notification or run
 *ApiMocktle: Continue Syncing Remaining Endpoints*. The queue lives in plugin storage, survives closing the window,
@@ -320,12 +321,18 @@ Rebuild and re-grant afterwards. This is the host's capability model, not a choi
 - **Map renders with an example key**: `Map<K, V>` exports as
   `{ "type": "object", "properties": { "<example name for K>": V } }` rather than `additionalProperties` — the
   latter shows as an empty object in ApiMocktle / YApi field tables.
-- **Command budget: 4.2 s for the dashboard, 50 s for an export**: the host limits a plugin call to 5 s, but
-  `host::begin_task` raises that call's wall clock to 60 s and every `report` renews it. An export therefore opens a
-  background task and scans with a 50 s budget, at the cost of a "ApiMocktle: resolving request and response types"
-  entry with progress in the IDE's background-task area. The dashboard does not: it only needs routes, returns within
-  1.5 s, and opens no task. Both paths return what they found with a "results may be incomplete" note rather than
-  being killed by the host. Very large projects also hit the text-search limit.
+- **Command budget: 50 s for both the dashboard and an export**: the host limits a plugin call to 5 s, but
+  `host::begin_task` raises that call's wall clock to 60 s and every `report` renews it. Each opens a background task
+  for its scan and gets the 50 s budget, at the cost of an "ApiMocktle: resolving request and response types" or
+  "syncing endpoints" entry with progress in the IDE's background-task area. Both paths return what they found with a
+  "results may be incomplete" note rather than being killed by the host. Very large projects also hit the text-search
+  limit.
+- **The status bar's endpoint list comes from the dashboard's scan**: the host gives the "list endpoints" call a hard
+  2 s limit, while a project-wide search alone costs 3.7 s on a large project — a scan started there is always killed
+  and the plugin reaped (the IDE reports "Plugin ApiMocktle crashed"). That call therefore only reads a cache: the
+  dashboard and export publish their routes into plugin storage after scanning, and the status bar and the
+  `Ctrl/Cmd+Shift+A` endpoint search read it. **On a project that has not been scanned yet the status bar is empty**;
+  opening the dashboard once fills it, and the IDE invalidates the cache when files change and asks again.
 - **No export when the DTO closure did not finish**: an incomplete route list is a display problem — a few endpoints
   are simply missing. An incomplete DTO graph is different: schemas built from it lose fields, and export updates an
   existing interface by `method + path`, so sending one would replace the server's correct document with a poorer

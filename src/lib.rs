@@ -106,6 +106,16 @@ fn publish_routes(root: &str, scanned: &scan::ScanResult) {
     }
 }
 
+/// Drops the published routes for `root`.
+///
+/// The endpoints provider reads this cache without scanning, so it is the only
+/// way the IDE's status bar learns that the project changed: "refresh" from the
+/// dashboard calls this and then publishes a fresh scan. Without it the provider
+/// kept showing the routes of whatever was there when the cache was written.
+fn forget_routes(root: &str) {
+    let _ = host::storage::delete(&routes_cache_key(root));
+}
+
 /// The routes published by the last scan, or an empty list.
 ///
 /// Never scans: the endpoints provider has 2 s and a scan cannot fit.
@@ -1011,6 +1021,11 @@ impl Views for ApiMocktle {
                     Some("refresh") => {
                         self.cache.clear();
                         self.routes.clear();
+                        if let Some(project) = ctx.project()
+                            && let Ok(root) = project.root()
+                        {
+                            forget_routes(&root);
+                        }
                         let payload = self.dashboard_payload(ctx);
                         post(payload);
                     }
