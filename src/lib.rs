@@ -509,6 +509,21 @@ impl ApiMocktle {
             };
             return Err(Error::Failed(text.into()));
         }
+        // A name several types answer to cannot be resolved from the field mention
+        // alone. Export updates by `method + path`, so a document built from the
+        // wrong type would replace a correct one — refusing is the safer failure.
+        let ambiguous = scanned.dto.ambiguous_names();
+        if !ambiguous.is_empty() {
+            // A warning rather than a refusal: the scoped resolution above already
+            // gives each endpoint its own declaration, and a name only shows up here
+            // when the project itself cannot settle it. Refusing every export on a
+            // real project with a common name (`Result`, `PageParam`) proved too
+            // blunt; the log names them so a wrong document can be traced.
+            host::log(
+                LogLevel::Warn,
+                &format!("ApiMocktle: 类型名有歧义，按作用域解析 {ambiguous:?}"),
+            );
+        }
         Ok((scanned, project))
     }
 

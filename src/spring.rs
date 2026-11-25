@@ -134,6 +134,13 @@ pub struct Class {
     /// class's file, so the file-name index cannot find it by name. Collected
     /// here and surfaced into `FileModel::classes` by the caller.
     pub nested: Vec<Class>,
+    /// The type that declares this one, empty for a top-level type.
+    ///
+    /// Two controllers can each declare a `Request`, and those are different
+    /// types. The scan needs the nesting to give each one a distinct identity:
+    /// resolving both to one entry builds one endpoint's schema from the other's
+    /// fields. `parse` fills this in while flattening `nested`.
+    pub outer: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -288,8 +295,9 @@ pub fn parse(src: &str) -> FileModel {
                             // the type that declares it (harmless, and it keeps
                             // the order stable).
                             let nested = std::mem::take(&mut class.nested);
+                            let owner = class.name.clone();
                             model.classes.push(class);
-                            push_nested(&mut model.classes, nested);
+                            push_nested(&mut model.classes, nested, &owner);
                         } else {
                             pending.clear();
                         }
@@ -385,11 +393,21 @@ fn param_name<'a>(src: &'a str, lexed: &Lexed, from: usize, to: usize) -> Option
 }
 
 /// Adds `nested` and everything declared inside it to `out`.
-fn push_nested(out: &mut Vec<Class>, nested: Vec<Class>) {
+///
+/// Each nested type records its declaring type in `outer` (`Outer`, or
+/// `Outer::Inner` one level deeper), which is what lets the scan tell two
+/// same-named inner types apart.
+fn push_nested(out: &mut Vec<Class>, nested: Vec<Class>, outer: &str) {
     for mut class in nested {
         let deeper = std::mem::take(&mut class.nested);
+        class.outer = outer.to_owned();
+        let qualified = if outer.is_empty() {
+            class.name.clone()
+        } else {
+            format!("{outer}::{}", class.name)
+        };
         out.push(class);
-        push_nested(out, deeper);
+        push_nested(out, deeper, &qualified);
     }
 }
 

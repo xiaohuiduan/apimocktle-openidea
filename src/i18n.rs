@@ -134,6 +134,17 @@ pub const DTO_TYPE_LIMIT: Text = Text::new(
     "这个项目用到的 DTO 类型超过了单次扫描的上限，因此没有导出，服务器上的接口文档保持不变。请用「导出当前文件/目录」只解析这部分接口用到的类型。",
 );
 
+/// Export refused because a type name means more than one type.
+///
+/// Two controllers in different packages can each declare a `Payload`, and a field
+/// mention carries only the simple name. Export updates an existing interface by
+/// `method + path`, so sending a document built from the wrong type would replace a
+/// correct one — worse than not exporting at all.
+pub const DTO_AMBIGUOUS: Text = Text::new(
+    "More than one type in this project has the same simple name, and this endpoint's type cannot be told apart from the name alone, so nothing was exported and the server's documents are unchanged. Rename one of the types, or export the current file so only its own types are resolved.",
+    "这个项目里有多个同名的类型，这条接口用的到底是哪一个无法从名字判断，因此没有导出，服务器上的接口文档保持不变。请给其中一个改名，或用「导出当前文件」只解析该文件自己的类型。",
+);
+
 /// The background task a scan opens to get a 60-second call budget.
 pub const SCAN_TASK_TITLE: Text = Text::new("ApiMocktle: resolving request and response types", "ApiMocktle: 解析请求响应类型");
 pub const SCAN_TASK_ROUTES: Text = Text::new("reading controllers", "读取控制器");
@@ -386,6 +397,7 @@ mod tests {
             BACKGROUND_DONE,
             DTO_INCOMPLETE,
             DTO_TYPE_LIMIT,
+            DTO_AMBIGUOUS,
             SCAN_TASK_TITLE,
             SCAN_TASK_ROUTES,
             EXPORT_TASK_TITLE,

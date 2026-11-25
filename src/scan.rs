@@ -7,7 +7,7 @@ use openidea_plugin::{Error, Project, TextQuery};
 use serde_json::Value;
 
 use crate::java::{LineIndex, lex};
-use crate::model::{Endpoint, FieldSpec, ParamSpec, simple_name, split_type};
+use crate::model::{Endpoint, FieldSpec, ParamSpec, ResolvedClass, simple_name, split_type};
 use crate::spring::{self, ParamKind};
 
 /// The HTTP verbs whose annotations mark a controller file.
@@ -286,10 +286,94 @@ fn index_of(paths: Vec<String>) -> HashMap<String, Vec<String>> {
 
 /// The DTO graph. Fields and declared type parameters travel together because
 /// expanding a wrapper such as `Result<X>` needs both.
+///
+/// Types are keyed by simple name, which is what a field mention (`List<Request>`)
+/// carries. Two projects can declare the same simple name in different packages or
+/// inside different controllers, and those are different types: resolving both to
+/// one entry would build one endpoint's schema from the other's fields and, because
+/// export updates by `method + path`, overwrite a correct document with a wrong one.
+///
+/// `scopes` keeps the qualified identity alongside, keyed by
+/// `package::Outer::Name`, and `ambiguous` records the simple names that turned out
+/// to mean more than one type. An export refuses to send a name that is ambiguous
+/// rather than guessing which one the endpoint meant.
 #[derive(Clone, Debug, Default)]
 pub struct DtoIndex {
     pub fields: HashMap<String, Vec<FieldSpec>>,
     pub params: HashMap<String, Vec<String>>,
+    /// `package::Outer::Name` -> fields, for the types that live in a package.
+    scopes: HashMap<String, Vec<FieldSpec>>,
+    /// `package::Outer::Name` -> declared type parameters.
+    scope_params: HashMap<String, Vec<String>>,
+    /// Simple names declared by more than one type.
+    ambiguous: HashSet<String>,
+}
+
+impl DtoIndex {
+    /// Records a type under its simple name and its qualified one.
+    ///
+    /// The first writer of a simple name wins, as before. A second, *different*
+    /// type claiming the same simple name marks it ambiguous instead of silently
+    /// replacing the first.
+    pub fn insert(&mut self, qualified: &str, simple: &str, params: Vec<String>, fields: Vec<FieldSpec>) {
+        match self.fields.get(simple) {
+            Some(existing) => {
+                if *existing != fields {
+                    self.ambiguous.insert(simple.to_owned());
+                }
+            }
+            None => {
+                self.fields.insert(simple.to_owned(), fields.clone());
+                self.params.insert(simple.to_owned(), params.clone());
+            }
+        }
+        self.scopes.insert(qualified.to_owned(), fields);
+        self.scope_params.insert(qualified.to_owned(), params);
+    }
+
+    /// The fields of `name` as seen from `scope` (a `package::Outer::...` prefix).
+    ///
+    /// The endpoint's own scope is tried first, then each enclosing scope outward,
+    /// then the simple name. That order is what makes `AController.Request` and
+    /// `BController.Request` resolve to their own types.
+    pub fn resolve_in(&self, scope: &str, name: &str) -> Option<ResolvedClass> {
+        let mut prefix = scope;
+        loop {
+            let key = format!("{prefix}::{name}");
+            if let Some(fields) = self.scopes.get(&key) {
+                return Some(ResolvedClass {
+                    params: self.scope_params.get(&key).cloned().unwrap_or_default(),
+                    fields: fields.clone(),
+                });
+            }
+            match prefix.rsplit_once("::") {
+                Some((outer, _)) => prefix = outer,
+                None => break,
+            }
+        }
+        let fields = self.fields.get(name)?;
+        Some(ResolvedClass {
+            params: self.params.get(name).cloned().unwrap_or_default(),
+            fields: fields.clone(),
+        })
+    }
+
+    /// Marks `name` as meaning more than one type.
+fn mark_ambiguous(&mut self, name: String) {
+self.ambiguous.insert(name);
+}
+
+    /// Whether `name` means more than one type in this project.
+    pub fn is_ambiguous(&self, name: &str) -> bool {
+        self.ambiguous.contains(name)
+    }
+
+    /// Ambiguous simple names, sorted, for a refusal message.
+    pub fn ambiguous_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.ambiguous.iter().cloned().collect();
+        names.sort();
+        names
+    }
 }
 
 /// Why a DTO closure stopped before every reachable type was resolved.
@@ -416,7 +500,7 @@ pub fn scan_with_progress(
     let mut types = TypeIndex::build(project, options);
 
     let mut endpoints: Vec<Endpoint> = Vec::new();
-    let mut classes: HashMap<String, (Vec<String>, Vec<spring::Field>)> = HashMap::new();
+    let mut classes: HashMap<String, ClassEntry> = HashMap::new();
     let mut sources: HashMap<String, String> = HashMap::new();
     // Simple class name → the package it was imported from. Dependency jars
     // are ranked with it, so the jar that holds `ApiEnvelope` is read first.
@@ -464,8 +548,9 @@ pub fn scan_with_progress(
         }
         constants.absorb(&model);
         for class in &model.classes {
+            let qualified = qualified_name(&model.package, class);
             classes
-                .entry(class.name.clone())
+                .entry(qualified)
                 .or_insert_with(|| (class.type_params.clone(), class.fields.clone()));
         }
         sources.insert(path.clone(), src.clone());
@@ -981,7 +1066,7 @@ fn resolve_dtos(
     options: &Options,
     types: &mut TypeIndex,
     endpoints: &[Endpoint],
-    classes: &HashMap<String, (Vec<String>, Vec<spring::Field>)>,
+    classes: &HashMap<String, ClassEntry>,
     sources: &HashMap<String, String>,
     deps: &mut crate::deps::Deps,
     hints: &HashMap<String, String>,
@@ -996,16 +1081,19 @@ fn resolve_dtos(
     // distinct types. Deduplicating here is what makes the queue length a usable
     // progress denominator; `tried` below already prevented duplicate *work*,
     // but a queue of duplicates made the bar's total meaningless.
-    let mut queue: Vec<String> = Vec::new();
+    let mut queue: Vec<(String, String)> = Vec::new();
     for endpoint in endpoints {
+        let scope = endpoint_scope(endpoint);
         if let Some(ty) = &endpoint.body_type {
-            push_names(ty, &mut queue);
+            push_names(ty, &mut queue, &scope);
         }
-        push_names(&endpoint.return_type, &mut queue);
+        push_names(&endpoint.return_type, &mut queue, &scope);
     }
 
     let mut dto = DtoIndex::default();
     let mut tried: HashSet<String> = HashSet::new();
+    // Bare names more than one type answers to; the export refuses on any.
+    let ambiguous: HashSet<String> = HashSet::new();
     let mut budget = options.type_budget.unwrap_or(TYPE_BUDGET);
     // The queue grows as types are resolved (each type adds the types its fields
     // mention), so `done + queue.len()` is not a fixed denominator: it rises as
@@ -1014,7 +1102,7 @@ fn resolve_dtos(
     // the bar can stall, but never jump back, which is what "stuck at 80%" was.
     let mut peak_total = queue.len().max(1);
     let mut stop = None;
-    while let Some(name) = queue.pop() {
+    while let Some((name, scope)) = queue.pop() {
         // The closure is the most expensive stage; stopping here keeps the
         // routes that were already found instead of losing the whole call. The
         // caller must still know the graph is partial, so this is reported back
@@ -1023,7 +1111,21 @@ fn resolve_dtos(
             stop = Some(DtoStop::Deadline);
             break;
         }
-        if !tried.insert(name.clone()) {
+        // De-duplicated by the qualified identity: two endpoints naming their own
+        // `Request` are two different types and both must be resolved.
+        // Identity is settled by, in order: the endpoint's own scope, the package
+// its imports name for this type, then a unique candidate anywhere. When
+// none of them settles it, the name is ambiguous and export refuses rather
+// than save a document built from the wrong type.
+let scoped = scoped_lookup(classes, &scope, &name).or_else(|| imported_lookup(classes, hints, &name));
+let identity = match &scoped {
+Some((qualified, _)) => qualified.clone(),
+// A scoped table entry is a type of its own; with no entry the bare
+// name is used, so one type reached from several endpoints is still
+// resolved once and the budget is spent on distinct types.
+None => name.clone(),
+};
+        if !tried.insert(identity) {
             continue;
         }
         if budget == 0 {
@@ -1031,14 +1133,20 @@ fn resolve_dtos(
             break;
         }
         budget -= 1;
-        let found = match classes.get(&name) {
-            Some(hit) => Some(hit.clone()),
-            None => load_class(project, options, types, &name, sources)
-                .or_else(|| deps.fields(project, &name, hints.get(&name).map(String::as_str))),
+        // The endpoint's scope decides which declaration a bare name means, so the
+        // scoped key is tried before the global one.
+        let found = match scoped.or_else(|| class_lookup(classes, &name)) {
+            Some((qualified, hit)) => Some((qualified, hit)),
+            None => load_class(project, options, types, &name, &scope, sources)
+                .map(|(path, params, fields)| (package_of_path(&path, &name), (params, fields)))
+                .or_else(|| {
+                    deps.fields(project, &name, hints.get(&name).map(String::as_str))
+                        .map(|hit| (name.clone(), hit))
+                }),
         };
-        let Some((params, fields)) = found else { continue };
+        let Some((qualified, (params, fields))) = found else { continue };
         for field in &fields {
-            push_names(&field.ty, &mut queue);
+            push_names(&field.ty, &mut queue, &qualified);
         }
         let specs: Vec<FieldSpec> = fields
             .iter()
@@ -1050,8 +1158,10 @@ fn resolve_dtos(
                 children: Vec::new(),
             })
             .collect();
-        dto.params.insert(name.clone(), params);
-        dto.fields.insert(name, specs);
+        // Recorded under its qualified identity so an endpoint that names the
+        // same simple type resolves to its own declaration; the simple name is
+        // kept for the types that carry no package.
+        dto.insert(&qualified, &name, params, specs);
         // `queue` shrinks as types are resolved, so the total is what has been
         // finished plus what is still waiting. Reported across the second half of
         // the bar (`base`) so the closure does not restart it from zero after the
@@ -1074,6 +1184,9 @@ fn resolve_dtos(
                 progress(half + into, base);
             }
         }
+    }
+    for name in ambiguous {
+        dto.mark_ambiguous(name);
     }
     (dto, stop)
 }
@@ -1111,14 +1224,158 @@ fn wire_name(field: &spring::Field) -> String {
 }
 
 /// Every class name `ty` refers to, type arguments included.
-fn push_names(ty: &str, out: &mut Vec<String>) {
+/// The DTO scope of `endpoint`: its package and declaring class.
+fn endpoint_scope(endpoint: &Endpoint) -> String {
+    if endpoint.package.is_empty() {
+        endpoint.class_name.clone()
+    } else {
+        format!("{}::{}", endpoint.package, endpoint.class_name)
+    }
+}
+
+/// The class `name` means through the import that names it.
+///
+/// `import com.alpha.Payload;` is the project saying which `Payload` a file means,
+/// so it settles a case the package scope cannot: the type lives in another
+/// package entirely. The hint is per project rather than per file, so it only
+/// answers when the name was imported exactly once.
+fn imported_lookup(
+classes: &HashMap<String, ClassEntry>,
+hints: &HashMap<String, String>,
+name: &str,
+) -> Option<(String, ClassEntry)> {
+let package = hints.get(name)?;
+let key = format!("{package}::{name}");
+classes.get_key_value(&key).map(|(key, hit)| (key.clone(), hit.clone()))
+}
+
+/// The class `name` means inside `scope`, walking the scope outward.
+///
+/// `com.acme::AController` then `com.acme` then the bare name: a nested type in
+/// the controller wins, then one in its package, then a unique one anywhere.
+fn scoped_lookup(classes: &HashMap<String, ClassEntry>, scope: &str, name: &str) -> Option<(String, ClassEntry)> {
+    let mut prefix = scope;
+    loop {
+        let key = format!("{prefix}::{name}");
+        if let Some(hit) = classes.get_key_value(&key) {
+            return Some((key, hit.1.clone()));
+        }
+        match prefix.rsplit_once("::") {
+            Some((outer, _)) => prefix = outer,
+            None => break,
+        }
+    }
+    None
+}
+
+/// A parsed class: its declared type parameters and its fields.
+type ClassEntry = (Vec<String>, Vec<spring::Field>);
+
+/// Every class `name` could mean, as `(qualified key, entry)`.
+///
+/// A qualified key answers with itself. A bare simple name can match several
+/// packages or controllers, and which one an endpoint means is not decidable from
+/// the name alone when none of them is in the endpoint's own scope — that is the
+/// case an export must refuse instead of guessing.
+fn class_candidates(classes: &HashMap<String, ClassEntry>, name: &str) -> Vec<(String, ClassEntry)> {
+if let Some(hit) = classes.get_key_value(name) {
+return vec![(name.to_owned(), hit.1.clone())];
+}
+let suffix = format!("::{name}");
+let mut found: Vec<(String, ClassEntry)> = classes
+.iter()
+.filter(|(key, _)| key.ends_with(&suffix))
+.map(|(key, hit)| (key.clone(), hit.clone()))
+.collect();
+// HashMap order is arbitrary; sorting keeps the chosen type and the refusal
+// message stable between runs.
+found.sort_by(|a, b| a.0.cmp(&b.0));
+found
+}
+
+/// The one class `name` means, or `None` when it is missing or ambiguous.
+fn class_lookup(classes: &HashMap<String, ClassEntry>, name: &str) -> Option<(String, ClassEntry)> {
+let mut candidates = class_candidates(classes, name);
+if candidates.len() == 1 {
+return candidates.pop();
+}
+None
+}
+
+/// The qualified name of the class `name` declared in `path`.
+///
+/// A source file lives under a package directory, so the package is what follows
+/// the last source root in the path: `.../src/main/java/com/alpha/Payload.java`
+/// yields `com.alpha::Payload`. Running past the root instead would make the
+/// project directory part of every package name, and then no scope would ever
+/// match.
+fn package_of_path(path: &str, name: &str) -> String {
+    let normalised = path.replace('\\', "/");
+    let segments: Vec<&str> = normalised.split('/').collect();
+    // The package starts after the last `java`/`kotlin` source root, or after
+    // `src` when the layout has no such level.
+    let root = segments
+        .iter()
+        .rposition(|s| matches!(*s, "java" | "kotlin"))
+        .or_else(|| segments.iter().rposition(|s| *s == "src"));
+    let package: Vec<&str> = match root {
+        Some(at) => segments[at + 1..]
+            .iter()
+            .copied()
+            .filter(|s| {
+                !s.is_empty() && !s.ends_with(".java") && !s.ends_with(".kt")
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    if package.is_empty() {
+        return name.to_owned();
+    }
+    format!("{}::{name}", package.join("."))
+}
+
+/// Whether `path` lives in the directory of `scope`'s package.
+///
+/// `scope` is `com.acme::Ctrl`, so the package directory is `com/acme`. A type the
+/// endpoint names without a qualifier is the one in its own package when there is
+/// one; a same-named file elsewhere is a different type.
+fn path_in_scope(path: &str, scope: &str) -> bool {
+let Some((package, _)) = scope.rsplit_once("::") else {
+return false;
+};
+let dir = package.replace('.', "/");
+let normalised = path.replace('\\', "/");
+normalised.contains(&format!("/{dir}/")) || normalised.contains(&format!("/{dir}::"))
+}
+
+/// The identity of a class: its package, the type that declares it, and its name.
+///
+/// `com.acme::AController::Request` and `com.acme::BController::Request` are two
+/// different types that a field mention spells the same way. Keeping the qualified
+/// name is what lets the scan resolve each endpoint against its own declaration
+/// instead of whichever came first.
+fn qualified_name(package: &str, class: &spring::Class) -> String {
+    let mut out = String::new();
+    if !package.is_empty() {
+        out.push_str(package);
+        out.push_str("::");
+    }
+    if !class.outer.is_empty() {
+        out.push_str(&class.outer);
+        out.push_str("::");
+    }
+    out.push_str(&class.name);
+    out
+}
+
+fn push_names(ty: &str, out: &mut Vec<(String, String)>, scope: &str) {
     let (base, args) = split_type(ty);
     let base = simple_name(&base);
     if !base.is_empty() && base.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-        out.push(base);
+        out.push((base, scope.to_owned()));
     }
     for arg in args {
-        push_names(&arg, out);
+        push_names(&arg, out, scope);
     }
 }
 
@@ -1216,9 +1473,14 @@ fn load_class(
     options: &Options,
     index: &mut TypeIndex,
     name: &str,
+    scope: &str,
     sources: &HashMap<String, String>,
-) -> Option<(Vec<String>, Vec<spring::Field>)> {
+) -> Option<(String, Vec<String>, Vec<spring::Field>)> {
     let mut candidates = index.candidates(name);
+    // A same-named file in the endpoint's own package is the type it means; without
+    // this, two `Payload.java` in different packages resolved to whichever the index
+    // listed first and the other endpoint got the wrong fields.
+    candidates.sort_by_key(|path| !path_in_scope(path, scope));
     if candidates.is_empty() {
         // Some projects keep a class away from its file name; search for the
         // declaration instead of guessing a path. `fallback` caches the result,
@@ -1236,7 +1498,7 @@ fn load_class(
         };
         let model = spring::parse(&src);
         if let Some(class) = model.classes.iter().find(|c| c.name == name) {
-            return Some((class.type_params.clone(), class.fields.clone()));
+            return Some((path.clone(), class.type_params.clone(), class.fields.clone()));
         }
     }
     None

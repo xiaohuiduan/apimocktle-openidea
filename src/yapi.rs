@@ -6,7 +6,7 @@ use openidea_plugin::{Error, HttpRequest, host};
 use serde_json::{Value, json};
 
 use crate::i18n;
-use crate::model::{Endpoint, ParamSpec, ResolvedClass, body_schema};
+use crate::model::{Endpoint, ParamSpec, body_schema};
 use crate::scan::DtoIndex;
 
 const LIST_PROJECTS: &str = "/api/project/list";
@@ -288,6 +288,19 @@ fn form_params(params: &[ParamSpec]) -> Value {
     )
 }
 
+/// The DTO scope of `endpoint`: its package and declaring class, as the key
+/// prefix `DtoIndex::resolve_in` walks outward from.
+///
+/// `package::Controller` means a nested `Request` declared in that controller
+/// resolves to that controller's own type before any same-named type elsewhere.
+fn endpoint_scope(endpoint: &Endpoint) -> String {
+    if endpoint.package.is_empty() {
+        endpoint.class_name.clone()
+    } else {
+        format!("{}::{}", endpoint.package, endpoint.class_name)
+    }
+}
+
 /// The YApi interface document for one endpoint.
 ///
 /// `lang` picks the language of the `markdown` field, the only prose in the
@@ -295,10 +308,13 @@ fn form_params(params: &[ParamSpec]) -> Value {
 /// document does not depend on a mounted host — the document is also built by
 /// tests and by the endpoint export path with no view attached.
 pub fn api_doc(endpoint: &Endpoint, dto: &DtoIndex, depth: u32, lang: i18n::Lang) -> Value {
-    let resolve = |name: &str, _d: u32| {
-        let fields = dto.fields.get(name)?;
-        Some(ResolvedClass { params: dto.params.get(name).cloned().unwrap_or_default(), fields: fields.clone() })
-    };
+    // Resolve from the endpoint's own scope outward. Two controllers in one
+    // package can each declare a `Request`, and a field mention carries only the
+    // simple name: without the scope both endpoints would be built from whichever
+    // type happened to be indexed first, and export updates by `method + path`,
+    // so the wrong one would overwrite a correct document on the server.
+    let scope = endpoint_scope(endpoint);
+    let resolve = |name: &str, _d: u32| dto.resolve_in(&scope, name);
     let request_type = endpoint.body_type.clone();
     let req_body_other = request_type
         .as_ref()
